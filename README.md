@@ -1,116 +1,67 @@
 <!-- mcp-name: io.github.c0decave/axross-headless-mcp -->
 # axross-headless-mcp
 
-axross's headless MCP server: file tools on the local disk and on SFTP, SMB, WebDAV, S3 and more for any MCP client, over stdio or HTTP - without Qt.
+**axross's headless MCP server: file tools on the local disk and on SFTP, SMB, WebDAV, S3 and more for any MCP client, over stdio or HTTP - without Qt.**
 
-The MCP (Model Context Protocol) server of [axross](https://github.com/c0decave/axross)
-on its own: an LLM client - Claude Desktop, Claude Code, Cursor, VS Code, any MCP client -
-lists, reads, searches and hashes files on this machine and on axross's remote
-connections, and with `--mcp-write` writes them. No GUI and no Qt: it runs on a server,
-in a container or in CI.
+- **Your files for any MCP client** - Claude Desktop, Claude Code, Cursor, VS Code: list, read, search and hash files.
+- **Local disk and remote connections** - SFTP built in; SMB, WebDAV, S3, Azure, cloud drives, Git, databases as extras.
+- **Read-only by default** - the write tools only with `--mcp-write` and an explicit `--mcp-root`.
+- **Confined to one folder** - every path stays under `--mcp-root`; SSH and GnuPG keys and tokens are refused.
+- **50+ tools in groups** - metadata, duplicates, archives, crypto, file types, transfers, remote profiles and more.
+- **stdio or HTTP** - streamable HTTP with a bearer token, mTLS for anything but loopback.
+- **No GUI, no Qt** - runs on a server, in a container or in CI: `pipx`, `uvx` or Docker.
+- **Current MCP** - 2025-11-25: tool annotations, structured results, progress, cancellation, resources.
+- **An audit trail** - what each tool did or refused, on stderr and in the log.
+- **The same code as axross** - axross's settings and saved connection profiles, credentials from the keyring.
 
-- **File tools** (always on, read-only): `list_dir`, `stat`, `read_file`, `checksum`,
-  `search`, `walk`, `recursive_checksum`, `grep`, `list_versions`, `open_version_read`,
-  and `preview` (image thumbnails; with the `images` extra, which brings Pillow).
-- **Write tools** (`--mcp-write --mcp-root DIR`): `write_file`, `mkdir`, `remove`,
-  `rename`, `copy`, `bulk_copy`, `symlink`, `hardlink`, `chmod`.
-- **Capability groups** (`--mcp-tools GROUP,...` or `all`): metadata, duplicates,
-  packer, archive, crypto, index, filetype, transfer, remote (axross's saved
-  connection profiles as further backends), exec (`--mcp-allow-exec`), agent,
-  extensions.
-- Every path is confined to `--mcp-root` (default: your home folder); secret files
-  (SSH and GnuPG private keys, tokens) are refused unless `--mcp-allow-secret-reads`.
+## Contents
 
-The protocol: MCP 2025-11-25, 2025-06-18 and 2024-11-05 (the client's version is
-answered when it is one of them), tool annotations (read-only, destructive,
-idempotent, open-world), structured results with output schemas, progress,
-cancellation, logging and `axross://` resources. Long jobs run in the background
-through axross's own `axross/tasks/start` / `status` / `cancel` / `list`. A file
-name that is not UTF-8 is shown with U+FFFD and comes with its raw bytes
-(`name_b64`, `path_b64`); every path argument takes them back (`path_b64`, ...).
-The audit trail (what each tool did or refused) goes to stderr and to the log.
+- **[Everything in detail: the extended README](https://github.com/c0decave/axross-headless-mcp/blob/main/docs/README-extended.md)**
+- [What changed: the CHANGELOG](https://github.com/c0decave/axross-headless-mcp/blob/main/CHANGELOG.md)
+- [Screenshots](#screenshots)
+- [Install](#install)
+- [Connect a client](#connect-a-client)
+- [Documentation](#documentation)
+- [Tests](#tests)
+- [Licence](#licence)
 
-### Install
+## Screenshots
+
+![The tools of every group, and a client's tools/call over stdio](https://raw.githubusercontent.com/c0decave/axross-headless-mcp/main/docs/screenshots/terminal.png)
+
+*The tools of every group, and a client's tools/call over stdio.*
+
+## Install
 
 ```sh
-pipx install axross-headless-mcp                  # or: pip install axross-headless-mcp
-pipx install 'axross-headless-mcp[all]'           # with every remote protocol and format
-axross-headless-mcp --version
+pipx install axross-headless-mcp            # or: pip install axross-headless-mcp
+pipx install 'axross-headless-mcp[all]'     # with every remote protocol and format
 axross-headless-mcp --mcp-list-tools --mcp-tools all   # what it would serve, as JSON
 ```
 
-The extras are axross's: `smb`, `webdav`, `s3`, `azure`, `onedrive`, `gdrive`,
-`dropbox`, `winrm`, `wmi`, `exchange`, `adb`, `archive`, `tftp`, `postgres`, `redis`,
-`mongo`, `git`, `dns`, `magic`, `encoding`, `snmp`, `ldap`, `metadata`, plus `images`
-(Pillow); `all` holds what axross's own `all` holds (not `winrm`, `wmi`, `exchange`)
-plus `images`. SFTP / SSH (paramiko) is always there.
-
-### Connect a client (stdio)
-
-Claude Code:
+## Connect a client
 
 ```sh
 claude mcp add axross -- axross-headless-mcp --mcp-root ~/projects --mcp-tools all
 ```
 
-Claude Desktop, Cursor, VS Code and the like (`claude_desktop_config.json`,
-`.cursor/mcp.json`, ...):
-
-```json
-{
-  "mcpServers": {
-    "axross": {
-      "command": "axross-headless-mcp",
-      "args": ["--mcp-root", "/home/me/projects", "--mcp-tools", "all"]
-    }
-  }
-}
-```
-
-Add `--mcp-write` for the write tools (it needs an explicit `--mcp-root`).
-`uvx axross-headless-mcp ...` works as the command as well, without installing first.
-
-### Over HTTP
+Claude Desktop, Cursor, VS Code and other clients: [the JSON
+configuration](https://github.com/c0decave/axross-headless-mcp/blob/main/docs/README-extended.md#connect-a-client-stdio). Over HTTP (a bearer token, mTLS off
+loopback): [Over HTTP](https://github.com/c0decave/axross-headless-mcp/blob/main/docs/README-extended.md#over-http). In a container:
 
 ```sh
-axross-headless-mcp --mcp-http 127.0.0.1:7331 --mcp-root ~/projects --mcp-tools all
-# prints a bearer token (or set AXROSS_MCP_HTTP_TOKEN); the endpoint is
-# http://127.0.0.1:7331/messages (streamable HTTP, Mcp-Session-Id, SSE)
+docker run -i --rm -v "$PWD:/data" ghcr.io/c0decave/axross-headless-mcp:latest \
+    --mcp-server --mcp-root /data --mcp-tools all
 ```
 
-A client sends `Authorization: Bearer <token>`. Anything but loopback needs mTLS:
-`--mcp-cert server.pem --mcp-key server-key.pem --mcp-ca clients-ca.pem`.
-`--mcp-allow-scripts` and `--mcp-allow-secret-reads` are stdio-only.
+## Documentation
 
-### Docker
-
-```sh
-docker run -i --rm -v "$PWD:/data" ghcr.io/c0decave/axross-headless-mcp:latest     --mcp-server --mcp-root /data --mcp-tools all
-```
-
-### Settings
-
-The server reads axross's settings (`~/.config/axross`): the saved connection
-profiles of the `remote` group (credentials from the system keyring), the metadata
-and duplicate indexes, the security mode. The log goes to
-`~/.local/state/axross/logs/axross.log` (`--debug` / `-v`: also stderr; stdout is the
-protocol's).
-
-Full reference: [docs/MCP.md](https://github.com/c0decave/axross/blob/main/docs/MCP.md)
-and the tool catalogue [docs/mcp-tools.json](https://github.com/c0decave/axross/blob/main/docs/mcp-tools.json).
-Setup steps for AI agents (Cline and others):
-[llms-install.md](https://github.com/c0decave/axross-headless-mcp/blob/main/llms-install.md).
-
-It is the same code as in [axross](https://github.com/c0decave/axross), written out by
-axross's `scripts/export_standalone.py mcp`; it reads axross's settings
-(`~/.config/axross`) and axross's saved connection profiles.
-
-## Install and run
-
-```sh
-pip install axross-headless-mcp      # or, from this folder: pip install .
-axross-headless-mcp
-```
+| Page | What it covers |
+|---|---|
+| [Extended README](https://github.com/c0decave/axross-headless-mcp/blob/main/docs/README-extended.md) | every tool group, the protocol, HTTP, Docker, settings |
+| [docs/MCP.md](https://github.com/c0decave/axross/blob/main/docs/MCP.md) | the full reference of axross's MCP server |
+| [docs/mcp-tools.json](https://github.com/c0decave/axross/blob/main/docs/mcp-tools.json) | the tool catalogue, generated from the manifest |
+| [llms-install.md](https://github.com/c0decave/axross-headless-mcp/blob/main/llms-install.md) | setup steps for AI agents (Cline and others) |
 
 ## Tests
 
@@ -120,4 +71,5 @@ python -m pytest tests
 
 ## Licence
 
-Apache-2.0, as axross.
+Apache-2.0, as [axross](https://github.com/c0decave/axross): the same code, written out by axross's
+`scripts/export_standalone.py`. Everything in detail: the [extended README](https://github.com/c0decave/axross-headless-mcp/blob/main/docs/README-extended.md).
