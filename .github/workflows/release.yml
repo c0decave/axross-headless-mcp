@@ -5,6 +5,9 @@
 # Registry come from axross's own release workflow (.github/workflows/
 # mcp-release.yml in c0decave/axross). Every action is pinned by its commit;
 # only the release job may write (contents: write), with the workflow's token.
+# The heavy steps write their output to $RUNNER_TEMP/job.log as well; a
+# failed job shows the log's last lines as annotations
+# (packaging/ci_log_tail.py), readable through the API without the logs.
 name: release
 
 on:
@@ -36,16 +39,26 @@ jobs:
             || { echo "::error::README.md lacks the mcp-name line"; exit 1; }
     - name: sdist and wheel
       run: |
-        python -m pip install build twine
-        python -m build --outdir release/
-        python -m twine check --strict release/*
+        set -o pipefail
+        {
+          python -m pip install build twine
+          python -m build --outdir release/
+          python -m twine check --strict release/*
+        } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
     - name: The wheel installed, without Qt, against its own tests
       run: |
-        python -m venv "$RUNNER_TEMP/check"
-        "$RUNNER_TEMP/check/bin/pip" install release/*.whl pytest
-        "$RUNNER_TEMP/check/bin/axross-headless-mcp" --version
-        "$RUNNER_TEMP/check/bin/python" -c 'import importlib.util as u, sys; sys.exit(u.find_spec("PyQt6") is not None)'
-        "$RUNNER_TEMP/check/bin/python" -m pytest -q tests
+        set -o pipefail
+        {
+          python -m venv "$RUNNER_TEMP/check"
+          "$RUNNER_TEMP/check/bin/pip" install release/*.whl
+          "$RUNNER_TEMP/check/bin/pip" install pytest
+          "$RUNNER_TEMP/check/bin/axross-headless-mcp" --version
+          "$RUNNER_TEMP/check/bin/python" -c 'import importlib.util as u, sys; sys.exit(u.find_spec("PyQt6") is not None)'
+          "$RUNNER_TEMP/check/bin/python" -m pytest -q -rfE tests
+        } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
+    - name: The end of the job's log as annotations
+      if: failure()
+      run: python packaging/ci_log_tail.py "$RUNNER_TEMP/job.log" "python job"
     - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: python
@@ -68,14 +81,22 @@ jobs:
         path: artifacts
     - name: SHA256SUMS and the notes
       run: |
-        mkdir assets
-        find artifacts -type f -exec cp {} assets/ \;
-        (cd assets && sha256sum -- * > ../SHA256SUMS) && mv SHA256SUMS assets/
-        cat assets/SHA256SUMS
-        python3 packaging/release_notes.py "$GITHUB_REF_NAME" assets > notes.md
+        set -o pipefail
+        {
+          mkdir assets
+          find artifacts -type f -exec cp {} assets/ \;
+          (cd assets && sha256sum -- * > ../SHA256SUMS) && mv SHA256SUMS assets/
+          cat assets/SHA256SUMS
+          python3 packaging/release_notes.py "$GITHUB_REF_NAME" assets > notes.md
+        } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
     - name: The GitHub release
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
+        set -o pipefail
         gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "axross-headless-mcp ${GITHUB_REF_NAME#v}" --notes-file notes.md assets/*
+            --title "axross-headless-mcp ${GITHUB_REF_NAME#v}" --notes-file notes.md assets/* \
+            2>&1 | tee -a "$RUNNER_TEMP/job.log"
+    - name: The end of the job's log as annotations
+      if: failure()
+      run: python3 packaging/ci_log_tail.py "$RUNNER_TEMP/job.log" "release job"
