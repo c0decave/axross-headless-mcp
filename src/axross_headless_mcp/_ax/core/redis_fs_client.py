@@ -1,0 +1,383 @@
+"""Redis-as-storage backend.
+
+Uses Redis hashes as a tiny per-path record. The schema:
+
+* ``axross:meta:<path>`` — hash with ``parent``, ``is_dir``, ``mode``,
+  ``mtime``. The bytes live in ``axross:data:<path>`` (a separate
+  string key) so directory listings don't pull every blob into memory.
+* ``axross:children:<parent>`` — set of child paths. Cheaper than
+  scanning ``axross:meta:*`` to enumerate a directory.
+* TTL: optional. Per-key TTL is honoured but not set by axross —
+  callers can set it manually after a write to make the entry
+  ephemeral.
+
+Use cases:
+
+* A volatile, network-reachable workspace: parking small artefacts
+  for a few hours during a security engagement.
+* Cross-process scratch space behind axross MCP without provisioning
+  a real DB.
+
+Requires: ``pip install axross[redis]`` — redis-py>=5.
+"""
+
+from __future__ import annotations
+
+import errno
+import logging
+import threading
+from datetime import datetime
+from typing import Iterable
+from urllib.parse import urlsplit
+
+from core.db_fs_base import DbFsBackend, parse_mode
+
+log = logging.getLogger(__name__)
+
+try:
+    import redis  # type: ignore[import-not-found]
+except ImportError:
+    redis = None  # type: ignore[assignment]
+
+
+def _proxied_connection_class(proxy_cfg, use_tls: bool):
+    """redis-py connection class whose TCP leg goes through *proxy_cfg*.
+
+    TLS (``rediss``) is layered on top of the proxied socket by redis-py
+    itself, so certificate and host-name checks still use the real host.
+    """
+    from core.proxy import create_proxy_socket
+
+    base = redis.connection.SSLConnection if use_tls else redis.connection.Connection
+
+    class ProxiedConnection(base):  # type: ignore[misc, valid-type]
+        def _connect(self):
+            timeout = self.socket_connect_timeout or 10.0
+            sock = create_proxy_socket(proxy_cfg, self.host, int(self.port), timeout=float(timeout))
+            sock.settimeout(self.socket_timeout)
+            if use_tls:
+                try:
+                    return self._wrap_socket_with_ssl(sock)
+                except Exception:
+                    sock.close()
+                    raise
+            return sock
+
+    return ProxiedConnection
+
+
+#: redis-py waits for ever without these: a silent server (a TLS-only port
+#: opened without TLS, a black hole) held the connect and every command.
+_REDIS_TIMEOUTS = {
+    "socket_connect_timeout": 10,
+    "socket_timeout": 30,
+}
+#: Tries after a time-out or a lost connection: redis-py 8 makes three,
+#: with back-off - a silent server cost minutes before an error.
+_REDIS_RETRIES = 1
+
+_NS_META = "axross:meta:"
+_NS_DATA = "axross:data:"
+_NS_KIDS = "axross:children:"
+
+
+class RedisFsSession(DbFsBackend):
+    """Redis-backed FileBackend."""
+
+    _DRIVER_ERRORS = (redis.exceptions.RedisError,) if redis is not None else ()
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 6379,
+        password: str = "",
+        database: int | str = 0,
+        url: str = "",
+        use_tls: bool = False,
+        **_ignored,
+    ):
+        from core.proxy import proxy_config_from_kwargs
+
+        proxy_cfg = proxy_config_from_kwargs(_ignored)
+        if redis is None:
+            raise ImportError(
+                "Redis backend requires redis-py. Install with: pip install axross[redis]",
+            )
+        if url:
+            parts = urlsplit(url)
+            host = host or (parts.hostname or "127.0.0.1")
+            port = port or (parts.port or 6379)
+            password = password or (parts.password or "")
+            try:
+                database = int((parts.path or "/").lstrip("/") or 0)
+            except ValueError:
+                database = 0
+            use_tls = use_tls or parts.scheme == "rediss"
+        # RESP2, as redis-py 5-7 spoke by default: redis-py 8 opens every
+        # connection with HELLO 3, which a server before Redis 6 (and a
+        # Redis-speaking server or proxy without HELLO) refuses or answers
+        # with something that is not a HELLO map - the connect failed.
+        client_kwargs: dict = {}
+        if proxy_cfg is not None:
+            # A dedicated pool keeps every connection redis-py ever opens
+            # (reconnects included) on the proxied connection class.
+            client_kwargs["connection_pool"] = redis.ConnectionPool(
+                connection_class=_proxied_connection_class(proxy_cfg, bool(use_tls)),
+                host=host,
+                port=int(port),
+                password=password or None,
+                db=int(database),
+                decode_responses=False,
+                protocol=2,
+                **_REDIS_TIMEOUTS,
+            )
+        else:
+            client_kwargs.update(
+                host=host,
+                port=int(port),
+                password=password or None,
+                db=int(database),
+                ssl=bool(use_tls),
+                decode_responses=False,
+                protocol=2,
+                **_REDIS_TIMEOUTS,
+            )
+        from redis.backoff import ExponentialBackoff
+        from redis.retry import Retry
+
+        client_kwargs["retry"] = Retry(ExponentialBackoff(cap=1.0), _REDIS_RETRIES)
+        self._client = redis.Redis(**client_kwargs)
+        try:
+            self._client.ping()
+        except redis.exceptions.AuthenticationError as exc:
+            self._client.close()
+            raise PermissionError(
+                errno.EACCES, f"Redis {host}:{port}: the password was refused ({exc})"
+            ) from exc
+        except redis.exceptions.RedisError as exc:
+            # A silent server held ping() for ever (no time-out set); a
+            # refused one raised redis' own ConnectionError, no OSError.
+            self._client.close()
+            raise ConnectionError(
+                errno.ECONNREFUSED if "refused" in str(exc).lower() else errno.EIO,
+                f"Cannot connect to Redis {host}:{port}: {exc}",
+            ) from exc
+        self._lock = threading.RLock()
+        self._display = f"{'rediss' if use_tls else 'redis'}://{host}:{port}/{database}"
+        log.info("Redis-FS connected: %s", self._display)
+
+    @property
+    def name(self) -> str:
+        return f"Redis: {self._display}"
+
+    def close(self) -> None:
+        log.info("Redis-FS disconnecting: %s", self._display)
+        try:
+            self._client.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------
+    # Raw-Redis passthrough — slice 3 of API_GAPS.
+    # ------------------------------------------------------------------
+
+    def cmd(self, *args):
+        """Run an arbitrary Redis command and return its raw reply.
+        Equivalent to ``redis-cli`` for one shot — useful for the
+        operations that don't fit ``GET``/``SET``::
+
+            sess.cmd("CONFIG", "GET", "maxmemory")
+            sess.cmd("CLIENT", "LIST")
+
+        Returns whatever redis-py's ``execute_command`` returns;
+        bytes for string replies, lists for multi-bulk, dicts for
+        XINFO etc.
+        """
+        if not args:
+            raise ValueError("cmd: at least one argument required")
+        with self._lock:
+            return self._client.execute_command(*args)
+
+    def scan(self, pattern: str = "*", *, count: int = 100, max_keys: int = 10_000) -> list[str]:
+        """Iterate keys matching ``pattern`` using ``SCAN`` (cursor-
+        based, safe on a busy server — ``KEYS *`` would block). Caps
+        at ``max_keys`` to keep the REPL prompt responsive."""
+        out: list[str] = []
+        with self._lock:
+            for raw in self._client.scan_iter(match=pattern, count=count):
+                if isinstance(raw, bytes):
+                    out.append(raw.decode("utf-8", errors="replace"))
+                else:
+                    out.append(str(raw))
+                if len(out) >= max_keys:
+                    break
+        return out
+
+    def ttl(self, key: str) -> int:
+        """TTL of ``key`` in seconds. -1 = no expiry, -2 = no such key."""
+        return int(self.cmd("TTL", key))
+
+    def info(self, section: str | None = None) -> dict:
+        """``INFO`` server stats parsed into a dict (one entry per
+        ``key:value`` pair). Pass ``section='memory'`` etc. to scope."""
+        with self._lock:
+            return self._client.info(section) if section else self._client.info()
+
+    # ------------------------------------------------------------------
+    # Adapter
+    # ------------------------------------------------------------------
+
+    def _db_get(self, path: str) -> dict | None:
+        with self._lock:
+            meta = self._client.hgetall(_NS_META + path)
+        row = self._meta_fields(path, meta)
+        if row is None:
+            return None
+        content = None
+        if not row["is_dir"]:
+            content = self._client.get(_NS_DATA + path)
+        # Passed on as answered: DbFsBackend accepts bytes only.
+        # bytes() of an integer reply would be that many zero bytes.
+        row["content"] = content
+        return row
+
+    # STRLEN answers the length without sending the value; a missing data
+    # key gives 0, the size a missing content had before.
+    def _db_get_meta(self, path: str) -> dict | None:
+        with self._lock:
+            meta = self._client.hgetall(_NS_META + path)
+        row = self._meta_fields(path, meta)
+        if row is not None:
+            row["size"] = 0 if row["is_dir"] else self._client.strlen(_NS_DATA + path)
+        return row
+
+    def _db_list_meta(self, parent: str) -> Iterable[dict]:
+        # One pipelined round trip for all children instead of a GET and
+        # an HGETALL per child.
+        with self._lock:
+            children = self._client.smembers(_NS_KIDS + parent)
+        paths = [
+            raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+            for raw in sorted(children or [])
+        ]
+        if not paths:
+            return []
+        pipe = self._client.pipeline()
+        for child_path in paths:
+            pipe.hgetall(_NS_META + child_path)
+            pipe.strlen(_NS_DATA + child_path)
+        replies = pipe.execute()
+        rows = []
+        for i, child_path in enumerate(paths):
+            row = self._meta_fields(child_path, replies[2 * i])
+            if row is not None:
+                # Read like any stored size (_row_to_item): a reply that
+                # is no integer (RESP lets a server send a bulk string)
+                # reads as 0 instead of raising ValueError.
+                row["size"] = 0 if row["is_dir"] else replies[2 * i + 1]
+                rows.append(row)
+        return rows
+
+    @staticmethod
+    def _meta_fields(path: str, meta) -> dict | None:
+        """The row fields stored in the meta hash (no content / size)."""
+        if not meta:
+            return None
+
+        # All fields come back as bytes.
+        def get(k: str) -> bytes | None:
+            return meta.get(k.encode())
+
+        is_dir = (get("is_dir") or b"0") == b"1"
+        mtime_raw = (get("mtime") or b"").decode("utf-8", "replace")
+        try:
+            mtime = datetime.fromisoformat(mtime_raw) if mtime_raw else None
+        except ValueError:
+            mtime = None
+        return {
+            "path": path,
+            "parent": (get("parent") or b"/").decode("utf-8", "replace"),
+            "is_dir": is_dir,
+            # Any client can write the hash: a mode that is no number
+            # reads as the default instead of raising ValueError.
+            "mode": parse_mode(get("mode"), 0o755 if is_dir else 0o644),
+            "mtime": mtime,
+        }
+
+    def _db_list(self, parent: str) -> Iterable[dict]:
+        with self._lock:
+            children = self._client.smembers(_NS_KIDS + parent)
+        for raw in sorted(children or []):
+            child_path = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+            d = self._db_get(child_path)
+            if d is not None:
+                yield d
+
+    def _db_insert(self, row: dict) -> None:
+        path = row["path"]
+        parent = row["parent"]
+        mtime = row.get("mtime") or datetime.now()
+        if isinstance(mtime, datetime):
+            mtime = mtime.isoformat()
+        with self._lock:
+            pipe = self._client.pipeline()
+            pipe.hset(
+                _NS_META + path,
+                mapping={
+                    "parent": parent,
+                    "is_dir": "1" if row.get("is_dir") else "0",
+                    "mode": str(int(row.get("mode") or 0o644)),
+                    "mtime": mtime,
+                },
+            )
+            if not row.get("is_dir"):
+                pipe.set(_NS_DATA + path, row.get("content") or b"")
+            else:
+                pipe.delete(_NS_DATA + path)
+            pipe.sadd(_NS_KIDS + parent, path)
+            pipe.execute()
+
+    def _db_update(self, path: str, **fields) -> None:
+        if not fields:
+            return
+        with self._lock:
+            pipe = self._client.pipeline()
+            mapping = {}
+            for k, v in fields.items():
+                if k == "content":
+                    if v is None:
+                        pipe.delete(_NS_DATA + path)
+                    else:
+                        pipe.set(_NS_DATA + path, v)
+                elif k == "is_dir":
+                    mapping["is_dir"] = "1" if v else "0"
+                elif k == "mtime" and isinstance(v, datetime):
+                    mapping["mtime"] = v.isoformat()
+                else:
+                    mapping[k] = str(v)
+            if mapping:
+                pipe.hset(_NS_META + path, mapping=mapping)
+            pipe.execute()
+
+    def _db_delete(self, path: str) -> None:
+        with self._lock:
+            meta = self._client.hgetall(_NS_META + path)
+            parent = (meta.get(b"parent") or b"/").decode("utf-8", "replace")
+            pipe = self._client.pipeline()
+            pipe.delete(_NS_META + path)
+            pipe.delete(_NS_DATA + path)
+            pipe.srem(_NS_KIDS + parent, path)
+            pipe.execute()
+
+    def _db_delete_subtree(self, path: str) -> None:
+        # Walk children breadth-first; Redis has no LIKE.
+        with self._lock:
+            stack = [path]
+            while stack:
+                current = stack.pop()
+                kids = self._client.smembers(_NS_KIDS + current)
+                for raw in kids or []:
+                    child = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                    stack.append(child)
+                self._db_delete(current)
+                self._client.delete(_NS_KIDS + current)

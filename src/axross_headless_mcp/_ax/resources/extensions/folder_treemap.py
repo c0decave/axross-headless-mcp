@@ -1,0 +1,296 @@
+"""A panel with a treemap of the current folder: each box is a file or
+subfolder, its area the size."""
+
+from __future__ import annotations
+
+import sys
+
+from core.i18n import tr
+
+EXTENSION = {
+    "name": "Folder Treemap",
+    "version": "1.0",
+    "description": "A panel that draws the current folder as a treemap - box area is size, "
+    "subfolders summed in the background (bounded); double-click a box to open it.",
+    "author": "axross",
+}
+
+#: Entries walked below one folder before the sums count as "at least".
+MAX_ENTRIES = 20000
+MAX_DEPTH = 12
+
+
+class WalkCancelled(Exception):
+    """The walk was no longer wanted (the folder was left meanwhile)."""
+
+
+def folder_sizes(backend, folder: str, *, max_entries: int = MAX_ENTRIES, cancelled=None):
+    """``([(name, size, is_dir)], complete)`` for the children of *folder*;
+    subfolder sizes are recursive sums. *complete* is False when the walk
+    stopped at *max_entries* or met unreadable folders. *cancelled()*,
+    asked before every listing, ends the walk with :class:`WalkCancelled`
+    when it returns True: a walk of a folder already left ran on to its
+    last listing (up to *max_entries* round trips) next to the new one."""
+    budget = [max_entries]
+    complete = [True]
+
+    def walk(path: str, depth: int) -> int:
+        if depth > MAX_DEPTH or budget[0] <= 0:
+            complete[0] = False
+            return 0
+        if cancelled is not None and cancelled():
+            raise WalkCancelled(folder)
+        try:
+            items = backend.list_dir(path)
+        except OSError:
+            complete[0] = False
+            return 0
+        total = 0
+        for item in items:
+            if item.name == "..":
+                continue
+            budget[0] -= 1
+            if budget[0] < 0:
+                complete[0] = False
+                break
+            if item.is_dir and not getattr(item, "is_link", False):
+                total += walk(backend.join(path, item.name), depth + 1)
+            elif not item.is_dir:
+                total += max(0, int(item.size or 0))
+        return total
+
+    out = []
+    if cancelled is not None and cancelled():
+        raise WalkCancelled(folder)
+    for item in backend.list_dir(folder):
+        if item.name == "..":
+            continue
+        if item.is_dir and not getattr(item, "is_link", False):
+            out.append((item.name, walk(backend.join(folder, item.name), 1), True))
+        elif not item.is_dir:
+            out.append((item.name, max(0, int(item.size or 0)), False))
+    return out, complete[0]
+
+
+class _RowSum:
+    """The running sum of a row, equal to ``sum(row)`` to the last bit:
+    compensated (Neumaier) as the built-in ``sum`` adds floats since Python
+    3.12, plainly before."""
+
+    __slots__ = ("hi", "lo")
+    compensated = sys.version_info >= (3, 12)
+
+    def __init__(self) -> None:
+        self.hi = 0.0
+        self.lo = 0.0
+
+    def add(self, x: float) -> None:
+        hi = self.hi
+        t = hi + x
+        if self.compensated:
+            if abs(hi) >= abs(x):
+                self.lo += (hi - t) + x
+            else:
+                self.lo += (x - t) + hi
+        self.hi = t
+
+    def value(self) -> float:
+        return self.hi + self.lo if self.lo else self.hi
+
+
+def squarify(sizes: list[float], x: float, y: float, w: float, h: float):
+    """Rectangles ``(x, y, w, h)`` for *sizes* (sorted large to small),
+    filling the box with aspect ratios near 1 (Bruls et al.).
+
+    Linear: the row keeps its sum as it grows, and its worst aspect ratio
+    comes from its first (largest) and last (smallest) box - the ratio
+    ``max(side² r / s², s² / (side² r))`` is largest at either end."""
+    values = [s for s in sizes if s > 0]
+    rects: list[tuple[float, float, float, float]] = []
+    total = sum(values)
+    if not values or w <= 0 or h <= 0:
+        return rects
+    scaled = [v * w * h / total for v in values]
+
+    def worst(largest: float, smallest: float, s: float, side: float) -> float:
+        return max(side * side * largest / (s * s), s * s / (side * side * smallest))
+
+    i = 0
+    count = len(scaled)
+    while i < count:
+        side = min(w, h)
+        start = i
+        row_sum = _RowSum()
+        row_sum.add(scaled[i])
+        s = row_sum.value()
+        current = worst(scaled[i], scaled[i], s, side)
+        i += 1
+        while i < count:
+            grown = _RowSum()
+            grown.hi, grown.lo = row_sum.hi, row_sum.lo
+            grown.add(scaled[i])
+            grown_s = grown.value()
+            candidate = worst(scaled[start], scaled[i], grown_s, side)
+            if candidate > current:
+                break
+            row_sum, s, current = grown, grown_s, candidate
+            i += 1
+        row = scaled[start:i]
+        if w >= h:  # lay the row out as a column on the left
+            cw = s / h
+            cy = y
+            for r in row:
+                rects.append((x, cy, cw, r / cw))
+                cy += r / cw
+            x, w = x + cw, w - cw
+        else:  # as a row on the top
+            rh = s / w
+            cx = x
+            for r in row:
+                rects.append((cx, y, r / rh, rh))
+                cx += r / rh
+            y, h = y + rh, h - rh
+    return rects
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+#: The walk state of each activation, by id(api), for deactivate().
+_STATES: dict[int, dict] = {}
+
+
+def activate(api):
+    from PyQt6.QtCore import QRectF, Qt
+    from PyQt6.QtGui import QColor, QPainter
+    from PyQt6.QtWidgets import QToolTip, QWidget
+
+    from ui.plain_text import plain_tooltip
+
+    class Treemap(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.entries: list[tuple[str, int, bool]] = []
+            self.complete = True
+            self.message = "Open a folder to see its treemap."
+            self.boxes: list[tuple[QRectF, tuple[str, int, bool]]] = []
+            # (entries, width, height) the boxes were laid out for: a repaint
+            # of the same folder at the same size reuses them.
+            self._laid_out = None
+            self._rects: list = []
+            self.setMouseTracking(True)
+            self.setMinimumSize(200, 160)
+
+        def set_entries(self, entries, complete):
+            self.entries = sorted(entries, key=lambda e: -e[1])
+            self.complete = complete
+            self.message = "" if any(e[1] > 0 for e in entries) else "Nothing with a size here."
+            self.update()
+
+        def paintEvent(self, _event):  # noqa: N802
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), self.palette().base())
+            self.boxes = []
+            if self.message:
+                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.message)
+                return
+            shown = [e for e in self.entries if e[1] > 0]
+            key = (self.entries, self.width(), self.height())
+            if self._laid_out is None or any(a is not b and a != b
+                                             for a, b in zip(self._laid_out, key)):
+                self._rects = squarify([e[1] for e in shown], 0, 0, self.width(), self.height())
+                self._laid_out = key
+            rects = self._rects
+            for n, ((rx, ry, rw, rh), entry) in enumerate(zip(rects, shown)):
+                box = QRectF(rx, ry, rw, rh)
+                hue = (n * 47) % 360
+                colour = QColor.fromHsv(hue, 90 if entry[2] else 50, 225)
+                painter.fillRect(box.adjusted(1, 1, -1, -1), colour)
+                if rw > 40 and rh > 16:
+                    painter.setPen(QColor("#202020"))
+                    label = entry[0] + ("/" if entry[2] else "")
+                    painter.drawText(
+                        box.adjusted(4, 2, -4, -2),
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                        painter.fontMetrics().elidedText(
+                            label, Qt.TextElideMode.ElideMiddle, int(rw) - 8
+                        ),
+                    )
+                self.boxes.append((box, entry))
+            painter.end()
+
+        def entry_at(self, pos):
+            for box, entry in self.boxes:
+                if box.contains(pos):
+                    return entry
+            return None
+
+        def mouseMoveEvent(self, event):  # noqa: N802
+            entry = self.entry_at(event.position())
+            if entry is not None:
+                note = "" if self.complete else " (at least)"
+                # The name is the folder's: shown as it is, never as markup.
+                QToolTip.showText(event.globalPosition().toPoint(),
+                                  plain_tooltip(f"{entry[0]}\n{human(entry[1])}{note}"), self)
+
+        def mouseDoubleClickEvent(self, event):  # noqa: N802
+            entry = self.entry_at(event.position())
+            ctx = api.current()
+            if entry is not None and entry[2] and ctx is not None and ctx.pane is not None:
+                ctx.pane.navigate_async(ctx.backend.join(ctx.folder, entry[0]))
+
+    view = Treemap()
+    api.add_dock(tr("Folder Treemap"), view, icon="treemap")
+    #: Counts the walks started; a walk (and its result or error) whose
+    #: number is no longer the last one is stale. deactivate() counts on
+    #: once more, so every walk still running stops at its next listing.
+    state = {"generation": 0, "off": False}
+    _STATES[id(api)] = state
+
+    def refresh(ctx):
+        if state["off"]:
+            return
+        state["generation"] += 1
+        generation = state["generation"]
+        view.message = "Measuring…"
+        view.update()
+
+        def stale() -> bool:
+            return state["generation"] != generation
+
+        def done(result):
+            if not stale():
+                view.set_entries(*result)
+
+        def failed(exc):
+            if stale() or isinstance(exc, WalkCancelled):
+                return  # a newer walk is under way; its outcome is shown
+            view.message = f"Cannot measure: {exc}"
+            view.update()
+
+        api.run_in_background(
+            lambda: folder_sizes(ctx.backend, ctx.folder, cancelled=stale),
+            on_done=done,
+            on_error=failed,
+        )
+
+    api.on("path_changed", refresh)
+    api.on("pane_activated", refresh)
+    ctx = api.current()
+    if ctx is not None:
+        refresh(ctx)
+
+
+def deactivate(api):
+    """Switched off or reloaded: every walk still running is stale. Before,
+    a walk of a large remote folder went on listing it (up to 20,000
+    round trips) after the extension was gone."""
+    state = _STATES.pop(id(api), None)
+    if state is not None:
+        state["off"] = True
+        state["generation"] += 1

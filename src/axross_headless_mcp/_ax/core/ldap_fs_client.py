@@ -1,0 +1,595 @@
+"""LDAP directory-as-FileBackend (slice 8 of API_GAPS).
+
+Maps an LDAP tree onto axross's FileBackend protocol so a script can
+walk a directory the same way it walks SFTP or S3::
+
+    b = axross.open("ldap_lab")
+    for item in b.list_dir("/dc=example,dc=com/ou=people"):
+        print(item.name)
+
+Path scheme:
+* The root ``/`` lists the namingContexts the server publishes
+  (e.g. ``dc=example,dc=com``).
+* Every subsequent path segment is one **RDN** (relative DN), in
+  left-to-right tree-walk order. This is the OPPOSITE of LDAP's
+  native right-to-left DN encoding — the mapping is consistent with
+  how a filesystem reads.
+* A path that points at a non-leaf entry (an entry that has
+  children) behaves like a directory; ``list_dir`` returns its
+  children. A path that points at a leaf entry behaves like a file
+  whose content is the LDIF rendering of the entry's attributes.
+
+This backend is **read-only**; LDAP modify / add / delete are out
+of scope for the FileBackend surface (they are nominally writes, but
+the semantics — replace vs. add vs. delete-attribute — don't fit
+``open_write`` cleanly). For mutations, drop down to the underlying
+``self._conn`` (an ``ldap3.Connection``) and call ``modify`` directly.
+
+Requires: ``pip install axross[ldap]`` — ldap3>=2.9.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+from datetime import datetime
+from typing import IO
+
+from core.backend import SessionLifecycle
+from models.file_item import FileItem
+
+log = logging.getLogger(__name__)
+
+try:
+    import ldap3  # type: ignore[import-not-found]
+    from ldap3 import (
+        ALL,
+        BASE,
+        LEVEL,
+        SUBTREE,
+        Connection,
+        Server,
+        Tls,
+    )
+    from ldap3.core.exceptions import LDAPException
+except ImportError:  # pragma: no cover
+    ldap3 = None  # type: ignore[assignment]
+
+# What ldap3 raises besides LDAPException for an answer it cannot decode:
+# its BER decoder (ldap3.utils.asn1.decode_message_fast) indexes and
+# slices the raw bytes, so a truncated or mislabelled element surfaces
+# as KeyError / IndexError / ValueError / TypeError, a DN or value that
+# is not UTF-8 as UnicodeDecodeError (a ValueError).
+_LDAP_DECODE_ERRORS: tuple[type[BaseException], ...] = (
+    KeyError,
+    IndexError,
+    ValueError,
+    TypeError,
+    AttributeError,
+)
+try:
+    from pyasn1.error import PyAsn1Error
+
+    _LDAP_DECODE_ERRORS += (PyAsn1Error,)
+except ImportError:  # pragma: no cover
+    pass
+
+
+def _leading_rdn(dn: str) -> str:
+    """The leftmost RDN of ``dn``, up to the first UNESCAPED comma.
+
+    RFC 4514 escapes a comma inside a value as ``\\,`` (``cn=Doe\\, Jane``)
+    and a backslash as ``\\\\``; a plain split at the first comma cut
+    such names short."""
+    i = 0
+    while i < len(dn):
+        if dn[i] == "\\":
+            i += 2
+            continue
+        if dn[i] == ",":
+            return dn[:i]
+        i += 1
+    return dn
+
+
+def _segment_name(rdn: str) -> str:
+    """``rdn`` as one path segment. RFC 4514 does not escape "/" in a
+    value ("cn=AC/DC"), but here "/" separates segments; its hex-pair
+    escape ``\\2F`` names the same value and the server parses it back."""
+    return rdn.replace("/", "\\2F")
+
+
+#: Simple Paged Results (RFC 2696): its control OID, the page size asked
+#: for (below Active Directory's MaxPageSize of 1000) and a bound on pages.
+_PAGED_OID = "1.2.840.113556.1.4.319"
+# LDAP result codes (RFC 4511 4.1.9) a BASE search tells apart.
+_NO_SUCH_OBJECT = 32
+_INSUFFICIENT_ACCESS = 50
+_PAGE_SIZE = 500
+_MAX_PAGES = 2000
+
+
+class LdapFsSession(SessionLifecycle):
+    """Read-only LDAP-as-FileBackend.
+
+    ``host`` / ``port`` / ``use_tls`` configure the transport. Bind
+    creds are passed to ``connect()`` so the session can be
+    instantiated lazily.
+    """
+
+    supports_symlinks = False
+    supports_hardlinks = False
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = 389,
+        username: str = "",  # bind DN
+        password: str = "",
+        use_tls: bool = False,
+        timeout: float = 10.0,
+        verify_tls: bool = True,
+        **_ignored,
+    ):
+        self._tunnel = None
+        if ldap3 is None:
+            raise OSError("LDAP backend requires ldap3. Install with: pip install axross[ldap]")
+        self._host = host
+        self._port = int(port)
+        self._username = username
+        self._password = password
+        self._use_tls = bool(use_tls)
+        self._timeout = float(timeout)
+        # ldap3 defaults to Tls(validate=CERT_NONE) when none is given,
+        # i.e. LDAPS would accept any certificate. Validate unless the
+        # profile explicitly opts out.
+        from core import proxy as proxy_mod
+
+        # ldap3 dials the socket itself; with a proxy it connects to a
+        # loopback tunnel instead and TLS keeps verifying the real name.
+        self._tunnel = proxy_mod.open_tunnel(_ignored, host, self._port, timeout=self._timeout)
+        connect_host, connect_port = host, self._port
+        if self._tunnel is not None:
+            connect_host, connect_port = self._tunnel.host, self._tunnel.port
+        tls = None
+        if self._use_tls:
+            import ssl
+
+            if not verify_tls:
+                log.warning("LDAP: certificate verification DISABLED by profile option")
+            tls_kwargs: dict = {"validate": ssl.CERT_REQUIRED if verify_tls else ssl.CERT_NONE}
+            if self._tunnel is not None:
+                tls_kwargs.update(valid_names=[host], sni=host)
+            tls = Tls(**tls_kwargs)
+        try:
+            self._server = Server(
+                connect_host,
+                port=connect_port,
+                use_ssl=self._use_tls,
+                tls=tls,
+                get_info=ALL,
+                connect_timeout=int(self._timeout),
+            )
+            self._conn = Connection(
+                self._server,
+                user=username or None,
+                password=password or None,
+                auto_bind=True,
+                receive_timeout=int(self._timeout),
+                # ldap3 follows a referral to ANY host it names and binds
+                # there with this DN and password - directly (around the
+                # proxy) and over plain ldap:// even from an LDAPS session.
+                auto_referrals=False,
+            )
+        except LDAPException as exc:
+            if self._tunnel is not None:
+                self._tunnel.close()
+            raise OSError(f"LDAP bind to {host}:{port} failed: {exc}") from exc
+        except BaseException:
+            if self._tunnel is not None:
+                self._tunnel.close()
+            raise
+        # Cache the namingContexts for root-listing (single SEARCH on
+        # the rootDSE; cheap).
+        self._naming_contexts: list[str] = []
+        try:
+            info = self._server.info
+            ncs = getattr(info, "naming_contexts", None) or []
+            self._naming_contexts = [str(n) for n in ncs]
+        except Exception:  # noqa: BLE001
+            pass
+        self._display = (
+            f"ldap{'s' if self._use_tls else ''}://{username or 'anon'}@{host}:{self._port}"
+        )
+        log.info("LDAP-FS connected: %s", self._display)
+
+    # ------------------------------------------------------------------
+    # Identity / lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return f"LDAP: {self._display}"
+
+    @property
+    def connected(self) -> bool:
+        return bool(getattr(self._conn, "bound", False))
+
+    def close(self) -> None:
+        try:
+            self._conn.unbind()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._tunnel is not None:
+            self._tunnel.close()
+
+    def disconnect(self) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Path ↔ DN translation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _path_to_dn(path: str) -> str:
+        """Convert an axross-style left-to-right path into an LDAP DN.
+
+        ``"/dc=example,dc=com/ou=people/cn=alice"``  →
+        ``"cn=alice,ou=people,dc=example,dc=com"``
+
+        Empty path / root → ``""``.
+
+        Each path segment is treated as ONE RDN. If a segment itself
+        contains an *unescaped* comma (RFC 4514's RDN separator), it
+        could otherwise smuggle additional RDNs into the resulting DN
+        — e.g. ``/dc=test/ou=evil,ou=admins`` would become
+        ``ou=evil,ou=admins,dc=test``, granting access to a parallel
+        OU. We refuse such segments. Callers needing a literal comma
+        in an attribute value must escape it RFC-4514 style (``\\,``).
+        Each segment must also contain at least one ``=`` (every RDN
+        is ``attribute=value``); the root path bypasses the check.
+        """
+        # The base case (root) is allowed to be empty without further
+        # validation — represents the LDAP namingContext list.
+        if not path.strip("/"):
+            return ""
+        parts = [p for p in path.strip("/").split("/") if p]
+        # The FIRST segment is the base DN (the namingContext) and is
+        # allowed to be a multi-RDN string ``dc=example,dc=com`` —
+        # that's the canonical way users navigate LDAP-as-FS in axross.
+        # SUBSEQUENT segments must be single RDNs (one ``attr=value``
+        # pair) — an unescaped comma there would smuggle additional
+        # RDNs into the resulting DN. F31.
+        for seg in parts[1:]:
+            # Scan escapes left to right: "\\\\," is an escaped backslash
+            # followed by a real separator, not an escaped comma.
+            if _leading_rdn(seg) != seg:
+                raise ValueError(
+                    f"LDAP path segment {seg!r} contains an unescaped "
+                    f"comma — would smuggle additional RDNs into the DN. "
+                    f"Only the base-DN (first segment) may contain "
+                    f"multiple comma-joined RDNs; deeper segments must "
+                    f"be a single RDN. Use the RFC-4514 escape `\\,` "
+                    f"for a literal comma inside an attribute value."
+                )
+            if "=" not in seg:
+                raise ValueError(f"LDAP path segment {seg!r} is not an RDN (must contain `=`)")
+        # Every non-root path must point inside a base — reject paths
+        # whose first segment isn't a recognisable DN-shape.
+        if "=" not in parts[0]:
+            raise ValueError(f"LDAP path base {parts[0]!r} is not a DN (must contain `=`)")
+        # Reverse so the leaf RDN comes first (LDAP convention).
+        return ",".join(reversed(parts))
+
+    def _dn(self, path: str) -> str:
+        """``_path_to_dn`` for the FileBackend surface: a path that names
+        no valid DN names no entry (callers handle OSError, not the
+        guard's ValueError)."""
+        try:
+            return self._path_to_dn(path)
+        except ValueError as exc:
+            raise FileNotFoundError(f"LDAP path {path!r}: {exc}") from exc
+
+    @staticmethod
+    def _dn_to_path(dn: str, base: str = "") -> str:
+        """Convert an LDAP DN back into an axross-style path. ``base``
+        is dropped from the right when present so children of a base
+        DN don't repeat their ancestry in every path."""
+        if not dn:
+            return "/"
+        if base and dn.lower().endswith("," + base.lower()):
+            dn = dn[: -(len(base) + 1)]
+            parts = [p.strip() for p in dn.split(",")]
+            full = list(reversed(parts)) + base.split(",")[::-1]
+        else:
+            full = list(reversed([p.strip() for p in dn.split(",")]))
+        return "/" + "/".join(full)
+
+    # ------------------------------------------------------------------
+    # FileBackend surface
+    # ------------------------------------------------------------------
+
+    def list_dir(self, path: str) -> list[FileItem]:
+        """List children of the entry at ``path``. At ``"/"`` returns
+        the namingContexts (each as a directory)."""
+        dn = self._dn(path)
+        if not dn:
+            # Root → namingContexts.
+            return [FileItem(name=_segment_name(nc), is_dir=True) for nc in self._naming_contexts]
+        # SCOPE=LEVEL — direct children only, every page of them.
+        entries = self._search_all(
+            f"LDAP search {dn}",
+            search_base=dn,
+            search_filter="(objectClass=*)",
+            search_scope=LEVEL,
+            attributes=["*", "+"],
+        )
+        out: list[FileItem] = []
+        for entry in entries:
+            entry_dn = entry.entry_dn
+            # Take the leftmost RDN as the display name.
+            rdn = _leading_rdn(entry_dn)
+            out.append(self._entry_to_item(entry, _segment_name(rdn)))
+        return out
+
+    def stat(self, path: str) -> FileItem:
+        """Return a FileItem for the entry at ``path``. Treats every
+        entry as is_dir=True if it has children, file otherwise."""
+        dn = self._dn(path)
+        if not dn:
+            return FileItem(name="/", is_dir=True)
+        entry = self._base_entry(f"LDAP stat {path}", dn, path)
+        rdn = _leading_rdn(entry.entry_dn)
+        return self._entry_to_item(entry, _segment_name(rdn))
+
+    def is_dir(self, path: str) -> bool:
+        try:
+            return self.stat(path).is_dir
+        except FileNotFoundError:
+            return False
+
+    def exists(self, path: str) -> bool:
+        """False only for noSuchObject; a refused or failed search raises."""
+        try:
+            self.stat(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def open_read(self, path: str) -> IO[bytes]:
+        """Return the entry serialised as LDIF. Useful for ``cat``-
+        style inspection of all attributes on one entry."""
+        dn = self._dn(path)
+        if not dn:
+            # Root has no LDIF — synthesize a tiny summary.
+            text = "# axross-ldap root\n" + "\n".join(
+                f"# namingContext: {n}" for n in self._naming_contexts
+            )
+            return io.BytesIO(text.encode("utf-8"))
+        entry = self._base_entry(f"LDAP open_read {path}", dn, path)
+        try:
+            ldif = entry.entry_to_ldif()
+        except _LDAP_DECODE_ERRORS as exc:
+            raise OSError(f"LDAP open_read {path}: cannot render the entry: {exc}") from exc
+        if isinstance(ldif, str):
+            ldif = ldif.encode("utf-8")
+        return io.BytesIO(ldif)
+
+    def open_write(self, path: str, append: bool = False) -> IO[bytes]:
+        raise OSError(
+            "LDAP backend is read-only — drop down to ``self._conn.modify``"
+            " for direct attribute changes."
+        )
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        raise OSError("LDAP backend is read-only")
+
+    def mkdir(self, path: str) -> None:
+        raise OSError("LDAP backend is read-only")
+
+    def rename(self, src: str, dst: str) -> None:
+        raise OSError("LDAP backend is read-only")
+
+    def chmod(self, path: str, mode: int) -> None:
+        raise OSError("LDAP entries don't have POSIX permissions")
+
+    def copy(self, src: str, dst: str) -> None:
+        raise OSError("LDAP backend is read-only")
+
+    def readlink(self, path: str) -> str:
+        raise OSError("LDAP entries are not symlinks")
+
+    def disk_usage(self, path: str) -> tuple[int, int, int]:
+        return (0, 0, 0)
+
+    def list_versions(self, path: str) -> list:
+        return []
+
+    def open_version_read(self, path: str, version_id: str):
+        raise OSError("LDAP has no per-entry version history")
+
+    def checksum(self, path: str, algorithm: str = "sha256") -> str:
+        return ""
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    def normalize(self, path: str) -> str:
+        return "/" + "/".join(p for p in path.split("/") if p)
+
+    def separator(self) -> str:
+        return "/"
+
+    def join(self, *parts: str) -> str:
+        cleaned = [p.strip("/") for p in parts if p.strip("/")]
+        return "/" + "/".join(cleaned)
+
+    def parent(self, path: str) -> str:
+        if path in ("/", ""):
+            return "/"
+        parts = path.rstrip("/").rsplit("/", 1)
+        return parts[0] if parts[0] else "/"
+
+    def home(self) -> str:
+        return "/"
+
+    # ------------------------------------------------------------------
+    # LDAP-specific verbs (slice 8 — exposed via axross.ldap_search)
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        base_dn: str,
+        filter: str = "(objectClass=*)",
+        *,
+        scope: str = "subtree",
+        attributes: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Run a raw LDAP search against ``base_dn``. Returns up to
+        ``limit`` entries as dicts ``{dn, attributes}``.
+
+        ``scope`` is ``base`` / ``onelevel`` / ``subtree``.
+
+        ``attributes`` defaults to ``["*"]`` (all user attributes);
+        pass ``["*", "+"]`` to also include operational attributes.
+        """
+        scope_map = {"base": BASE, "onelevel": LEVEL, "subtree": SUBTREE}
+        sc = scope_map.get(scope.lower())
+        if sc is None:
+            raise ValueError(f"search scope must be base/onelevel/subtree, got {scope!r}")
+        ok, entries = self._search(
+            f"LDAP search {base_dn} {filter}",
+            search_base=base_dn,
+            search_filter=filter,
+            search_scope=sc,
+            attributes=attributes or ["*"],
+            size_limit=int(limit),
+        )
+        out: list[dict] = []
+        for entry in entries if ok else []:
+            attrs: dict = {}
+            for attr_name in entry.entry_attributes:
+                vals = entry[attr_name].values
+                attrs[attr_name] = vals if len(vals) != 1 else vals[0]
+            out.append({"dn": entry.entry_dn, "attributes": attrs})
+        return out
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _search(self, what: str, **kwargs) -> tuple[bool, list]:
+        """``Connection.search`` plus its entries, failing as OSError.
+
+        ldap3 raises LDAPException for protocol errors but lets its BER
+        decoder's KeyError / IndexError / ValueError ... through for an
+        answer it cannot decode (see _LDAP_DECODE_ERRORS); the entries
+        are built from the answer too, so they are read here as well.
+        """
+        try:
+            ok = self._conn.search(**kwargs)
+            entries = list(self._conn.entries)
+        except LDAPException as exc:
+            raise OSError(f"{what}: {exc}") from exc
+        except _LDAP_DECODE_ERRORS as exc:
+            raise OSError(
+                f"{what}: malformed answer from the server ({type(exc).__name__}: {exc})"
+            ) from exc
+        return bool(ok), entries
+
+    def _base_entry(self, what: str, dn: str, path: str):
+        """The entry *dn* itself (a BASE search). FileNotFoundError only
+        for noSuchObject (32) or a success without an entry: a refusal
+        (insufficientAccessRights, 50) is PermissionError and any other
+        result - busy, unavailable, a time limit - OSError. All of them
+        used to read as "not found"."""
+        ok, entries = self._search(
+            what,
+            search_base=dn,
+            search_filter="(objectClass=*)",
+            search_scope=BASE,
+            attributes=["*", "+"],
+        )
+        if ok and entries:
+            return entries[0]
+        result = getattr(self._conn, "result", None)
+        result = result if isinstance(result, dict) else {}
+        code = result.get("result", 0)
+        if ok or code in (0, None, _NO_SUCH_OBJECT):
+            raise FileNotFoundError(f"LDAP entry not found: {path}")
+        reason = f"{what}: {result.get('description') or 'result'} ({code})"
+        if code == _INSUFFICIENT_ACCESS:
+            raise PermissionError(reason)
+        raise OSError(reason)
+
+    def _search_all(self, what: str, **kwargs) -> list:
+        """Every entry of a search, page by page (RFC 2696). A server that
+        still ends with anything but success - sizeLimitExceeded where it
+        ignores paging - gave a cut listing that looked complete (review
+        B7, 2026-10-17): that is an OSError now."""
+        entries: list = []
+        cookie = None
+        for _page in range(_MAX_PAGES):
+            _ok, page = self._search(what, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
+            entries.extend(page)
+            result = getattr(self._conn, "result", None) or {}
+            code = result.get("result", 0)
+            if code not in (0, None):
+                raise OSError(f"{what}: the listing is incomplete - the server stopped after "
+                              f"{len(entries)} entries ({result.get('description') or code})")
+            try:
+                cookie = result["controls"][_PAGED_OID]["value"]["cookie"]
+            except (KeyError, TypeError):
+                cookie = None
+            if not cookie:
+                return entries
+        raise OSError(f"{what}: more than {_MAX_PAGES} pages of {_PAGE_SIZE} entries")
+
+    def _entry_to_item(self, entry, name: str) -> FileItem:
+        """Turn an ldap3 entry into a FileItem. Children-presence is a
+        secondary search; we estimate is_dir from objectClass first
+        (objects like ``organizationalUnit`` / ``container`` are
+        almost always containers) and only fall through to a SEARCH
+        for ambiguous classes."""
+        oclass = []
+        try:
+            oclass = [c.lower() for c in entry["objectClass"].values]
+        except Exception:  # noqa: BLE001
+            pass
+        container_classes = {
+            "organizationalunit",
+            "container",
+            "domain",
+            "country",
+            "groupofnames",
+            "groupofuniquenames",
+            "organizationalrole",
+            "dcobject",
+        }
+        is_dir = bool(set(oclass) & container_classes)
+        # Modified time from operational attribute when present.
+        modified = datetime.fromtimestamp(0)
+        try:
+            ts = entry["modifyTimestamp"].value
+            if isinstance(ts, datetime):
+                modified = ts
+        except Exception:  # noqa: BLE001
+            pass
+        # Size: the bytes open_read returns - the entry's LDIF. An entry
+        # that cannot be rendered cannot be read either.
+        size = 0
+        if not is_dir:
+            try:
+                ldif = entry.entry_to_ldif()
+                size = len(ldif.encode("utf-8") if isinstance(ldif, str) else ldif)
+            except _LDAP_DECODE_ERRORS:
+                pass
+        return FileItem(
+            name=name,
+            size=size if not is_dir else 0,
+            modified=modified,
+            permissions=0o555 if is_dir else 0o444,
+            is_dir=is_dir,
+        )

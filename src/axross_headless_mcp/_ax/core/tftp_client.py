@@ -1,0 +1,908 @@
+"""TFTP backend implementing the FileBackend protocol.
+
+TFTP (RFC 1350) is a UDP-based file-transfer protocol with a tiny
+surface: ``RRQ`` (read), ``WRQ`` (write), ``DATA``, ``ACK``, ``ERROR``.
+There is no native ``LIST``, no directory hierarchy, no rename, no
+chmod, no atime — TFTP servers are usually deliberately stripped
+(PXE boot, network appliance firmware drops, embedded device
+config push).
+
+For discovery, :meth:`TftpSession.find_files` walks a wordlist of
+common TFTP filenames (router configs, switch firmware, PXE-boot
+artefacts) and probes each via a brief RRQ. Hits go into a
+per-session cache so subsequent ``find_files`` runs return them
+instantly.
+
+Two consequences shape this backend:
+
+1. **No directory listing exists.** ``list_dir`` cannot enumerate
+   anything from the wire. Two opt-in modes are offered instead:
+
+   * **Disabled (default)** — ``list_dir`` returns an empty list.
+     Stat / read / write of paths the user types literally still
+     work. Honest about the protocol: nothing is fabricated.
+   * **Configured file-list** — when ``tftp_filelist_enabled`` is
+     True and ``tftp_filelist`` is set on the profile, those paths
+     get probed (RRQ + abort-on-first-block) and reported as
+     FileItems. Sizes come from the server's ``OACK`` if the
+     ``tsize`` option is supported, else marked as 0.
+
+2. **Per-transfer size cap.** TFTP block-counters wrap after 65535
+   blocks of 512 bytes (≈32 MiB) on classic servers, or higher with
+   the ``blksize`` extension. Some lab/embedded servers cap much
+   lower. ``tftp_max_size_bytes`` (default 16 MiB) is enforced
+   before every transfer and refuses anything bigger up-front.
+
+**Proxy support: SOCKS5 only.** TFTP is UDP, so only SOCKS5's
+UDP ASSOCIATE can relay it (HTTP CONNECT and SOCKS4 are TCP-only and
+are refused, never bypassed). The server must be given as an IP
+address: tftpy resolves names locally, which would leak the lookup.
+
+Requires the ``tftpy`` package (``pip install axross[tftp]``).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import io
+import logging
+import os
+import posixpath
+import re
+import socket
+import time
+from datetime import datetime
+from typing import IO
+
+from core import transfer_hooks
+from core.backend import SessionLifecycle
+from core.read_spool import new_named_spool
+from models.file_item import FileItem
+
+log = logging.getLogger(__name__)
+
+try:
+    import tftpy  # type: ignore[import-not-found]
+
+    TFTPY_AVAILABLE = True
+except ImportError:
+    tftpy = None  # type: ignore[assignment]
+    TFTPY_AVAILABLE = False
+
+
+class _TidFilter:
+    """A tftpy context's UDP socket that hands it only packets from the
+    transfer's peer.
+
+    tftpy's ``TftpContext.cycle`` logs "Discarding" for a packet from
+    another host or from a port other than the transfer ID (RFC 1350 4)
+    - and then processes it all the same: anyone who can send UDP to the
+    client's port could put a block of their own into a download
+    (firmware). Here such a packet is dropped and the wait goes on for
+    what is left of the timeout. Before the server's first answer fixes
+    the TID any port of the server's address is taken, as the RFC says.
+    """
+
+    def __init__(self, sock, context) -> None:
+        self._sock = sock
+        self._context = context
+
+    def recvfrom(self, size: int, *args):
+        sock, context = self._sock, self._context
+        timeout = sock.gettimeout()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while True:
+                buffer, peer = sock.recvfrom(size, *args)
+                host, port = peer[0], peer[1]
+                tid = context.tidport
+                if host == context.address and (not tid or port == tid):
+                    return buffer, peer
+                log.warning(
+                    "TFTP: dropped a packet from %s:%s; the transfer is with %s:%s",
+                    host, port, context.address, tid or context.port,
+                )
+                if deadline is not None:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise socket.timeout("timed out")
+                    sock.settimeout(left)
+        finally:
+            if sock.gettimeout() != timeout:
+                sock.settimeout(timeout)
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+def _install_tid_guard() -> None:
+    """Make every tftpy context receive through :class:`_TidFilter`
+    (idempotent; tftpy creates its socket in the context's __init__)."""
+    import tftpy.TftpContexts as contexts
+
+    base = contexts.TftpContext
+    if getattr(base.cycle, "_axross_tid_guard", False):
+        return
+    original = base.cycle
+
+    def cycle(self):
+        if not isinstance(self.sock, _TidFilter):
+            self.sock = _TidFilter(self.sock, self)
+        return original(self)
+
+    cycle._axross_tid_guard = True  # type: ignore[attr-defined]
+    base.cycle = cycle
+
+
+if TFTPY_AVAILABLE:
+    _install_tid_guard()
+
+
+# Default per-transfer cap. Classic TFTP without ``blksize`` blows
+# up at ~32 MiB; we go conservative because lab and embedded
+# servers tend to cap lower (8 / 16 MiB).
+DEFAULT_MAX_BYTES = 16 * 1024 * 1024
+
+
+# Filename allow-list for the configured file-list. TFTP filenames
+# are 7-bit-ASCII path-style. We sanitise to keep server-side
+# format-string / shell-injection trivially impossible.
+_FILENAME_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
+
+
+def _validate_filename(name: str) -> str:
+    """Strip leading slashes (TFTP servers reject them on most
+    daemons) and ensure the name fits the safe-character class.
+    """
+    cleaned = name.lstrip("/").strip()
+    if not cleaned:
+        raise OSError("TFTP filename is empty")
+    if not _FILENAME_RE.fullmatch(cleaned):
+        raise OSError(
+            f"TFTP filename {name!r} contains characters outside the [A-Za-z0-9._/-] safe set",
+        )
+    return cleaned
+
+
+#: The options of a size probe: ``tsize`` asks the server for the size
+#: in its option acknowledgement (RFC 2349).
+_TSIZE_OPTIONS = {"tsize": "0"}
+
+
+def _tftp_error(request: str, name: str, exc: Exception) -> OSError:
+    """The OSError for a failed request (``RRQ`` / ``WRQ``):
+    FileNotFoundError only for error code 1 (tftpy's
+    TftpFileNotFoundError); TimeoutError when the server did not answer
+    (tftpy's TftpTimeout: "Timed-out waiting for traffic", which read as
+    an unknown failure); an access violation and every other error packet
+    say nothing about the file."""
+    if tftpy is not None and isinstance(exc, tftpy.TftpFileNotFoundError):
+        return FileNotFoundError(errno.ENOENT, f"TFTP {request} {name!r}: {exc}", name)
+    if tftpy is not None and isinstance(exc, tftpy.TftpTimeout):
+        return TimeoutError(
+            errno.ETIMEDOUT, f"TFTP {request} {name!r}: the server did not answer ({exc})"
+        )
+    return OSError(f"TFTP {request} {name!r}: {exc}")
+
+
+def _rrq_error(name: str, exc: Exception) -> OSError:
+    """The OSError for a failed read request (see :func:`_tftp_error`)."""
+    return _tftp_error("RRQ", name, exc)
+
+
+class _NewBlocks:
+    """Bytes of the DATA blocks seen so far, each block counted once.
+
+    tftpy hands the packet hook every DATA packet it receives or sends, a
+    resent one too (a lost ACK on a busy network): counted twice, a
+    download could pass the size cap below its real size."""
+
+    def __init__(self) -> None:
+        self.total = 0
+        self._last: int | None = None
+
+    def add(self, pkt) -> bool:
+        """Count *pkt* if it is a DATA block not seen yet (True)."""
+        import tftpy.TftpPacketTypes as packets
+
+        if not isinstance(pkt, packets.TftpPacketDAT) or pkt.blocknumber == self._last:
+            return False
+        self._last = pkt.blocknumber
+        data = getattr(pkt, "data", b"")
+        self.total += len(data) if isinstance(data, (bytes, bytearray)) else 0
+        return True
+
+
+class TftpSession(SessionLifecycle):
+    """TFTP backend implementing the FileBackend protocol.
+
+    Read/write of literal paths works in any mode. Listing requires
+    the operator to opt in by configuring ``tftp_filelist`` and
+    flipping ``tftp_filelist_enabled``.
+    """
+
+    # No directory hierarchy on TFTP.
+    supports_symlinks = False
+    supports_hardlinks = False
+
+    # Cap on the per-session find-cache so a 50 000-entry wordlist
+    # does not blow process memory. Older hits are dropped LRU-style.
+    FIND_CACHE_LIMIT = 256
+
+    def __init__(
+        self,
+        host: str,
+        port: int = 69,
+        filelist: list[str] | None = None,
+        filelist_enabled: bool = False,
+        max_size_bytes: int = DEFAULT_MAX_BYTES,
+        timeout: float = 5.0,
+        retries: int = 3,
+        proxy_type: str = "none",
+        proxy_host: str = "",
+        proxy_port: int = 0,
+        proxy_username: str = "",
+        proxy_password: str = "",
+        address_family: str = "auto",
+    ):
+        import ipaddress
+
+        from core.proxy import proxy_config_from_kwargs, refuse_unsupported_proxy
+
+        self._proxy = proxy_config_from_kwargs(
+            {
+                "proxy_type": proxy_type,
+                "proxy_host": proxy_host,
+                "proxy_port": proxy_port,
+                "proxy_username": proxy_username,
+                "proxy_password": proxy_password,
+            }
+        )
+        if self._proxy is not None:
+            if self._proxy.proxy_type != "socks5":
+                refuse_unsupported_proxy(
+                    "TFTP",
+                    self._proxy.proxy_type,
+                    self._proxy.host,
+                    "TFTP is UDP and only SOCKS5 (UDP ASSOCIATE) can relay it.",
+                )
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                refuse_unsupported_proxy(
+                    "TFTP",
+                    self._proxy.proxy_type,
+                    self._proxy.host,
+                    "tftpy resolves host names locally, which would leak the lookup "
+                    "around the proxy; use the server's IP address.",
+                )
+        if (address_family or "auto") == "ipv6":
+            # tftpy opens an AF_INET socket and resolves with
+            # gethostbyname: an "IPv6 only" profile would go out over IPv4.
+            raise OSError(
+                errno.EAFNOSUPPORT,
+                "TFTP in axross speaks IPv4 only (the tftpy library); set the "
+                "profile's IP version to Auto or IPv4",
+            )
+        if not TFTPY_AVAILABLE:
+            raise ImportError(
+                "TFTP support requires tftpy. Install with: pip install axross[tftp]",
+            )
+        self._host = host
+        self._port = int(port)
+        self._max_size_bytes = int(max_size_bytes or DEFAULT_MAX_BYTES)
+        self._timeout = float(timeout)
+        self._retries = int(retries)
+        # Sanitise the configured list once at ctor time so a hostile
+        # profile.json can't inject newline / shell-meta into a TFTP
+        # filename via the configured list.
+        cleaned: list[str] = []
+        for entry in filelist or ():
+            try:
+                cleaned.append(_validate_filename(entry))
+            except OSError as exc:
+                log.warning("TFTP: dropping bad filelist entry %r: %s", entry, exc)
+        self._filelist = cleaned
+        self._filelist_enabled = bool(filelist_enabled)
+        # Per-session "find" cache: filename → (size, last_seen_ts).
+        # Bounded to FIND_CACHE_LIMIT entries; older entries dropped
+        # when the cap is hit.
+        self._find_cache: dict[str, tuple[int, datetime]] = {}
+
+        # tftpy's TftpClient is stateless per-transfer (UDP, no
+        # persistent connection). We construct it lazily inside each
+        # transfer to avoid holding a socket the user never uses.
+        log.info(
+            "TFTP session ready: %s:%d (filelist=%s, %d entries, max=%d B)",
+            host,
+            self._port,
+            "on" if self._filelist_enabled else "off",
+            len(self._filelist),
+            self._max_size_bytes,
+        )
+
+    # ------------------------------------------------------------------
+    # FileBackend identity
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return f"TFTP: {self._host}:{self._port}"
+
+    @property
+    def connected(self) -> bool:
+        # TFTP is connectionless. A session is "live" as long as the
+        # session object exists. There is no NOOP probe to perform.
+        return True
+
+    def disconnect(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    def home(self) -> str:
+        return "/"
+
+    def separator(self) -> str:
+        return "/"
+
+    def join(self, *parts: str) -> str:
+        cleaned = [p.strip("/") for p in parts if p]
+        if not cleaned:
+            return "/"
+        return "/" + "/".join(cleaned)
+
+    def parent(self, path: str) -> str:
+        return posixpath.dirname(path) or "/"
+
+    def normalize(self, path: str) -> str:
+        if not path:
+            return "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        return path
+
+    # ------------------------------------------------------------------
+    # Read surface
+    # ------------------------------------------------------------------
+
+    def list_dir(self, path: str) -> list[FileItem]:
+        """List configured files (opt-in) or return an empty list.
+
+        Subdirectory listing is meaningless on TFTP; we filter the
+        configured list by the path prefix the user navigated to so
+        a list like ``["images/menu.png", "configs/dhcpd.conf"]``
+        produces sensible "directories" `images/` and `configs/`
+        when the user is at root.
+        """
+        path = self.normalize(path)
+        if not self._filelist_enabled or not self._filelist:
+            return []
+
+        prefix = path.lstrip("/")
+        if prefix and not prefix.endswith("/"):
+            prefix = prefix + "/"
+
+        entries: dict[str, FileItem] = {}
+        for entry in self._filelist:
+            if prefix and not entry.startswith(prefix):
+                continue
+            tail = entry[len(prefix) :]
+            if "/" in tail:
+                # Subdirectory entry — synthesise a directory node.
+                dirname = tail.split("/", 1)[0]
+                if dirname not in entries:
+                    entries[dirname] = FileItem(
+                        name=dirname,
+                        size=0,
+                        modified=datetime.fromtimestamp(0),
+                        permissions=0o500,
+                        is_dir=True,
+                        is_link=False,
+                    )
+                continue
+            # Leaf file. Probe size if cheap; otherwise mark as 0. A file
+            # the server answers "File not found" for is not shown: it
+            # read as an empty file that could not be opened.
+            try:
+                size = self._probe_size(entry, missing_raises=True)
+            except FileNotFoundError:
+                continue
+            entries[tail] = FileItem(
+                name=tail,
+                size=size,
+                modified=datetime.fromtimestamp(0),
+                permissions=0o400,
+                is_dir=False,
+                is_link=False,
+            )
+
+        return sorted(entries.values(), key=lambda i: (not i.is_dir, i.name))
+
+    def _udp_scope(self):
+        """Route tftpy's internal UDP socket through the profile proxy."""
+        from core.proxy import patched_module_udp_socket
+
+        if self._proxy is None:
+            return contextlib.nullcontext()
+        import tftpy.TftpContexts as contexts
+
+        return patched_module_udp_socket(contexts, self._proxy)
+
+    def _probe_size(self, name: str, *, strict: bool = False,
+                    missing_raises: bool = False) -> int:
+        """Best-effort: ask the server for the file's ``tsize`` via
+        the OACK option. Many tftpd daemons honour this; some don't.
+        Returns 0 when unavailable. *strict*: a failed request raises as
+        :func:`_rrq_error` types it (FileNotFoundError for error code 1)
+        instead of reading as size 0 - stat() of a missing file returned
+        an item.
+
+        tftpy passes every received packet to the packet hook, the OACK
+        included, so a server that reports ``tsize`` answers before any
+        data block and the transfer is abandoned there. Without tsize
+        the file is downloaded and measured - up to the size cap: a larger
+        one stops there, its size unknown (0). *missing_raises*: error
+        code 1 is a FileNotFoundError, everything else still 0.
+        """
+        import tftpy.TftpPacketTypes as packets
+
+        class _SizeKnown(Exception):
+            def __init__(self, size: int) -> None:
+                self.size = size
+
+        blocks = _NewBlocks()
+        cap = self._max_size_bytes
+
+        def _hook(pkt) -> None:
+            if isinstance(pkt, packets.TftpPacketOACK):
+                raw = pkt.options.get("tsize")
+                try:
+                    size = int(raw)
+                except (TypeError, ValueError):
+                    return
+                if size >= 0:
+                    raise _SizeKnown(size)
+            elif blocks.add(pkt) and blocks.total > cap:
+                raise _SizeKnown(0)  # larger than a transfer may be
+
+        try:
+            client = tftpy.TftpClient(  # type: ignore[union-attr]
+                self._host,
+                self._port,
+                options=dict(_TSIZE_OPTIONS),
+            )
+            with new_named_spool(tag="tftp") as tmp, self._udp_scope():
+                client.download(
+                    name,
+                    tmp,
+                    packethook=_hook,
+                    timeout=self._timeout,
+                    retries=1,
+                )
+                # The server sent data without a usable tsize: measure.
+                tmp.seek(0, io.SEEK_END)
+                return tmp.tell()
+        except _SizeKnown as known:
+            return known.size
+        except Exception as exc:  # noqa: BLE001
+            log.debug("TFTP probe(%r) failed: %s", name, exc)
+            if strict or missing_raises:
+                error = _rrq_error(name, exc)
+                if isinstance(error, FileNotFoundError):
+                    raise error from exc
+            if strict:
+                # Another refusal may be of the tsize option alone (error 8):
+                # the plain read request decides; a file it opens is there,
+                # its size unknown.
+                self._probe_present(name)
+            return 0
+
+    def stat(self, path: str) -> FileItem:
+        path = self.normalize(path)
+        if path == "/":
+            return FileItem(
+                name="/",
+                is_dir=True,
+                is_link=False,
+                size=0,
+                modified=datetime.fromtimestamp(0),
+                permissions=0o500,
+            )
+        name = _validate_filename(path)
+        size = self._probe_size(name, strict=True)
+        return FileItem(
+            name=posixpath.basename(name),
+            size=size,
+            modified=datetime.fromtimestamp(0),
+            permissions=0o400,
+            is_dir=False,
+            is_link=False,
+        )
+
+    def is_dir(self, path: str) -> bool:
+        path = self.normalize(path)
+        if path == "/":
+            return True
+        if not self._filelist_enabled:
+            return False
+        prefix = path.lstrip("/") + "/"
+        return any(e.startswith(prefix) for e in self._filelist)
+
+    def exists(self, path: str) -> bool:
+        path = self.normalize(path)
+        if path == "/" or self.is_dir(path):
+            return True
+        name = _validate_filename(path)
+        if self._filelist_enabled and name in self._filelist:
+            # The list is only a shortcut to True: a file on the server
+            # but not on the list was "absent", and the transfer worker
+            # (if_exists="fail") went ahead and overwrote it.
+            return True
+        # TFTP has no metadata operation: a read request is the only
+        # existence check. It stops at the server's first data packet, so
+        # a file of any size costs one block (a file over the read cap
+        # used to fail the read and count as absent). Only error code 1
+        # "File not found" means False; a timeout, an access violation or
+        # any other error packet is an OSError - the transfer worker and
+        # server_side_copy(overwrite=False) take False as the go-ahead.
+        try:
+            self._probe_present(name)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _probe_present(self, name: str) -> None:
+        """Return once the server starts sending *name*; raise
+        FileNotFoundError for error code 1, OSError for anything else."""
+        import tftpy.TftpPacketTypes as packets
+
+        class _Present(Exception):
+            pass
+
+        def _hook(pkt) -> None:
+            # tftpy hands every received packet to the hook, an error
+            # packet too; data or an option acknowledgement means the
+            # server opened the file.
+            if isinstance(pkt, (packets.TftpPacketDAT, packets.TftpPacketOACK)):
+                raise _Present
+
+        client = tftpy.TftpClient(self._host, self._port)  # type: ignore[union-attr]
+        with new_named_spool(tag="tftp") as tmp:
+            try:
+                with self._udp_scope():
+                    client.download(
+                        name,
+                        tmp,
+                        packethook=_hook,
+                        timeout=self._timeout,
+                        retries=self._retries,
+                    )
+            except _Present:
+                return
+            except OSError:
+                raise
+            except Exception as exc:  # tftpy raises tftpy.TftpException
+                raise _rrq_error(name, exc) from exc
+
+    def open_read(self, path: str, mode: str = "rb") -> IO:
+        path = self.normalize(path)
+        name = _validate_filename(path)
+        client = tftpy.TftpClient(self._host, self._port)  # type: ignore[union-attr]
+
+        # tftpy writes into the open spool (a file object: given a path,
+        # tftpy deletes that file on "File not found", and the spool's own
+        # clean-up then reported the spool as the missing file). The size
+        # cap, progress and Cancel (core.transfer_hooks) are checked per
+        # new DATA block in the packet hook.
+        cap = self._max_size_bytes
+        blocks = _NewBlocks()
+        hooks = transfer_hooks.current()
+
+        def _packethook(pkt):
+            if not blocks.add(pkt):
+                return
+            if blocks.total > cap:
+                raise OSError(
+                    f"TFTP read of {name!r} exceeded {cap} byte cap (at {blocks.total} bytes)",
+                )
+            if hooks is not None:
+                hooks.received(blocks.total)  # InterruptedError on Cancel
+
+        with new_named_spool(tag="tftp") as tmp:
+            try:
+                with self._udp_scope():
+                    client.download(
+                        name,
+                        tmp,
+                        packethook=_packethook,
+                        timeout=self._timeout,
+                        retries=self._retries,
+                    )
+            except OSError:
+                raise
+            except Exception as exc:  # tftpy raises tftpy.TftpException
+                raise _rrq_error(name, exc) from exc
+            tmp.seek(0)
+            return io.BytesIO(tmp.read())
+
+    # ------------------------------------------------------------------
+    # Write surface — limited
+    # ------------------------------------------------------------------
+
+    def open_write(self, path: str, append: bool = False) -> IO:
+        """Return a buffer that uploads on close. Note: TFTP writes
+        only succeed on servers configured with ``--create`` /
+        ``--writable`` — most production tftpd daemons reject WRQ
+        outright. The size cap applies to the buffered bytes
+        BEFORE upload; if the user writes more than the cap, close()
+        raises rather than triggering a megabyte-flood transfer.
+        """
+        if append:
+            raise OSError("TFTP WRQ does not support append.")
+        path = self.normalize(path)
+        name = _validate_filename(path)
+        return _TftpWriter(self, name)
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        raise OSError(
+            "TFTP has no DELETE operation — the protocol does not "
+            "support removing files from the server.",
+        )
+
+    def mkdir(self, path: str, parents: bool = False, exist_ok: bool = False) -> None:
+        raise OSError(
+            "TFTP has no directory hierarchy — mkdir is not supported.",
+        )
+
+    def rename(self, src: str, dst: str) -> None:
+        raise OSError("TFTP does not support rename.")
+
+    def chmod(self, path: str, mode: int) -> None:
+        raise OSError("TFTP does not carry POSIX permissions.")
+
+    def copy(self, src: str, dst: str) -> None:
+        raise OSError("TFTP has no server-side copy.")
+
+    # ------------------------------------------------------------------
+    # Wordlist discovery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def default_wordlist_path() -> str | None:
+        """Return the bundled wordlist path under ``resources/`` or
+        ``None`` when the install layout doesn't ship one (e.g. a
+        slim wheel that excluded resources)."""
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(here, "resources", "wordlists", "tftp_common.txt")
+        return candidate if os.path.isfile(candidate) else None
+
+    @staticmethod
+    def load_wordlist(path: str) -> list[str]:
+        """Load a wordlist file. Lines starting with ``#`` and blanks
+        are skipped. Each surviving line is run through
+        :func:`_validate_filename`; entries that fail are dropped
+        (with a debug log) so a polluted list can't blow up the probe.
+        """
+        out: list[str] = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    try:
+                        out.append(_validate_filename(line))
+                    except OSError as exc:
+                        log.debug("wordlist: dropping %r: %s", line, exc)
+        except OSError as exc:
+            raise OSError(f"Cannot read wordlist {path}: {exc}") from exc
+        return out
+
+    def find_files(
+        self,
+        wordlist: list[str] | str | None = None,
+        on_progress=None,
+    ) -> list[FileItem]:
+        """Probe each entry in ``wordlist`` via a brief RRQ. Hits
+        are returned as ``FileItem``s and added to the per-session
+        find-cache; misses are silent.
+
+        ``wordlist`` may be:
+
+        * ``None`` → use the bundled list under
+          ``resources/wordlists/tftp_common.txt`` (raises if the
+          install layout lacks it).
+        * ``str`` → path to a user-supplied wordlist file.
+        * ``list[str]`` → an in-memory list of names.
+
+        ``on_progress(name, hit_so_far, total)`` is called once per
+        probed entry so a UI button can drive a progress bar.
+        Returns the list of hits sorted by name.
+        """
+        if isinstance(wordlist, list):
+            names = [_validate_filename(x) for x in wordlist]
+        else:
+            path = wordlist or self.default_wordlist_path()
+            if not path:
+                raise OSError(
+                    "TFTP find: no wordlist supplied and no bundled "
+                    "wordlist found under resources/wordlists/"
+                )
+            names = self.load_wordlist(path)
+
+        hits: list[FileItem] = []
+        total = len(names)
+        for i, name in enumerate(names):
+            cached = self._find_cache.get(name)
+            if cached is not None:
+                size, mtime = cached
+                hits.append(
+                    FileItem(
+                        name=name,
+                        size=size,
+                        modified=mtime,
+                        permissions=0o400,
+                        is_dir=False,
+                        is_link=False,
+                    )
+                )
+                if on_progress:
+                    on_progress(name, len(hits), total)
+                continue
+            try:
+                size = self._probe_size(name)
+            except Exception as exc:  # noqa: BLE001 — probe is best-effort
+                log.debug("TFTP find: probe(%r) raised: %s", name, exc)
+                size = -1
+            if size > 0:
+                self._record_find_hit(name, size)
+                hits.append(
+                    FileItem(
+                        name=name,
+                        size=size,
+                        modified=datetime.now(),
+                        permissions=0o400,
+                        is_dir=False,
+                        is_link=False,
+                    )
+                )
+            if on_progress:
+                on_progress(name, len(hits), total)
+        return sorted(hits, key=lambda i: i.name)
+
+    def _record_find_hit(self, name: str, size: int) -> None:
+        """Insert a hit into the find-cache, trimming the oldest entry
+        when the cap is reached."""
+        if name in self._find_cache:
+            self._find_cache[name] = (size, datetime.now())
+            return
+        if len(self._find_cache) >= self.FIND_CACHE_LIMIT:
+            # dict keeps insertion order; pop the oldest.
+            try:
+                oldest = next(iter(self._find_cache))
+                self._find_cache.pop(oldest, None)
+            except StopIteration:
+                pass
+        self._find_cache[name] = (size, datetime.now())
+
+    def find_cache_snapshot(self) -> list[FileItem]:
+        """Return the current in-memory cache as FileItems (no probing).
+        Useful for UI panes that want to show "previously found" hits
+        before kicking off a fresh scan."""
+        return sorted(
+            (
+                FileItem(
+                    name=name,
+                    size=size,
+                    modified=mtime,
+                    permissions=0o400,
+                    is_dir=False,
+                    is_link=False,
+                )
+                for name, (size, mtime) in self._find_cache.items()
+            ),
+            key=lambda i: i.name,
+        )
+
+    def clear_find_cache(self) -> None:
+        self._find_cache.clear()
+
+    # ------------------------------------------------------------------
+    # Internal: actual upload (called by _TftpWriter.close)
+    # ------------------------------------------------------------------
+
+    def _upload_bytes(self, name: str, data: bytes, hooks=None) -> None:
+        """Send *data* as *name* (WRQ). *hooks* (core.transfer_hooks):
+        progress per new DATA block, and Cancel between blocks."""
+        if len(data) > self._max_size_bytes:
+            raise OSError(
+                f"TFTP upload of {name!r} ({len(data)} bytes) exceeds "
+                f"{self._max_size_bytes} byte cap.",
+            )
+        blocks = _NewBlocks()
+        total = len(data)
+
+        def _packethook(pkt):
+            if blocks.add(pkt) and hooks is not None:
+                hooks.sent(blocks.total, total)  # InterruptedError on Cancel
+
+        with new_named_spool(tag="tftp") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            tmp.seek(0)
+            client = tftpy.TftpClient(self._host, self._port)  # type: ignore[union-attr]
+            try:
+                with self._udp_scope():
+                    client.upload(
+                        name,
+                        tmp,
+                        packethook=_packethook,
+                        timeout=self._timeout,
+                        retries=self._retries,
+                    )
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                raise _tftp_error("WRQ", name, exc) from exc
+
+
+class _TftpWriter:
+    """File-like writer that buffers in memory then ships via WRQ on
+    close. Aborts cleanly if discarded without close()."""
+
+    def __init__(self, session: TftpSession, name: str):
+        self._session = session
+        self._name = name
+        self._buf = io.BytesIO()
+        self._closed = False
+        # The running transfer's progress and Cancel: the WRQ happens in
+        # close(), after the copy loop.
+        self._hooks = transfer_hooks.current()
+        if self._hooks is not None:
+            self._hooks.expect_upload()
+
+    def write(self, data: bytes) -> int:
+        if self._closed:
+            raise OSError("TFTP writer closed")
+        # Eagerly enforce the cap so the user sees the error at write
+        # time rather than buried in close().
+        if self._buf.tell() + len(data) > self._session._max_size_bytes:
+            raise OSError(
+                f"TFTP upload of {self._name!r} would exceed "
+                f"{self._session._max_size_bytes} byte cap "
+                f"(buffered {self._buf.tell() + len(data)} bytes).",
+            )
+        return self._buf.write(data)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._session._upload_bytes(self._name, self._buf.getvalue(), self._hooks)
+        finally:
+            self._buf.close()
+
+    def discard(self) -> None:
+        """Drop buffered bytes without uploading. Used by the transfer
+        cancel path so a half-written blob doesn't get pushed."""
+        if self._closed:
+            return
+        self._closed = True
+        self._buf.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.discard()
+        else:
+            self.close()

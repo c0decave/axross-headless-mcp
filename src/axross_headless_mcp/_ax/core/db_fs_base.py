@@ -1,0 +1,650 @@
+"""Base class for backends that store the filesystem inside a
+relational / key-value DB.
+
+Common shape — every concrete subclass populates a single logical
+table or collection of rows::
+
+    (path TEXT PRIMARY KEY,
+     parent TEXT NOT NULL,
+     is_dir BOOLEAN NOT NULL,
+     mode INTEGER,
+     mtime TIMESTAMP,
+     content BLOB)
+
+The base class implements the FileBackend protocol against a tiny
+adapter interface that subclasses provide:
+
+* :meth:`_db_get(path)` → row dict or None
+* :meth:`_db_list(parent)` → list of row dicts
+* :meth:`_db_insert(row)`
+* :meth:`_db_update(path, **fields)`
+* :meth:`_db_delete(path)`
+* :meth:`_db_delete_subtree(path)`
+
+That's it. Adding a new DB then means writing the adapter (~150
+LOC) without touching the FileBackend semantics.
+
+Path semantics: POSIX-style; ``/`` is the root. The root row is
+implicit — ``stat("/")`` always returns a synthetic dir entry so
+the UI can pivot off it without the table needing an explicit row
+for ``/``.
+"""
+
+from __future__ import annotations
+
+import errno
+import functools
+import io
+import logging
+import posixpath
+from datetime import datetime, timezone
+from typing import IO, Any, Iterable
+
+from core.answer_fields import as_size
+from core.backend import SessionLifecycle
+from models.file_item import FileItem
+
+log = logging.getLogger(__name__)
+
+
+def parse_mode(value, default: int) -> int:
+    """Permission bits from a stored ``mode``, else *default*.
+
+    The store is shared: any client can put anything in the field. An
+    int (not bool) or a decimal / ``0o`` octal string (Redis stores
+    text) is accepted and masked to the permission bits; anything else -
+    no number, negative, NaN - gives *default*.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value & 0o7777 if value >= 0 else default
+    if isinstance(value, bytes):
+        value = value.decode("ascii", "replace")
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            if text.startswith("0o"):
+                return int(text[2:], 8) & 0o7777
+            if text.isascii() and text.isdigit() and len(text) <= 12:
+                return int(text) & 0o7777
+        except ValueError:
+            return default
+    return default
+
+
+def _driver_errors_as_oserror(method):
+    """A database driver's own errors as OSError.
+
+    redis.RedisError, pymongo.PyMongoError and psycopg.Error are not
+    OSError, so a dropped connection or a server-side error answer
+    (Redis WRONGTYPE for a key of another type) escaped to callers that
+    handle OSError. Each backend names its driver's base class in
+    ``_DRIVER_ERRORS``.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except self._DRIVER_ERRORS as exc:
+            raise OSError(f"{type(self).__name__}.{method.__name__}: {exc}") from exc
+        except UnicodeEncodeError as exc:
+            # A name from a non-UTF-8 file system (surrogate escapes) cannot
+            # be stored as text: an OSError the copy reports per file, not
+            # a UnicodeEncodeError that ended the whole job.
+            raise OSError(
+                errno.EILSEQ,
+                f"{type(self).__name__}.{method.__name__}: the name is not valid UTF-8",
+            ) from exc
+
+    return wrapper
+
+
+def _now() -> datetime:
+    """The write timestamp, AWARE. A naive value means something different
+    to every store: BSON reads it as UTC, a Postgres TIMESTAMPTZ column in
+    the session's zone (the server's setting, not this machine's)."""
+    return datetime.now(timezone.utc)
+
+
+class _RowAdapter:
+    """Subclass interface. Subclasses MUST override every method."""
+
+    def _db_get(self, path: str) -> dict | None:
+        raise NotImplementedError
+
+    def _db_list(self, parent: str) -> Iterable[dict]:
+        raise NotImplementedError
+
+    # Metadata-only variants for list_dir / stat / is_dir / exists: a row
+    # may carry ``size`` instead of ``content`` so the database does not
+    # ship every file body just to have its length taken. The defaults
+    # return the full rows, which _row_to_item handles as before.
+    def _db_get_meta(self, path: str) -> dict | None:
+        return self._db_get(path)
+
+    def _db_list_meta(self, parent: str) -> Iterable[dict]:
+        return self._db_list(parent)
+
+    def _db_insert(self, row: dict) -> None:
+        raise NotImplementedError
+
+    def _db_update(self, path: str, **fields: Any) -> None:
+        raise NotImplementedError
+
+    def _db_delete(self, path: str) -> None:
+        raise NotImplementedError
+
+    def _db_delete_subtree(self, path: str) -> None:
+        raise NotImplementedError
+
+    def _transaction(self):
+        """A context in which several writes land together or not at all;
+        stores without transactions (Redis, MongoDB) do them one by one."""
+        import contextlib
+
+        return contextlib.nullcontext()
+
+
+# ---------------------------------------------------------------------------
+# Public mixin
+# ---------------------------------------------------------------------------
+
+
+def _canonical(rooted: str) -> str:
+    """posixpath.normpath of a rooted path with its leading slashes
+    collapsed too: normpath keeps two (``//`` is "implementation
+    defined" in POSIX), and ``rename(x, "//")`` stored a row under
+    ``//`` that no listing of ``/`` shows - the data was hidden."""
+    return "/" + (posixpath.normpath(rooted) or "/").lstrip("/")
+
+
+class DbFsBackend(_RowAdapter, SessionLifecycle):
+    """FileBackend implementation backed by ``_RowAdapter`` ops.
+
+    Concrete subclasses inherit from this AND from ``_RowAdapter``
+    (provided by inheritance — they only need to override the six
+    adapter methods)."""
+
+    supports_symlinks = False
+    supports_hardlinks = False
+
+    #: The database driver's exception base classes; see
+    #: _driver_errors_as_oserror. Empty when the driver is missing.
+    _DRIVER_ERRORS: tuple[type[BaseException], ...] = ()
+
+    # ------------------------------------------------------------------
+    # Identity / lifecycle — subclasses set these.
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return "db-fs"
+
+    @property
+    def connected(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    def home(self) -> str:
+        return "/"
+
+    def separator(self) -> str:
+        return "/"
+
+    def join(self, *parts: str) -> str:
+        cleaned = [s for s in (p.strip("/") for p in parts) if s]
+        if not cleaned:
+            return "/"
+        return "/" + "/".join(cleaned)
+
+    def parent(self, path: str) -> str:
+        return posixpath.dirname(path.rstrip("/")) or "/"
+
+    def normalize(self, path: str) -> str:
+        if not path:
+            return "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        # Collapse any '..' / '//' to keep DB lookups deterministic.
+        return _canonical(path)
+
+    @staticmethod
+    def _strict_normalize_or_reject(path: str) -> str:
+        """Normalise ``path`` and refuse if the input wasn't already
+        canonical. ``posixpath.normpath('/..') == '/'`` would otherwise
+        let `mkdir('..')` succeed silently as a root no-op, masking
+        caller bugs. Callers that legitimately want lenient normalising
+        should call :meth:`normalize` directly.
+        """
+        if not path:
+            raise OSError("empty path")
+        rooted = path if path.startswith("/") else "/" + path
+        canonical = _canonical(rooted)
+        # The only legal difference between input and canonical is the
+        # implicit leading slash and the root case.
+        if rooted not in (canonical, canonical + "/"):
+            raise OSError(f"non-canonical path {path!r} (would normalise to {canonical!r})")
+        return canonical
+
+    # ------------------------------------------------------------------
+    # FileBackend — read surface
+    # ------------------------------------------------------------------
+
+    @_driver_errors_as_oserror
+    def list_dir(self, path: str) -> list[FileItem]:
+        path = self.normalize(path)
+        # Implicit root: any path that doesn't exist as a row but
+        # equals "/" is treated as an empty directory; deeper paths
+        # require a real row.
+        if path != "/":
+            row = self._db_get_meta(path)
+            if row is None:
+                raise FileNotFoundError(errno.ENOENT, f"No such path: {path}")
+            if not row.get("is_dir"):
+                raise NotADirectoryError(errno.ENOTDIR, f"Not a directory: {path}")
+        items: list[FileItem] = []
+        for row in self._db_list_meta(path):
+            item = self._row_to_item(row)
+            if item is None:
+                log.warning("%s: skipping a row without a path under %s", type(self).__name__, path)
+                continue
+            items.append(item)
+        return items
+
+    @staticmethod
+    def _refuse_slash_on_file(raw: str, row: dict | None) -> None:
+        """NotADirectoryError for "file/", as stat(2) says: normalize()
+        drops the slash, and remove("file/") deleted the file."""
+        if row is not None and not row.get("is_dir") and raw.endswith("/") and raw.strip("/"):
+            raise NotADirectoryError(errno.ENOTDIR, f"Not a directory: {raw}", raw)
+
+    @_driver_errors_as_oserror
+    def stat(self, path: str) -> FileItem:
+        raw, path = path, self.normalize(path)
+        if path == "/":
+            return FileItem(
+                name="/",
+                is_dir=True,
+                is_link=False,
+                size=0,
+                modified=datetime.fromtimestamp(0),
+                permissions=0o755,
+            )
+        row = self._db_get_meta(path)
+        if row is None:
+            raise FileNotFoundError(errno.ENOENT, f"No such path: {path}")
+        self._refuse_slash_on_file(raw, row)
+        item = self._row_to_item(row)
+        if item is None:
+            raise OSError(f"Unusable row for {path}: it has no path")
+        return item
+
+    @_driver_errors_as_oserror
+    def is_dir(self, path: str) -> bool:
+        path = self.normalize(path)
+        if path == "/":
+            return True
+        row = self._db_get_meta(path)
+        return bool(row and row.get("is_dir"))
+
+    @_driver_errors_as_oserror
+    def exists(self, path: str) -> bool:
+        raw, path = path, self.normalize(path)
+        if path == "/":
+            return True
+        row = self._db_get_meta(path)
+        # "file/" names no entry (lstat(2): ENOTDIR).
+        return row is not None and not (
+            not row.get("is_dir") and raw.endswith("/") and raw.strip("/")
+        )
+
+    @_driver_errors_as_oserror
+    def open_read(self, path: str) -> IO[bytes]:
+        raw, path = path, self.normalize(path)
+        row = self._db_get(path)
+        if row is None:
+            raise FileNotFoundError(errno.ENOENT, f"No such path: {path}")
+        self._refuse_slash_on_file(raw, row)
+        if row.get("is_dir"):
+            raise IsADirectoryError(errno.EISDIR, f"Is a directory: {path}")
+        return io.BytesIO(self._content_bytes(row, path))
+
+    @staticmethod
+    def _content_bytes(row: dict, path: str) -> bytes:
+        """The stored body as bytes. ``bytes(value)`` of an int would be
+        that many zero bytes (or a MemoryError for a huge one), of a str
+        or a date a TypeError; content of any other type is an error."""
+        data = row.get("content")
+        if data is None:
+            return b""
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return bytes(data)
+        raise OSError(f"Unusable content for {path}: {type(data).__name__}, not bytes")
+
+    def readlink(self, path: str) -> str:
+        raise OSError("DB-FS backends do not model symlinks")
+
+    def list_versions(self, path: str) -> list:
+        return []
+
+    def open_version_read(self, path: str, version_id: str):
+        raise OSError("DB-FS backends do not expose version history")
+
+    # ------------------------------------------------------------------
+    # FileBackend — write surface
+    # ------------------------------------------------------------------
+
+    @_driver_errors_as_oserror
+    def mkdir(self, path: str) -> None:
+        # Strict normalise so mkdir("..") / mkdir("/foo/../..") /
+        # mkdir("/") fail loudly instead of being silent no-ops that
+        # mask caller bugs. Read paths use the lenient normalize().
+        path = self._strict_normalize_or_reject(path)
+        if path == "/":
+            return
+        existing = self._db_get(path)
+        if existing is not None:
+            if existing.get("is_dir"):
+                return
+            raise FileExistsError(errno.EEXIST, f"Path exists and is a file: {path}")
+        # Ensure parent exists (or is root).
+        parent = self.parent(path)
+        self._check_parent(parent)
+        self._db_insert(
+            {
+                "path": path,
+                "parent": parent,
+                "is_dir": True,
+                "mode": 0o755,
+                "mtime": _now(),
+                "content": None,
+            }
+        )
+
+    @_driver_errors_as_oserror
+    def remove(self, path: str, recursive: bool = False) -> None:
+        raw, path = path, self.normalize(path)
+        if path == "/":
+            raise OSError("Refusing to remove root")
+        row = self._db_get(path)
+        if row is None:
+            raise FileNotFoundError(errno.ENOENT, f"No such path: {path}")
+        self._refuse_slash_on_file(raw, row)
+        if row.get("is_dir"):
+            # Names only: the full rows shipped every child's file body
+            # just to see whether the folder is empty.
+            children = list(self._db_list_meta(path))
+            if children and not recursive:
+                raise OSError(errno.ENOTEMPTY, f"Directory not empty: {path}")
+            self._db_delete_subtree(path)
+        else:
+            self._db_delete(path)
+
+    @_driver_errors_as_oserror
+    def rename(self, src: str, dst: str) -> None:
+        from core.path_policy import refuse_folder_path
+
+        raw_src, src = src, self.normalize(src)
+        if raw_src.endswith("/"):
+            self._refuse_slash_on_file(raw_src, self._db_get_meta(src))
+        if src != "/":
+            # normalize() drops the slash: a file renamed to "x/" became "x".
+            refuse_folder_path(dst, "rename to", source_is_file=lambda: self._is_file(src))
+        dst = self.normalize(dst)
+        if src == "/" or dst == "/":
+            raise OSError("Refusing to rename root")
+        # Defensive: rename(/a, /a/b) would re-traverse the just-inserted
+        # destination tree. _db_list materialises before we insert, so
+        # this can't actually loop today — but a buggy adapter (one whose
+        # _db_list scans live state) would. Cheap insurance.
+        if dst == src or dst.startswith(src.rstrip("/") + "/"):
+            raise OSError(
+                errno.EINVAL,
+                f"Refusing rename {src!r} -> {dst!r}: destination is at or under source",
+            )
+        row = self._db_get(src)
+        if row is None:
+            raise FileNotFoundError(errno.ENOENT, f"No such path: {src}")
+        if self._db_get(dst) is not None:
+            raise FileExistsError(errno.EEXIST, f"Destination already exists: {dst}")
+        dst_parent = self.parent(dst)
+        self._check_parent(dst_parent)
+        # Copy-then-delete via DB ops, in one transaction where the store
+        # has them (SQLite, PostgreSQL): a failure half way left a folder
+        # split between the old and the new name.
+        with self._transaction():
+            self._move_row(src, dst, row)
+
+    def _move_row(self, src: str, dst: str, row: dict) -> None:
+        """Insert *row* (of *src*) under *dst*, its children after it,
+        then drop *src*. The modification time stays the row's own."""
+        self._db_insert(
+            {
+                "path": dst,
+                "parent": self.parent(dst),
+                "is_dir": row.get("is_dir", False),
+                # Schemaless stores hand back whatever another client
+                # stored; the adapters' inserts take an int.
+                "mode": parse_mode(row.get("mode"), 0o755 if row.get("is_dir") else 0o644),
+                "mtime": row.get("mtime") or _now(),
+                "content": row.get("content"),
+            }
+        )
+        if row.get("is_dir"):
+            for child in list(self._db_list_meta(src)):
+                child_row = self._db_get(child["path"])
+                if child_row is None:
+                    continue  # gone meanwhile
+                child_dst = posixpath.join(dst, posixpath.basename(child["path"]))
+                self._move_row(child["path"], child_dst, child_row)
+        self._db_delete(src)
+
+    @_driver_errors_as_oserror
+    def open_write(self, path: str, append: bool = False) -> IO[bytes]:
+        from core.path_policy import refuse_folder_path
+
+        # normalize() drops the slash: "x/" was written as a FILE "x".
+        path = self.normalize(refuse_folder_path(path))
+        if path == "/":
+            raise OSError("Refusing to write root")
+        parent = self.parent(path)
+        self._check_parent(parent)
+        existing = self._db_get(path)
+        if existing is not None and existing.get("is_dir"):
+            raise IsADirectoryError(errno.EISDIR, f"Is a directory: {path}")
+        prelude = b""
+        if append and existing is not None:
+            prelude = self._content_bytes(existing, path)
+        return _DbWriter(self, path, prelude)
+
+    @_driver_errors_as_oserror
+    def chmod(self, path: str, mode: int) -> None:
+        raw, path = path, self.normalize(path)
+        if path == "/":
+            return
+        row = self._db_get_meta(path)
+        if row is None:
+            raise FileNotFoundError(errno.ENOENT, f"No such path: {path}")
+        self._refuse_slash_on_file(raw, row)
+        self._db_update(path, mode=int(mode))
+
+    @_driver_errors_as_oserror
+    def copy(self, src: str, dst: str) -> None:
+        from core.path_policy import refuse_folder_path
+
+        raw_src, src = src, self.normalize(src)
+        # normalize() drops the slash: a copy to "x/" was written as a FILE "x".
+        dst = self.normalize(refuse_folder_path(dst, "copy to"))
+        if dst == "/":
+            raise OSError("Refusing to overwrite root")
+        row = self._db_get(src)
+        if row is None:
+            raise FileNotFoundError(errno.ENOENT, f"No such path: {src}")
+        self._refuse_slash_on_file(raw_src, row)
+        if self._db_get(dst) is not None:
+            raise FileExistsError(errno.EEXIST, f"Destination already exists: {dst}")
+        if row.get("is_dir"):
+            raise IsADirectoryError(errno.EISDIR, "DB-FS copy: source is a directory")
+        # Mirror mkdir's parent-existence guard so copy can't insert an
+        # orphan row that no list_dir() would ever surface.
+        dst_parent = self.parent(dst)
+        self._check_parent(dst_parent)
+        self._db_insert(
+            {
+                "path": dst,
+                "parent": dst_parent,
+                "is_dir": False,
+                "mode": parse_mode(row.get("mode"), 0o644),
+                "mtime": _now(),
+                "content": row.get("content"),
+            }
+        )
+
+    def _is_file(self, path: str) -> bool:
+        row = self._db_get_meta(self.normalize(path))
+        return row is not None and not row.get("is_dir")
+
+    def _check_parent(self, parent: str) -> None:
+        """FileNotFoundError when the folder *parent* is not there,
+        NotADirectoryError when it is a file; the root always is."""
+        if parent == "/":
+            return
+        row = self._db_get_meta(parent)
+        if row is None:
+            raise FileNotFoundError(errno.ENOENT, f"Parent does not exist: {parent}")
+        if not row.get("is_dir"):
+            raise NotADirectoryError(errno.ENOTDIR, f"Parent is not a directory: {parent}")
+
+    def disk_usage(self, path: str) -> tuple[int, int, int]:
+        return (0, 0, 0)
+
+    def checksum(self, path: str, algorithm: str = "sha256") -> str:
+        # Subclasses with native hashing can override; the base just
+        # returns "" so the transfer engine streams + hashes itself.
+        return ""
+
+    # ------------------------------------------------------------------
+    # Internal: row → FileItem
+    # ------------------------------------------------------------------
+
+    def _row_to_item(self, row: dict) -> FileItem | None:
+        """The FileItem for a stored row; None for a row without a path.
+
+        Rows are read with the type each field should have: the store is
+        shared, and a field of another type must not become a ValueError
+        or TypeError in the pane."""
+        path = row.get("path")
+        if not isinstance(path, str) or not path.strip("/"):
+            return None
+        is_dir = bool(row.get("is_dir"))
+        if "size" in row:
+            size = 0 if is_dir else as_size(row["size"], digit_strings=True)
+        else:
+            content = row.get("content")
+            size = 0 if is_dir or not isinstance(content, (bytes, bytearray)) else len(content)
+        mtime = row.get("mtime")
+        if isinstance(mtime, str):
+            try:
+                mtime = datetime.fromisoformat(mtime)
+            except ValueError:
+                mtime = datetime.fromtimestamp(0)
+        if not isinstance(mtime, datetime):
+            mtime = datetime.fromtimestamp(0)
+        return FileItem(
+            name=posixpath.basename(path) or path,
+            size=size,
+            modified=mtime,
+            # (a stored 0 has always read as "unset")
+            permissions=parse_mode(row.get("mode") or None, 0o755 if is_dir else 0o644),
+            is_dir=is_dir,
+            is_link=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Writer — buffers in memory, commits on close
+# ---------------------------------------------------------------------------
+
+
+class _DbWriter:
+    """Buffer bytes in memory, then upsert on close."""
+
+    def __init__(self, backend: DbFsBackend, path: str, prelude: bytes = b""):
+        self._backend = backend
+        self._path = path
+        self._buf = io.BytesIO(prelude)
+        if prelude:
+            self._buf.seek(0, io.SEEK_END)
+        self._closed = False
+
+    def write(self, data: bytes) -> int:
+        if self._closed:
+            raise OSError("writer closed")
+        return self._buf.write(data)
+
+    def read(self, n: int = -1) -> bytes:
+        return self._buf.read(n)
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        return self._buf.seek(pos, whence)
+
+    def tell(self) -> int:
+        return self._buf.tell()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._commit()
+        except self._backend._DRIVER_ERRORS as exc:
+            raise OSError(f"Cannot write {self._path}: {exc}") from exc
+        finally:
+            self._buf.close()
+
+    def _commit(self) -> None:
+        data = self._buf.getvalue()
+        existing = self._backend._db_get(self._path)
+        row = {
+            "path": self._path,
+            "parent": self._backend.parent(self._path),
+            "is_dir": False,
+            "mode": parse_mode((existing or {}).get("mode") or None, 0o644),
+            "mtime": _now(),
+            "content": data,
+        }
+        if existing is None:
+            self._backend._db_insert(row)
+        else:
+            self._backend._db_update(
+                self._path,
+                content=data,
+                mtime=row["mtime"],
+                is_dir=False,
+            )
+
+    def discard(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._buf.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.discard()
+        else:
+            self.close()

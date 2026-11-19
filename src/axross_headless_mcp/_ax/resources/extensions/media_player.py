@@ -1,0 +1,6849 @@
+"""A media player panel: playlist (drag & drop, M3U, shuffle and repeat;
+folds away), seeking, volume with mute, tags and cover, a 10-band
+equalizer (folds away) and animated visualizations a click switches
+between - in colour schemes, with options, fullscreen or in a window of
+their own."""
+
+from __future__ import annotations
+
+import atexit
+import collections
+import functools
+import json
+import logging
+import math
+import os
+import posixpath
+import random
+import re
+import shutil
+import threading
+import time
+import weakref
+from typing import NamedTuple
+
+from PyQt6 import sip
+from PyQt6.QtCore import (
+    QByteArray,
+    QEvent,
+    QLineF,
+    QMetaObject,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt6.QtGui import (
+    QActionGroup,
+    QBrush,
+    QColor,
+    QFont,
+    QIcon,
+    QImage,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QRadialGradient,
+    QTransform,
+)
+from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtWidgets import (
+    QAbstractButton,
+    QAbstractItemView,
+    QAbstractSlider,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionSlider,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core import audio_route
+from core.audio_eq import (  # one equalizer for all of axross (the Audio Mixer's too)
+    BANDS,
+    FRAME,
+    HOP,
+    MAX_GAIN_DB,
+    PRESETS,
+    Equalizer,
+    _gain_curve,  # noqa: F401 - the tests reach it here
+)
+from core.i18n import tr
+from core.multimedia_env import prime_notify_lookups
+from ui.plain_text import plain_tooltip as _plain_tooltip
+from ui.themes import contrast_ratio, is_hex_colour
+
+log = logging.getLogger(__name__)
+
+try:  # the equalizer and the visualizations need numpy; playback does not
+    import numpy as np
+except ImportError:  # pragma: no cover - depends on the install
+    np = None
+
+EXTENSION = {
+    "name": "Media Player",
+    "version": "1.3",
+    "description": "A panel that plays MP3, WAV, Ogg Vorbis, FLAC, Opus, AAC and more: playlist "
+    "with drag & drop, M3U load/save and the last list restored, seeking, shuffle and repeat, "
+    "volume with mute, keyboard control, tags and cover, a 10-band equalizer with presets that "
+    "folds away, and animated visualizations - spectrum, mirrored, radial, line and polar "
+    "spectrum, waterfall, oscilloscope, stereo scope, VU meter, starfield - a click switches "
+    "between, in colour schemes (or your own colours) with bar count, smoothing, peak fall and "
+    "frame rate, fullscreen like a screensaver or detached into a window of any size; the "
+    "playlist folds away (equalizer and visualizations need numpy).",
+    "author": "axross",
+}
+
+
+#: *text* (a track's path, name or tags) as a tooltip that shows it as it
+#: is: Qt takes a tooltip that looks like markup for rich text.
+plain_tooltip = _plain_tooltip
+
+
+#: Each one played by the engine (Qt's FFmpeg) from source and in the frozen
+#: axross-full (tests/test_media_player_drop_reports.py names the measurement).
+#: Video containers (.mp4, .mkv) stay out: a folder of films is no playlist.
+AUDIO_SUFFIXES = (".mp3", ".wav", ".ogg", ".oga", ".opus", ".flac", ".m4a", ".aac", ".wma", ".aiff",
+                  ".aif", ".mka", ".m4b", ".wv", ".spx", ".tta", ".ac3", ".mp2", ".caf", ".au",
+                  ".amr", ".webm")
+RATE = 44100
+#: Seconds of audio decoded ahead of the sound card at most. The decoder
+#: waits until its buffer is read, so not reading bounds the memory: read
+#: at once, a one-hour track ended up in memory as float samples (~1 GB).
+MAX_AHEAD_SECONDS = 2.0
+#: Seconds of equalized audio the equalizer thread keeps ready for the
+#: audio thread, which writes it to the sound card without waiting for the
+#: equalizer. A slider change is heard that much later (plus what the card
+#: holds). When equalizing slows down (a GIL shared with a busy thread), a
+#: block is at least twice what the last one took, so more is kept ready.
+EQ_AHEAD_SECONDS = 0.1
+#: Bytes per sample of the sample formats a sound card may take.
+SAMPLE_BYTES = {"Float": 4, "Int16": 2, "Int32": 4, "UInt8": 1}
+#: Seconds of playback the monitor judges the sound card's speed over, and
+#: how far from real time counts as wrong (0.2: below 0.8x or above 1.2x).
+MONITOR_WINDOW_SECONDS = 3.0
+MONITOR_TOLERANCE = 0.2
+#: The share of the monitor's window in which the sound card's room stayed
+#: unfilled, above which a wrong speed is the feed's (the decoder or the
+#: equalizer fell behind), not the sound card's.
+MONITOR_STARVED_SHARE = 0.5
+#: The audio backends Edit > Settings… > Audio offers (QT_AUDIO_BACKEND
+#: values, core.multimedia_env.AUDIO_BACKENDS), as messages name them.
+BACKEND_LABELS = {"pulseaudio": "PulseAudio", "pipewire": "PipeWire"}
+#: Bytes copied from a remote backend at most (the file is played locally).
+MAX_REMOTE_BYTES = 512 * 1024 * 1024
+#: The arrow keys seek by this much, with Shift by the big step (ms).
+SEEK_STEP_MS = 5_000
+SEEK_BIG_STEP_MS = 30_000
+#: The -15 s / +15 s buttons.
+SKIP_BUTTON_MS = 15_000
+#: A skip past the end lands this far before it, so the track ends as it
+#: always does (next track, repeat, sleep timer) on every engine.
+SKIP_END_MARGIN_MS = 250
+#: Seconds of decoded audio the equalizer engine keeps behind the queue, so
+#: a seek back into them needs no decoder: QAudioDecoder cannot seek, and
+#: decoding from the top again took up to 0.8 s for a seek back to 40 s of
+#: a 60 s track on a real sink, more the later in the track
+#: (tests/test_media_player_seek_memory.py). Twice the big keyboard step:
+#: Shift+Left twice in a row stays in memory. 23 MB at 48 kHz.
+HISTORY_SECONDS = 2 * SEEK_BIG_STEP_MS // 1000
+#: The memory's bound in bytes: a 192 kHz sound card keeps less time.
+HISTORY_MAX_BYTES = 64 * 1024 * 1024
+#: ⏮ starts the track again once it played this long, else goes back.
+RESTART_AFTER_MS = 3_000
+#: How often a sound card stream that closed by itself is opened again per
+#: play or seek before playback fails with a message.
+MAX_SINK_REOPENS = 3
+#: A stopped sink is silent at once but keeps its stream this long, or until
+#: the next sink has opened (ms): see EqEngine._park_sink.
+PARK_MS = 1000
+#: + and - change the volume by this many slider steps (of 100).
+VOLUME_STEP = 5
+REPEAT_MODES = ("off", "all", "one")
+
+#: The control buttons' icons, drawn here (24x24, Feather-style strokes):
+#: a label like 🔀 needs an emoji font, which a plain Linux install lacks -
+#: the button showed an empty box.
+CONTROL_ICONS = {
+    "previous": '<polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/>',
+    "play": '<polygon points="6 4 20 12 6 20 6 4"/>',
+    "pause": '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>',
+    "stop": '<rect x="5" y="5" width="14" height="14" rx="1"/>',
+    "next": '<polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/>',
+    # a turning arrow round a "15" drawn in strokes (a <text> needs a font)
+    "back15": '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>'
+              '<path stroke-width="1.4" d="M8.6 10.6l1.2-.9v5.6M15.6 9.7h-2.9l-.3 2.6'
+              'c.4-.3.9-.4 1.4-.4a1.6 1.6 0 0 1 0 3.2c-.6 0-1.1-.2-1.5-.6"/>',
+    "forward15": '<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>'
+                 '<path stroke-width="1.4" d="M8.6 10.6l1.2-.9v5.6M15.6 9.7h-2.9l-.3 2.6'
+                 'c.4-.3.9-.4 1.4-.4a1.6 1.6 0 0 1 0 3.2c-.6 0-1.1-.2-1.5-.6"/>',
+    "shuffle": '<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>'
+               '<polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>'
+               '<line x1="4" y1="4" x2="9" y2="9"/>',
+    "repeat": '<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>'
+              '<polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>',
+    "repeat-one": '<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>'
+                  '<polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>'
+                  '<path d="M11 10.5l1.5-1v5"/>',
+    "volume": '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>'
+              '<path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>',
+    "volume-x": '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>'
+                '<line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>',
+}
+CONTROL_ICON_SIZE = 18
+
+
+def control_svg(name: str, colour: str) -> str:
+    """The SVG of control icon *name*, stroked in *colour* (``#rrggbb``)."""
+    body = CONTROL_ICONS[name]
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+            f'stroke="{colour}" stroke-width="2" stroke-linecap="round" '
+            f'stroke-linejoin="round">{body}</svg>')
+
+
+_control_icon_cache: dict[tuple[str, str, int], QIcon] = {}
+
+
+def control_icon(name: str, colour: str, size: int = 32) -> QIcon:
+    """Control icon *name* in *colour*, rendered once per (name, colour, size)."""
+    key = (name, colour, size)
+    cached = _control_icon_cache.get(key)
+    if cached is None:
+        renderer = QSvgRenderer(QByteArray(control_svg(name, colour).encode("utf-8")))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        try:
+            renderer.render(painter)
+        finally:
+            painter.end()
+        cached = _control_icon_cache[key] = QIcon(pixmap)
+    return cached
+
+
+def history_frames(rate: int) -> int:
+    """Frames of decoded float stereo audio kept behind the queue at
+    *rate*: HISTORY_SECONDS, at most HISTORY_MAX_BYTES."""
+    return min(HISTORY_SECONDS * rate, HISTORY_MAX_BYTES // 8)
+
+
+class DecodedMemory:
+    """One stretch of a track's decoded float stereo frames (8 bytes each),
+    the newest *limit()* frames of it: what the equalizer engine played or
+    skipped lately, for a seek back without the decoder. Kept as chunks -
+    a bytearray that drops its oldest bytes moved all 23 MB now and then:
+    25 us an append on average, up to 9 ms holding the GIL (measured)."""
+
+    def __init__(self, limit) -> None:
+        #: limit() -> frames kept at most (read on each append).
+        self.limit = limit
+        self._chunks: collections.deque = collections.deque()
+        self.nbytes = 0
+        #: The track frame after the last one held.
+        self.end = 0
+
+    @property
+    def start(self) -> int:
+        """The track frame of the oldest frame held (== end: none)."""
+        return self.end - self.nbytes // 8
+
+    def forget(self, at: int = 0) -> None:
+        """Empty, to be filled from track frame *at* on."""
+        self._chunks.clear()
+        self.nbytes = 0
+        self.end = at
+
+    def append(self, raw: bytes, start: int) -> None:
+        """*raw* - whole frames from track frame *start* on - after what is
+        held; when they do not follow on it, they replace it."""
+        if not raw:
+            return
+        if start != self.end:
+            self.forget(start)
+        self._chunks.append(bytes(raw))
+        self.nbytes += len(raw)
+        self.end += len(raw) // 8
+        excess = self.nbytes - max(0, int(self.limit())) * 8
+        while excess > 0:
+            first = self._chunks[0]
+            if len(first) <= excess:
+                self._chunks.popleft()
+                cut = len(first)
+            else:
+                self._chunks[0] = first[excess:]
+                cut = excess
+            self.nbytes -= cut
+            excess -= cut
+
+    def take_from(self, frame: int) -> bytes:
+        """The frames from track frame *frame* (held) to the end, which no
+        longer are held."""
+        if not self.start <= frame < self.end:
+            raise ValueError(f"frame {frame} is not held ({self.start}-{self.end})")
+        taken = []
+        need = (self.end - frame) * 8
+        while need:
+            last = self._chunks.pop()
+            if len(last) <= need:
+                taken.append(last)
+                need -= len(last)
+            else:
+                taken.append(last[len(last) - need:])
+                self._chunks.append(last[:len(last) - need])
+                need = 0
+        self.nbytes -= (self.end - frame) * 8
+        self.end = frame
+        return b"".join(reversed(taken))
+
+
+def is_audio(name: str) -> bool:
+    return name.lower().endswith(AUDIO_SUFFIXES) and "." in name.strip(".")
+
+
+def format_time(ms) -> str:
+    """``m:ss``, or ``h:mm:ss`` from an hour on; nonsense is ``0:00``."""
+    try:
+        seconds = max(0, int(ms)) // 1000
+    except (TypeError, ValueError):
+        seconds = 0
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def perceptual_to_linear(value: float) -> float:
+    """The amplitude for a volume slider position (0..1): cubic, as
+    PulseAudio maps its volumes - equal slider steps sound like about equal
+    steps in loudness, where a linear mapping crowds all audible change
+    into the bottom fifth of the slider."""
+    value = min(1.0, max(0.0, float(value)))
+    return value ** 3
+
+
+def linear_to_perceptual(gain: float) -> float:
+    gain = min(1.0, max(0.0, float(gain)))
+    return gain ** (1.0 / 3.0)
+
+
+# -- files, playlists and the saved state ------------------------------------------------
+
+#: A dropped folder adds at most this many tracks, this many levels deep.
+MAX_DROP_FILES = 2000
+MAX_DROP_DEPTH = 6
+#: Bytes copied from a remote backend for one drop at most, all files.
+MAX_REMOTE_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+#: An M3U playlist is read only up to this size, this many entries and
+#: this long a line; a longer line is no path anyone wrote.
+MAX_PLAYLIST_BYTES = 1024 * 1024
+MAX_PLAYLIST_ENTRIES = 10_000
+MAX_PLAYLIST_LINE = 4096
+PLAYLIST_SUFFIXES = (".m3u", ".m3u8")
+#: The saved state (last playlist, position, volume) is read up to this size.
+MAX_STATE_BYTES = 4 * 1024 * 1024
+STATE_VERSION = 1
+
+#: Temporary folders holding copies of remote tracks (up to
+#: MAX_REMOTE_BYTES each): the playlist plays from them; a copy goes when
+#: its row does (after it stops playing), the rest when the extension
+#: unloads.
+_TEMP_FOLDERS: list[str] = []
+_TEMP_PREFIX = "axross-media-"
+#: In each temporary folder: the process that made it, so a later start
+#: removes the folders of one that ended without cleaning up (a crash).
+_OWNER_FILE = "owner.json"
+#: A folder without an owner file (made before there was one) is stale
+#: once it has not changed for this long.
+STALE_UNMARKED_SECONDS = 24 * 3600
+
+
+class PlaylistError(ValueError):
+    """A playlist file that is refused as a whole."""
+
+
+class PlaylistEntry:
+    """One track of a playlist: its local path, the #EXTINF title ("" for
+    none) and length in seconds (0 when unknown)."""
+
+    __slots__ = ("path", "title", "duration")
+
+    def __init__(self, path: str, title: str = "", duration: int = 0) -> None:
+        self.path = path
+        self.title = title
+        self.duration = duration
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, PlaylistEntry) and (self.path, self.title, self.duration) == (
+            other.path, other.title, other.duration)
+
+    def __repr__(self) -> str:
+        return f"PlaylistEntry({self.path!r}, {self.title!r}, {self.duration!r})"
+
+
+def _is_temp_copy(path: str) -> bool:
+    """Whether *path* is a temporary copy of a remote track. Names only (the
+    copies' paths are built from the folders' own): no filesystem call, so
+    a save of a long list never waits on a slow mount."""
+    path = os.path.abspath(path)
+    return any(path.startswith(folder + os.sep) for folder in _TEMP_FOLDERS)
+
+
+#: Streams the player opens by URL (internet radio, a file on a web server).
+STREAM_SCHEMES = ("http", "https")
+MAX_URL_LENGTH = 2048
+
+
+def is_stream(path: object) -> bool:
+    """Whether *path* is a stream URL (http / https) rather than a file."""
+    if not isinstance(path, str) or len(path) > MAX_URL_LENGTH:
+        return False
+    scheme, sep, rest = path.partition("://")
+    return bool(sep) and scheme.lower() in STREAM_SCHEMES and bool(rest.strip("/")) \
+        and path.isprintable() and not any(c.isspace() for c in path)
+
+
+def media_url(path: str) -> QUrl:
+    """The QUrl the decoder opens: a stream as it is, a file as a file."""
+    return QUrl(path) if is_stream(path) else QUrl.fromLocalFile(path)
+
+
+def stream_title(url: str) -> str:
+    """A short name for a stream: its host and last path part."""
+    parsed = QUrl(url)
+    tail = parsed.path().rstrip("/").rsplit("/", 1)[-1]
+    return f"{parsed.host()}{' - ' + tail if tail else ''}" or url
+
+
+def default_title(path: str) -> str:
+    """What the playlist shows for *path* without a title of its own."""
+    return stream_title(path) if is_stream(path) else os.path.basename(path)
+
+
+def _is_track(path: str) -> bool:
+    """An audio file by name that is a regular file: not a FIFO (the
+    decoder would block on it), device or folder named like a track."""
+    return is_audio(os.path.basename(path)) and os.path.isfile(path)
+
+
+def _clean_text(text: str, limit: int = 300) -> str:
+    return "".join(c for c in text if c.isprintable())[:limit].strip()
+
+
+def collect_local(paths, max_files: int | None = None, max_depth: int | None = None):
+    """The tracks among local *paths* as ``[(path, title)]``: audio files,
+    the audio files in folders (sorted, at most *max_files* and *max_depth*
+    levels; a link to a folder is followed, each folder walked once, so a
+    loop ends) and the entries of M3U playlists. Also the number of entries
+    that gave no track - dropped ones that are none, folders that cannot be
+    read or lie deeper than the bound, and, only when nothing was found, the
+    other files the folders held (a cover beside the tracks is no news) -
+    and whether the bound cut the list."""
+    max_files = MAX_DROP_FILES if max_files is None else max_files
+    max_depth = MAX_DROP_DEPTH if max_depth is None else max_depth
+    found: list[tuple[str, str]] = []
+    skipped = 0
+    others = 0  # files in the folders that are no track
+    truncated = False
+    walked: set[str] = set()
+
+    def walk(folder: str, depth: int) -> None:
+        nonlocal truncated, skipped, others
+        real = os.path.realpath(folder)
+        if real in walked:
+            return
+        if depth > max_depth:
+            skipped += 1
+            return
+        walked.add(real)
+        try:
+            with os.scandir(folder) as it:
+                entries = sorted(it, key=lambda e: e.name.casefold())
+        except OSError:
+            skipped += 1
+            return
+        for entry in entries:
+            if len(found) >= max_files:
+                truncated = True
+                return
+            try:
+                if entry.is_dir():  # a link to a folder too: *walked* stops a loop
+                    walk(entry.path, depth + 1)
+                elif is_audio(entry.name) and entry.is_file():
+                    found.append((entry.path, ""))
+                else:
+                    others += 1
+            except OSError:
+                skipped += 1
+
+    for path in paths:
+        if len(found) >= max_files:
+            truncated = True
+            break
+        path = str(path)
+        if os.path.isdir(path):
+            walk(path, 1)
+        elif path.lower().endswith(PLAYLIST_SUFFIXES):
+            try:
+                entries, gone = read_playlist(path)
+            except PlaylistError:
+                skipped += 1
+                continue
+            skipped += gone
+            room = max_files - len(found)
+            truncated = truncated or len(entries) > room
+            found.extend((e.path, e.title) for e in entries[:room])
+        elif _is_track(path):
+            found.append((path, ""))
+        else:
+            skipped += 1
+    return found, skipped + (0 if found else others), truncated
+
+
+def fetch_remote(backend, paths, temp_root: str | None = None):
+    """Copy the tracks among *paths* of a remote *backend* (folders listed
+    as :func:`collect_local` walks them) into a new temporary folder:
+    ``([(local copy, name)], skipped, truncated, folder)``. Every file is
+    bounded by MAX_REMOTE_BYTES and the drop by MAX_REMOTE_TOTAL_BYTES; a
+    file over its bound fails the drop, the folder then goes. Runs on a
+    worker thread: backend calls only, no Qt. The panel copies file by file
+    instead (:meth:`PlayerPanel.add_remote`): the first track plays while
+    the rest still copies."""
+    remote, skipped, truncated = list_remote(backend, paths)
+    if not remote:
+        return [], skipped, truncated, ""
+    folder = remote_temp_folder(temp_root)
+    out: list[tuple[str, str]] = []
+    total = 0
+    try:
+        for index, (path, name) in enumerate(remote):
+            target, total = copy_remote(backend, path, name, folder, index, total)
+            out.append((target, name))
+    except BaseException:
+        _forget_temp(folder)
+        raise
+    return out, skipped, truncated, folder
+
+
+def remote_temp_folder(temp_root: str | None = None) -> str:
+    """A new temporary folder for remote tracks' copies, registered at once:
+    an unload while it fills still removes it. The panel makes it on the
+    GUI thread, where the unload runs (PlayerPanel.add_remote)."""
+    import tempfile
+
+    folder = os.path.abspath(tempfile.mkdtemp(prefix=_TEMP_PREFIX, dir=temp_root))
+    _TEMP_FOLDERS.append(folder)
+    try:
+        with open(os.path.join(folder, _OWNER_FILE), "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "proc_start": _process_start(os.getpid())}, fh)
+    except OSError:
+        _forget_temp(folder)
+        raise
+    return folder
+
+
+def _process_start(pid: int) -> int | None:
+    """The kernel's start time of *pid* (Linux): tells it from a later
+    process that got the same pid. (As core.extensions has it - the
+    player is also exported on its own, without that module.)"""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _process_alive(pid: int, proc_start) -> bool:
+    """Whether the process that made a temporary folder still runs."""
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) \
+                and code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:  # gone, or another user's process has the pid now
+        return False
+    now = _process_start(pid)
+    return not (isinstance(proc_start, int) and now is not None and now != proc_start)
+
+
+def _temp_folder_of(path: str) -> str | None:
+    path = os.path.abspath(path)
+    return next((f for f in _TEMP_FOLDERS if path.startswith(f + os.sep)), None)
+
+
+def _has_copies(folder: str) -> bool:
+    """Whether *folder* still holds a track's copy (a subfolder of one)."""
+    try:
+        return any(name != _OWNER_FILE for name in os.listdir(folder))
+    except OSError:
+        return False
+
+
+def delete_temp_copy(path: str, *, keep_folder: bool = False) -> None:
+    """Remove the temporary copy *path* of a remote track - its file and
+    the subfolder it was copied into - and, unless *keep_folder*, its
+    temporary folder once that holds no copy any more. Before, the copies
+    stayed until the extension unloaded: each Clear and re-add of a remote
+    folder kept up to MAX_REMOTE_TOTAL_BYTES more on the disk."""
+    folder = _temp_folder_of(path)
+    if folder is None:
+        return  # not a copy of ours
+    sub = os.path.dirname(os.path.abspath(path))
+    if os.path.dirname(sub) == folder:
+        shutil.rmtree(sub, ignore_errors=True)
+    else:  # pragma: no cover - copy_remote always makes the subfolder
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if not keep_folder and not _has_copies(folder):
+        _forget_temp(folder)
+
+
+def _owner_alive(folder: str) -> bool | None:
+    """Whether the process that made *folder* still runs; None when the
+    folder names none."""
+    try:
+        with open(os.path.join(folder, _OWNER_FILE), encoding="utf-8") as fh:
+            owner = json.loads(fh.read(4096))
+        pid = owner["pid"]
+    except (OSError, ValueError, RecursionError, KeyError, TypeError):
+        return None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    return _process_alive(pid, owner.get("proc_start"))
+
+
+def sweep_stale_temp_folders(temp_root: str | None = None) -> list[str]:
+    """Remove the temporary folders (``axross-media-*``) whose process has
+    ended - an axross that crashed or was killed left its copies behind
+    for good. Only this user's folders, never a link; the removed ones."""
+    import tempfile
+
+    root = temp_root or tempfile.gettempdir()
+    removed = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return removed
+    now = time.time()
+    for entry in entries:
+        if not entry.name.startswith(_TEMP_PREFIX):
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            continue  # another user's
+        folder = os.path.abspath(entry.path)
+        if folder in _TEMP_FOLDERS:
+            continue
+        alive = _owner_alive(folder)
+        if alive or (alive is None and now - st.st_mtime < STALE_UNMARKED_SECONDS):
+            continue
+        shutil.rmtree(folder, ignore_errors=True)
+        removed.append(folder)
+    return removed
+
+
+def copy_remote(backend, path: str, name: str, folder: str, index: int,
+                total: int = 0) -> tuple[str, int]:
+    """Copy the remote track *path* as *name* into *folder* (its own
+    subfolder *index*: equal names do not clash): the local copy and
+    *total* plus its bytes. Over MAX_REMOTE_BYTES, or *total* over
+    MAX_REMOTE_TOTAL_BYTES, raises OSError and leaves no part behind."""
+    from core.path_policy import safe_leaf
+
+    # The name comes from the server: one path segment only, never "../x"
+    # (that would write outside the temporary folder).
+    try:
+        name = safe_leaf(name)
+    except ValueError as exc:
+        raise OSError(f"{name!r} is not a file name: {exc}") from exc
+    subfolder = os.path.join(folder, str(index))
+    os.mkdir(subfolder)
+    target = os.path.join(subfolder, name)
+    copied = 0
+    try:
+        with backend.open_read(path) as src, open(target, "wb") as dst:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                total += len(chunk)
+                if copied > MAX_REMOTE_BYTES:
+                    raise OSError(f"{name} is larger than {MAX_REMOTE_BYTES >> 20} MB")
+                if total > MAX_REMOTE_TOTAL_BYTES:
+                    raise OSError(f"the tracks are larger than "
+                                  f"{MAX_REMOTE_TOTAL_BYTES >> 20} MB together")
+                dst.write(chunk)
+    except BaseException:
+        shutil.rmtree(subfolder, ignore_errors=True)
+        raise
+    return target, total
+
+
+def list_remote(backend, paths):
+    """The tracks among *paths* of a remote *backend*, folders walked as
+    :func:`collect_local` walks them: ``([(path, name)], skipped,
+    truncated)``. Backend calls only, no Qt."""
+    remote: list[tuple[str, str]] = []
+    skipped = 0
+    others = 0  # files in the folders that are no track
+    truncated = False
+
+    def walk(folder: str, depth: int) -> None:
+        # Counted as in collect_local; a remote link to a folder is not
+        # followed (no realpath to stop a loop with) and counts as skipped.
+        nonlocal truncated, skipped, others
+        if depth > MAX_DROP_DEPTH:
+            skipped += 1
+            return
+        try:
+            listed = backend.list_dir(folder)
+        except OSError:
+            skipped += 1
+            return
+        from core.path_policy import drop_unsafe_names
+
+        safe = drop_unsafe_names(listed, backend=backend)
+        skipped += len(listed) - len(safe)
+        items = sorted(safe, key=lambda i: i.name.casefold())
+        for item in items:
+            if len(remote) >= MAX_DROP_FILES:
+                truncated = True
+                return
+            child = backend.join(folder, item.name)
+            if item.is_dir:
+                if getattr(item, "is_link", False):
+                    skipped += 1
+                else:
+                    walk(child, depth + 1)
+            elif is_audio(item.name):
+                remote.append((child, item.name))
+            else:
+                others += 1
+
+    for path in paths:
+        if len(remote) >= MAX_DROP_FILES:
+            truncated = True
+            break
+        name = posixpath.basename(str(path).replace("\\", "/").rstrip("/"))
+        try:
+            is_dir = backend.stat(path).is_dir
+        except OSError:
+            skipped += 1
+            continue
+        if is_dir:
+            walk(path, 1)
+        elif is_audio(name):
+            remote.append((path, name))
+        else:
+            skipped += 1
+    if not remote:
+        return [], skipped + others, truncated
+    return remote, skipped, truncated
+
+
+def _forget_temp(folder: str) -> None:
+    shutil.rmtree(folder, ignore_errors=True)
+    try:
+        _TEMP_FOLDERS.remove(folder)
+    except ValueError:
+        pass
+
+
+def _entry_path(line: str, base_dir: str) -> str | None:
+    """The local path an M3U line names, or None (a URL, nonsense)."""
+    if line.lower().startswith("file:"):
+        local = QUrl(line).toLocalFile()
+        return os.path.normpath(local) if local else None
+    if "://" in line:
+        # Internet radio playlists name streams; anything else is no track.
+        return line if is_stream(line) else None
+    path = line if os.path.isabs(line) else os.path.join(base_dir, line)
+    path = os.path.normpath(path)
+    if os.sep == "/" and "\\" in line and not os.path.exists(path):
+        # A playlist written on Windows: Music\a.mp3
+        alt = line.replace("\\", "/")
+        path = os.path.normpath(alt if os.path.isabs(alt) else os.path.join(base_dir, alt))
+    return path
+
+
+def parse_m3u(data: bytes, base_dir: str):
+    """The tracks of an M3U/M3U8 playlist as ``([PlaylistEntry], skipped)``.
+
+    UTF-8 (a BOM is fine; a legacy .m3u that is no UTF-8 is read as
+    Latin-1); relative paths are resolved against *base_dir*; ``#EXTINF``
+    gives title and length. An entry is skipped when it is a URL, longer
+    than MAX_PLAYLIST_LINE, has control characters, is no audio file by
+    name or no regular file (missing, a FIFO, a device) - absolute paths
+    and ``..`` are allowed as in every player, but only for such files.
+    After MAX_PLAYLIST_ENTRIES the rest counts as skipped. NUL bytes refuse
+    the whole file: it is no text playlist."""
+    if b"\x00" in data:
+        raise PlaylistError("not a text playlist (NUL bytes)")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        # Legacy playlists are Windows' cp1252 (Winamp: Don’t, –, …, €), a
+        # superset of Latin-1's printable characters; its five unused bytes
+        # stay Latin-1.
+        text = data.decode("cp1252", errors="replace") if _is_cp1252(data) \
+            else data.decode("latin-1")
+    entries: list[PlaylistEntry] = []
+    skipped = 0
+    title, duration = "", 0
+    # Only real line ends: str.splitlines also cuts at \x85, \x1c and others.
+    for raw in re.split(r"\r\n|\r|\n", text):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            if line.upper().startswith("#EXTINF:"):
+                head, _sep, rest = line[8:].partition(",")
+                try:
+                    seconds = float(head.split()[0]) if head.split() else 0.0
+                    # inf / nan / 1e999: OverflowError from int() escaped a slot.
+                    duration = max(0, int(seconds)) if math.isfinite(seconds) else 0
+                except (ValueError, OverflowError):
+                    duration = 0
+                title = _clean_text(rest)
+            continue
+        if len(entries) >= MAX_PLAYLIST_ENTRIES:
+            skipped += 1
+            continue
+        path = None
+        if len(line) <= MAX_PLAYLIST_LINE and line.isprintable():
+            path = _entry_path(line, base_dir)
+        if path is not None and (is_stream(path) or _is_track(path)):
+            entries.append(PlaylistEntry(path, title, duration))
+        else:
+            skipped += 1
+        title, duration = "", 0
+    return entries, skipped
+
+
+def _umask() -> int:
+    """The process umask without setting it (os.umask would change it for
+    every thread for a moment)."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0o022
+
+
+def _is_cp1252(data: bytes) -> bool:
+    """Whether *data* decodes as cp1252 (its five undefined bytes absent)."""
+    try:
+        data.decode("cp1252")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def read_playlist(path: str):
+    """:func:`parse_m3u` of the file at *path*; PlaylistError when it is no
+    regular file, unreadable or larger than MAX_PLAYLIST_BYTES."""
+    import stat as stat_module
+
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise PlaylistError(f"cannot read the playlist: {exc.strerror or exc}") from exc
+    if not stat_module.S_ISREG(st.st_mode):
+        raise PlaylistError("the playlist is not a regular file")
+    if st.st_size > MAX_PLAYLIST_BYTES:
+        raise PlaylistError(f"the playlist is larger than {MAX_PLAYLIST_BYTES >> 10} KiB")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(MAX_PLAYLIST_BYTES + 1)
+    except OSError as exc:
+        raise PlaylistError(f"cannot read the playlist: {exc.strerror or exc}") from exc
+    if len(data) > MAX_PLAYLIST_BYTES:
+        raise PlaylistError(f"the playlist is larger than {MAX_PLAYLIST_BYTES >> 10} KiB")
+    return parse_m3u(data, os.path.dirname(os.path.abspath(path)))
+
+
+def write_playlist(path: str, entries) -> tuple[int, int]:
+    """Write *entries* as an extended M3U in UTF-8 (atomically): paths under
+    the playlist's folder relative, others absolute. Temporary copies of
+    remote tracks and paths a line cannot hold are left out. Returns
+    (written, left out)."""
+    import tempfile
+
+    folder = os.path.dirname(os.path.abspath(path))
+    lines = ["#EXTM3U"]
+    size = len(lines[0]) + 1
+    written = skipped = 0
+    for entry in entries:
+        if is_stream(entry.path):
+            line = entry.path
+        else:
+            track = os.path.abspath(entry.path)
+            if _is_temp_copy(track) or not track.isprintable():
+                skipped += 1
+                continue
+            rel = os.path.relpath(track, folder)
+            inside = not (rel == os.pardir or rel.startswith(os.pardir + os.sep)
+                          or os.path.isabs(rel))
+            line = rel.replace(os.sep, "/") if inside else track
+        if line.startswith("#") or line != line.strip():
+            # "#1 Crush.mp3" read back as a comment, " a.mp3" stripped.
+            line = "./" + line
+        title = _clean_text(entry.title or "")
+        block = ([f"#EXTINF:{int(entry.duration) if entry.duration else -1},{title}"]
+                 if title or entry.duration else []) + [line]
+        grown = size + sum(len(x.encode("utf-8")) + 1 for x in block)
+        if grown > MAX_PLAYLIST_BYTES or written >= MAX_PLAYLIST_ENTRIES:
+            skipped += 1   # read_playlist would refuse the whole file
+            continue
+        lines += block
+        size = grown
+        written += 1
+    try:
+        mode = os.stat(path).st_mode & 0o777   # saving over it keeps who may read it
+    except OSError:
+        mode = 0o666 & ~_umask()
+    fd, tmp = tempfile.mkstemp(prefix=".playlist-", suffix=".tmp", dir=folder)
+    try:
+        if hasattr(os, "fchmod"):   # not on Windows
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return written, skipped
+
+
+def state_file():
+    """The extension's own settings: the last playlist, position, volume."""
+    from pathlib import Path
+
+    return Path.home() / ".config" / "axross" / "media_player.json"
+
+
+def read_state(path) -> tuple[dict, bool]:
+    """The saved state and whether the file could be used (a missing file
+    can; a broken, huge or non-object one cannot - it is kept aside before
+    the next save replaces it)."""
+    import json
+    import stat as stat_module
+
+    try:
+        if not stat_module.S_ISREG(os.stat(path).st_mode):
+            return {}, False  # never open a FIFO: it would block
+        with open(path, "rb") as fh:
+            data = fh.read(MAX_STATE_BYTES + 1)
+    except FileNotFoundError:
+        return {}, True
+    except OSError:
+        return {}, False
+    if len(data) > MAX_STATE_BYTES:
+        return {}, False
+    try:
+        state = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return {}, False
+    return (state, True) if isinstance(state, dict) else ({}, False)
+
+
+def encode_state(state: dict) -> str:
+    """*state* as the JSON the state file holds, within MAX_STATE_BYTES (what
+    read_state accepts): a playlist too long for it keeps its first tracks
+    (and the current one). ASCII with escapes: a file name that is no UTF-8
+    (an old Latin-1 collection, a FAT stick) is kept as its escapes - written
+    as it was, it failed every save with UnicodeEncodeError."""
+    import json
+
+    def dump(s: dict) -> str:
+        return json.dumps(s, ensure_ascii=True, indent=1) + "\n"
+
+    text = dump(state)
+    tracks = state.get("tracks")
+    if len(text) <= MAX_STATE_BYTES or not isinstance(tracks, list) or not tracks:
+        if len(text) > MAX_STATE_BYTES:
+            raise ValueError("the player state is too large to save")
+        return text
+    current = state.get("current", -1)
+    low, high = 0, len(tracks)   # the most tracks that fit, by halving
+    while low < high:
+        mid = (low + high + 1) // 2
+        if len(dump(dict(state, tracks=tracks[:mid]))) <= MAX_STATE_BYTES:
+            low = mid
+        else:
+            high = mid - 1
+    kept = dict(state, tracks=tracks[:low])
+    if not isinstance(current, int) or current >= low:
+        kept.update(current=-1, position_ms=0)
+    return dump(kept)
+
+
+def write_state(path, state: dict, *, keep_old: bool = False) -> None:
+    """Save *state* privately (0600, atomic); *keep_old* first keeps a copy
+    of an unreadable file next to it. ValueError when it cannot be encoded."""
+    from core.secure_storage import keep_unreadable_copy, write_secret_file
+
+    text = encode_state(state)
+    if keep_old and not keep_unreadable_copy(path):
+        raise OSError(f"{path} is unreadable and could not be kept aside")
+    write_secret_file(str(path), text)
+
+
+# -- DSP (numpy) ---------------------------------------------------------------------
+
+
+def bar_centres(rate: int, n_fft: int, n_bars: int):
+    top = min(16000.0, rate / 2)
+    edges = np.geomspace(40.0, top, n_bars + 1)
+    return np.sqrt(edges[:-1] * edges[1:])
+
+
+#: The equalizer thread works out the visualizer's bars at most this often
+#: (s), only while one asked within BARS_WANTED_FOR; the GUI thread takes
+#: them while they are at most BARS_FRESH old, else works them out itself.
+BARS_EVERY = 0.02
+BARS_WANTED_FOR = 0.5
+BARS_FRESH = 0.1
+
+
+def spectrum_bars(samples, rate: int, n_bars: int = 32):
+    """0..1 per bar (log-spaced, 40 Hz to 16 kHz) for the last samples:
+    the loudest bin of each bar on a -70..0 dBFS scale. A bar narrower
+    than the bin spacing (21.5 Hz at 2048 frames: the low bars) holds no
+    bin; it takes the spectrum interpolated at its centre - it stayed at
+    0 for ever before (bars 1 and 3 of 32, a quarter of 128)."""
+    data = np.asarray(samples, np.float32)
+    mono = data.mean(axis=1) if data.ndim == 2 else data
+    n = len(mono)
+    if n == 0:
+        return np.zeros(n_bars, np.float32)
+    window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / n)
+    mags = np.abs(np.fft.rfft(mono * window))
+    freqs = np.fft.rfftfreq(n, 1.0 / rate)
+    edges = np.geomspace(40.0, min(16000.0, rate / 2), n_bars + 1)
+    starts = np.searchsorted(freqs, edges[:-1], side="left")  # the bins in [edge, next edge)
+    stops = np.searchsorted(freqs, edges[1:], side="left")
+    has = stops > starts
+    peak = np.interp(np.sqrt(edges[:-1] * edges[1:]), freqs, mags)
+    if has.any():
+        # The bars are contiguous: the bins of one end where the next one's
+        # begin, so a reduceat over the starts (and the last stop) is each
+        # bar's maximum. The appended 0 keeps a stop at the end in range.
+        bounds = np.append(starts[has], stops[has][-1])
+        peak[has] = np.maximum.reduceat(np.append(mags, 0.0), bounds)[:-1]
+    ref = n / 4.0  # a full-scale sine under the Hann window
+    with np.errstate(divide="ignore"):
+        db = np.where(peak > 0, 20 * np.log10(np.maximum(peak, 1e-300) / ref), -200.0)
+    return np.clip((db + 70.0) / 70.0, 0.0, 1.0).astype(np.float32)
+
+
+def waveform(samples, n_points: int):
+    """*n_points* evenly spaced values of the mono mix, clipped to -1..1:
+    the oscilloscope's trace (all zero for no samples)."""
+    if n_points < 2:
+        raise ValueError(f"a waveform needs at least 2 points, not {n_points}")
+    data = np.asarray(samples, np.float32)
+    mono = data.mean(axis=1) if data.ndim == 2 else data
+    if len(mono) == 0:
+        return np.zeros(n_points, np.float32)
+    index = np.linspace(0, len(mono) - 1, n_points).astype(np.intp)
+    return np.clip(mono[index], -1.0, 1.0)
+
+
+#: The VU meter shows -VU_RANGE_DB..0 dBFS.
+VU_RANGE_DB = 60.0
+
+
+def _vu_scale(value: float) -> float:
+    if value <= 0.0:
+        return 0.0
+    db = 20.0 * float(np.log10(value))
+    return min(1.0, max(0.0, (db + VU_RANGE_DB) / VU_RANGE_DB))
+
+
+def vu_levels(samples) -> tuple[float, float, float, float]:
+    """RMS left, RMS right, peak left, peak right of the last samples, each
+    0..1 on a -60..0 dBFS scale (mono: both channels the same)."""
+    data = np.asarray(samples, np.float32)
+    if data.ndim == 1:
+        data = data[:, None]
+    if data.ndim != 2 or len(data) == 0 or data.shape[1] == 0:
+        return (0.0, 0.0, 0.0, 0.0)
+    left = data[:, 0]
+    right = data[:, 1] if data.shape[1] > 1 else left
+    rms = [float(np.sqrt(np.mean(np.square(channel)))) for channel in (left, right)]
+    peak = [float(np.max(np.abs(channel))) for channel in (left, right)]
+    rms_l, rms_r, peak_l, peak_r = (_vu_scale(v) for v in (*rms, *peak))
+    return (rms_l, rms_r, peak_l, peak_r)
+
+
+# -- playback --------------------------------------------------------------------------
+
+
+class MemorySink:
+    """An audio sink that keeps what it is given (tests, no sound card)."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.running = False
+
+    def start(self) -> None:
+        self.running = True
+
+    def bytes_free(self) -> int:
+        return 1 << 30
+
+    def write(self, data: bytes) -> int:
+        self.data += data
+        return len(data)
+
+    def suspend(self) -> None:
+        self.running = False
+
+    def resume(self) -> None:
+        self.running = True
+
+    def stop(self) -> None:
+        self.running = False
+
+    def set_volume(self, volume: float) -> None:
+        pass
+
+    def samples(self, channels: int = 2):
+        return np.frombuffer(bytes(self.data), np.float32).reshape(-1, channels)
+
+
+# -- the sound card's format ------------------------------------------------------------
+#
+# Measured against real PipeWire sinks: a QAudioSink opened in a format the
+# device reports unsupported (float stereo on every mono sink - Bluetooth in
+# its headset profile is one) stays in StoppedState under Qt's PipeWire
+# backend: nothing plays, the position stands. The same sinks played float
+# mono, or their preferred format, at 1.00x. So the engine asks the device.
+
+
+def choose_sink_format(supported, preferred) -> tuple[int, int, str]:
+    """(rate, channels, sample format) to open the sound card with:
+    float stereo at :data:`RATE`, else float mono at RATE (the engine mixes
+    down), else float at the device's rate, else its *preferred* format
+    (rate, channels, sample format). *supported(rate, channels, format)*
+    answers for the device."""
+    rate, channels, _fmt = preferred
+    for candidate in ((RATE, 2, "Float"), (RATE, 1, "Float"), (rate, 2, "Float"),
+                      (rate, 1, "Float")):
+        if supported(*candidate):
+            return candidate
+    return preferred
+
+
+def qt_format(rate: int, channels: int, sample_format: str):
+    from PyQt6.QtMultimedia import QAudioFormat
+
+    fmt = QAudioFormat()
+    fmt.setSampleRate(int(rate))
+    fmt.setChannelCount(int(channels))
+    fmt.setSampleFormat(getattr(QAudioFormat.SampleFormat, sample_format))
+    return fmt
+
+
+def format_tuple(fmt) -> tuple[int, int, str]:
+    return fmt.sampleRate(), fmt.channelCount(), fmt.sampleFormat().name
+
+
+def device_sink_format(device):
+    """The QAudioFormat :func:`choose_sink_format` picks for *device*."""
+    preferred = format_tuple(device.preferredFormat())
+    if preferred[2] not in SAMPLE_BYTES or preferred[0] <= 0 or preferred[1] <= 0:
+        preferred = (RATE, 2, "Int16")
+    chosen = choose_sink_format(
+        lambda r, c, f: device.isFormatSupported(qt_format(r, c, f)), preferred)
+    return qt_format(*chosen)
+
+
+def no_audio_device() -> bool:
+    """The audio check (core.multimedia_probe) found no output device."""
+    from core import multimedia_probe
+
+    result = multimedia_probe.cached()
+    return bool(result is not None and result.ok and not result.outputs)
+
+
+def routed_sink_format(_desired=None):
+    """The sink format for the output device chosen in Settings > Audio
+    (the system's default when none is)."""
+    from PyQt6.QtMultimedia import QMediaDevices
+
+    device = audio_route.source_device("media") or QMediaDevices.defaultAudioOutput()
+    return device_sink_format(device)
+
+
+def convert_frames(frames, channels: int, sample_format: str) -> bytes:
+    """Float stereo *frames* (n x 2) as the sound card takes them: mono is
+    the mean of both channels, more than two channels get the pair and
+    silence; Int16/Int32/UInt8 are scaled and clipped."""
+    if sample_format not in SAMPLE_BYTES:
+        raise ValueError(f"unknown sample format {sample_format!r}")
+    frames = np.asarray(frames, np.float32).reshape(-1, 2)
+    if channels == 1:
+        data = frames.mean(axis=1, keepdims=True)
+    elif channels == 2:
+        data = frames
+    else:
+        data = np.zeros((len(frames), channels), np.float32)
+        data[:, :2] = frames
+    if sample_format == "Float":
+        return np.ascontiguousarray(data, np.float32).tobytes()
+    clipped = np.clip(data.astype(np.float64), -1.0, 1.0)
+    if sample_format == "Int16":
+        return (clipped * 32767).astype(np.int16).tobytes()
+    if sample_format == "Int32":
+        return (clipped * 2147483647).astype(np.int32).tobytes()
+    return (128 + clipped * 127).astype(np.uint8).tobytes()
+
+
+def output_hint(backend: str) -> str:
+    """What to change in Edit > Settings… > Audio when the sound card plays
+    wrong through *backend* ("" when unknown): another backend - never the
+    one in use - or another output device."""
+    others = [label for label in BACKEND_LABELS.values() if label != backend]
+    if len(others) == 1:
+        return tr("Choose the {backend} backend or another output device in "
+                  "Edit → Settings… → Audio.").format(backend=others[0])
+    return tr("Choose a backend (PulseAudio or PipeWire) or another output device in "
+              "Edit → Settings… → Audio.")
+
+
+class PlaybackMonitor:
+    """Judges the playback speed: frames handed to the sound card over the
+    last :data:`MONITOR_WINDOW_SECONDS`, against real time, and whose fault
+    a wrong speed is. When the sound card's buffer stayed full it takes
+    audio too slow (or too fast): another backend or output may help. When
+    its buffer stayed half empty or more for most of the window (the
+    updates flagged *starved*: nothing was ready, or making it took longer
+    than playing it), the Media Player did not deliver fast enough - the
+    sound card is not the cause, and no other output is suggested. Reports
+    once per track (:meth:`reset`); a pause or seek starts the window anew
+    (:meth:`pause`)."""
+
+    def __init__(self, rate: int) -> None:
+        self.rate = rate
+        self.reset()
+
+    def reset(self) -> None:
+        self._samples = collections.deque()
+        self._reported = False
+
+    def pause(self) -> None:
+        self._samples.clear()
+
+    def update(self, now: float, frames: int, backend: str = "",
+               starved: bool = False) -> str | None:
+        """Feed the frames handed over so far at *now* and whether the sound
+        card's room stayed unfilled this time (*starved*); a sentence for the
+        user when the speed is wrong, once."""
+        if self._reported:
+            return None
+        self._samples.append((now, frames, bool(starved)))
+        while len(self._samples) > 1 and now - self._samples[1][0] >= MONITOR_WINDOW_SECONDS:
+            self._samples.popleft()
+        first_time, first_frames, _ = self._samples[0]
+        span = now - first_time
+        if span < MONITOR_WINDOW_SECONDS:
+            return None
+        speed = (frames - first_frames) / span / self.rate
+        if abs(speed - 1.0) <= MONITOR_TOLERANCE:
+            return None
+        via = tr(" through {backend}").format(backend=backend) if backend else ""
+        starved_share = sum(sample[2] for sample in self._samples) / len(self._samples)
+        if speed < 1.0 and starved_share > MONITOR_STARVED_SHARE:
+            # The sound card waited for audio: the feed is behind.
+            if speed < 0.05:
+                text = tr("The Media Player delivered no audio (measured over {seconds:g} s) "
+                          "while the sound card{via} waited for it – playback stands. The sound "
+                          "card is not the cause.").format(seconds=MONITOR_WINDOW_SECONDS, via=via)
+            else:
+                text = tr("The Media Player could not deliver audio fast enough: it played at "
+                          "x{speed:.2f} speed (measured over {seconds:g} s) while the sound "
+                          "card{via} waited for more. The sound card is not the cause.").format(
+                              speed=speed, seconds=MONITOR_WINDOW_SECONDS, via=via)
+        elif speed < 0.05:
+            text = tr("The sound card takes no audio{via} – playback stands. {hint}").format(
+                via=via, hint=output_hint(backend))
+        else:
+            text = tr("The sound card plays at x{speed:.2f} speed{via} (measured over {seconds:g} s)"
+                      " instead of x1.00. {hint}").format(speed=speed, via=via,
+                                                          hint=output_hint(backend),
+                                                          seconds=MONITOR_WINDOW_SECONDS)
+        self._reported = True
+        return text
+
+
+class QtSink:
+    """The sound card: QAudioSink in push mode, on the output device chosen
+    in Edit > Settings… > Audio (core.audio_route; the system's default
+    when none is or it is not connected), in the format *fmt* - one the
+    device takes (:func:`routed_sink_format`)."""
+
+    def __init__(self, fmt) -> None:
+        from PyQt6.QtMultimedia import QAudioSink, QMediaDevices
+
+        device = audio_route.source_device("media") or QMediaDevices.defaultAudioOutput()
+        self._sink = QAudioSink(device, fmt)
+        prime_notify_lookups(self._sink)
+        rate, channels, sample_format = format_tuple(fmt)
+        self._sink.setBufferSize(rate * channels * SAMPLE_BYTES.get(sample_format, 4) // 4)  # 250 ms
+        self._io = None
+
+    def start(self) -> None:
+        self._io = self._sink.start()
+
+    def alive(self) -> bool:
+        """Whether the stream start() opened can still be written: a
+        QIODevice whose wrapper sip marked deleted raises on every call."""
+        from PyQt6 import sip
+
+        return self._io is not None and not sip.isdeleted(self._io)
+
+    def bytes_free(self) -> int:
+        return self._sink.bytesFree() if self.alive() else 0
+
+    def write(self, data: bytes) -> int:
+        return int(self._io.write(data)) if self.alive() else 0
+
+    def suspend(self) -> None:
+        self._sink.suspend()
+
+    def resume(self) -> None:
+        self._sink.resume()
+
+    def stop(self) -> None:
+        self._sink.stop()
+        self._io = None
+
+    def set_volume(self, volume: float) -> None:
+        self._sink.setVolume(volume)
+
+
+def _audio_format(rate: int = RATE):
+    """What the decoder delivers and the equalizer works on: float stereo."""
+    return qt_format(rate, 2, "Float")
+
+
+# -- the audio threads ------------------------------------------------------------------
+#
+# The equalizer engine's feed (decoder -> equalizer -> sound card) runs in two
+# threads of its own. On the GUI thread it starved whenever the GUI was busy:
+# Qt's FFmpeg decoder hands out its next buffer only after the last one was
+# read - read() asks its renderer thread for one more frame, which comes back
+# as a queued signal to the thread that started the decoder (qtmultimedia 6.11
+# qffmpegaudiodecoder.cpp read() -> nextBuffer() -> Renderer::doForceStep()).
+# That is one buffer, ~22 ms of a 48 kHz MP3, per event-loop iteration of
+# that thread: measured on a null sink, a GUI loop busy 130 ms per iteration
+# played at x0.18, busy 40 ms at x0.52.
+#
+# Three threads, so that nothing stretches the iterations that matter: the
+# decoder thread reads buffers, the equalizer thread runs the equalizer, the
+# audio thread writes to the sound card. Each numpy call of the equalizer
+# lets go of the GIL, and getting it back next to a thread busy in Python
+# costs up to sys.getswitchinterval() (5 ms): with the decoder in the same
+# thread as the equalizer, decoding fell to x0.87 next to a GUI thread
+# busy in Python; with the equalizer in the audio thread, writes to the
+# card came up to 244 ms apart - its buffer holds 250 ms - and it ran dry
+# in 1 of 8 runs (measured).
+
+#: The threads' names.
+AUDIO_THREAD = "Media Player audio"
+DECODER_THREAD = "Media Player decoder"
+EQUALIZER_THREAD = "Media Player equalizer"
+#: The engines whose feed runs in those threads; closed at the exit.
+_ENGINES: weakref.WeakSet = weakref.WeakSet()
+_THREADS: dict = {}
+_exit_handler_registered = False
+_multimedia_started = False
+#: In the queue of decoded audio: the decoder delivered its last buffer.
+_END = object()
+
+
+def media_thread(name: str):
+    """The thread *name* (:data:`AUDIO_THREAD`, :data:`DECODER_THREAD`)
+    every equalizer engine uses: made and started on first use, ended at
+    the exit of the process after the engines still open were closed (a
+    QThread destroyed while it runs aborts the process)."""
+    global _exit_handler_registered
+    thread = _THREADS.get(name)
+    if thread is None:
+        from PyQt6.QtCore import QThread
+
+        thread = QThread()
+        thread.setObjectName(name)
+        thread.start()
+        _THREADS[name] = thread
+        if not _exit_handler_registered:
+            # Registered after PyQt6.QtCore's own exit handler: runs before it.
+            atexit.register(end_media_threads)
+            # And when the main loop ends: axross's main() drops the
+            # application object before the exit handlers run.
+            from PyQt6.QtCore import QCoreApplication
+
+            app = QCoreApplication.instance()
+            if app is not None:
+                app.aboutToQuit.connect(end_media_threads)
+            _exit_handler_registered = True
+    return thread
+
+
+def end_media_threads(timeout_ms: int = 5000) -> bool:
+    """Close every open engine and end the threads; True when they ended
+    (or never ran). The exit handler; a later engine starts them anew."""
+    for engine in list(_ENGINES):
+        try:
+            engine.close()
+        except Exception:  # noqa: BLE001 - the others still close, the threads still end
+            log.debug("Media Player: an engine did not close", exc_info=True)
+    ended = True
+    for name, thread in list(_THREADS.items()):
+        thread.quit()
+        if thread.wait(timeout_ms):
+            del _THREADS[name]
+        else:
+            ended = False
+            log.warning("Media Player: the thread %r did not end within %d ms", name, timeout_ms)
+    return ended
+
+
+def _unregister_exit_handlers() -> None:
+    """Take back what :func:`media_thread` registered: each load runs this
+    module afresh, so a hook of an unloaded copy would pile up (and keep
+    that copy alive) until the process ends."""
+    global _exit_handler_registered
+    if not _exit_handler_registered:
+        return
+    atexit.unregister(end_media_threads)
+    from PyQt6.QtCore import QCoreApplication
+
+    app = QCoreApplication.instance()
+    if app is not None:
+        try:
+            app.aboutToQuit.disconnect(end_media_threads)
+        except TypeError:  # not connected (no application when it was registered)
+            pass
+    _exit_handler_registered = False
+
+
+def _start_multimedia_here() -> None:
+    """Set Qt Multimedia's backend up on this (the GUI) thread: it belongs
+    to the thread that makes the first multimedia object, and that must
+    not be the decoder thread, which ends before the process does
+    (qtmultimedia qplatformmediaintegration.cpp: made on first use)."""
+    global _multimedia_started
+    if _multimedia_started:
+        return
+    from PyQt6.QtMultimedia import QAudioDecoder
+
+    first = QAudioDecoder()
+    prime_notify_lookups(first)
+    sip.delete(first)
+    _multimedia_started = True
+
+
+#: Marks a queued C++ slot in a _ThreadHost's calls (see post_slot).
+_SLOT = object()
+
+
+class _ThreadHost(QObject):
+    """Lives in one of the media threads and runs work there: what
+    :meth:`call` is handed from another thread runs there, in order, while
+    the caller waits; :meth:`post` does not wait, nor does
+    :meth:`post_slot`. Signals of the objects made there arrive at a
+    subclass's slots and go to the engine (held weakly)."""
+
+    _wake = pyqtSignal()
+
+    def __init__(self, engine, thread) -> None:
+        super().__init__()
+        self._engine = weakref.ref(engine)
+        self._calls = collections.deque()
+        #: A slot from post_slot is queued and has not run: the calls after
+        #: it wait (a wake-up queued before the slot would run them first).
+        self._held = False
+        #: threading.get_ident() of the thread, known from its first call.
+        self.ident: int | None = None
+        prime_notify_lookups(self)
+        # A real slot of this object: it runs in the thread the object lives
+        # in. A plain Python method gets a PyQt proxy that stays in the
+        # thread connect() ran in (measured: it ran on the GUI thread).
+        self._wake.connect(self._serve)
+        self.moveToThread(thread)
+
+    def call(self, fn, *args):
+        """*fn(*args)* in this host's thread; its result, or its exception
+        raised here."""
+        if threading.get_ident() == self.ident:
+            return fn(*args)
+        thread = self.thread()
+        if thread is None or not thread.isRunning():
+            raise RuntimeError("the Media Player's thread has ended")
+        done = threading.Event()
+        outcome: list = []
+        self._calls.append((fn, args, done, outcome))
+        self._wake.emit()
+        while not done.wait(0.5):
+            if not thread.isRunning():
+                raise RuntimeError("the Media Player's thread has ended")
+        kind, value = outcome
+        if kind == "error":
+            raise value
+        return value
+
+    def post(self, fn, *args) -> None:
+        """*fn(*args)* in this host's thread, later; an exception is logged."""
+        self._calls.append((fn, args, None, None))
+        self._wake.emit()
+
+    def post_slot(self, obj: QObject, slot: str, before=None) -> None:
+        """*before()*, then the C++ slot *slot* of *obj*, in this host's
+        thread, later - in order with the other calls. The slot is run by
+        Qt's event loop, not called from Python, so it holds no GIL: a
+        PyQt call holds it throughout, and QAudioDecoder.start() (it opens
+        and probes the file: 20 ms for a local WAV) stalled the GUI thread
+        that long although it ran in the decoder thread."""
+        self._calls.append((before, (obj, slot), _SLOT, None))
+        self._wake.emit()
+
+    @pyqtSlot()
+    def _resume(self) -> None:
+        """The slot post_slot queued has run: on with the calls after it."""
+        self._held = False
+        self._serve()
+
+    @pyqtSlot()
+    def _serve(self) -> None:
+        self.ident = threading.get_ident()
+        while self._calls and not self._held:
+            fn, args, done, outcome = self._calls.popleft()
+            if done is _SLOT:
+                obj, slot = args
+                try:
+                    if fn is not None:
+                        fn()
+                except Exception:  # noqa: BLE001 - raised into Qt, PyQt aborts
+                    log.exception("Media Player: %s failed", getattr(fn, "__name__", fn))
+                    continue
+                if not sip.isdeleted(obj):
+                    QMetaObject.invokeMethod(obj, slot, Qt.ConnectionType.QueuedConnection)
+                # The rest after the slot: its event is queued before _resume.
+                self._held = True
+                QMetaObject.invokeMethod(self, "_resume", Qt.ConnectionType.QueuedConnection)
+                return
+            if done is None:
+                try:
+                    fn(*args)
+                except Exception:  # noqa: BLE001 - raised into Qt, PyQt aborts
+                    log.exception("Media Player: %s failed", getattr(fn, "__name__", fn))
+                continue
+            try:
+                outcome[:] = ["ok", fn(*args)]
+            except BaseException as exc:  # noqa: BLE001 - handed to the waiting caller
+                outcome[:] = ["error", exc]
+            finally:
+                done.set()
+
+
+class _FeedHost(_ThreadHost):
+    """In the audio thread: the pump timer's ticks, the park timer's end."""
+
+    @pyqtSlot()
+    def tick(self) -> None:
+        engine = self._engine()
+        if engine is not None:
+            engine._signal("_pump")
+
+    @pyqtSlot()
+    def park_timeout(self) -> None:
+        engine = self._engine()
+        if engine is not None:
+            engine._signal("_park_timeout")
+
+
+class _EqHost(_ThreadHost):
+    """In the equalizer thread: its timer's ticks."""
+
+    @pyqtSlot()
+    def tick(self) -> None:
+        engine = self._engine()
+        if engine is not None:
+            engine._eq_signal("_eq_step")
+
+
+class _DecodeHost(_ThreadHost):
+    """In the decoder thread: the decoder's signals."""
+
+    def _forward(self, name: str, *args) -> None:
+        engine = self._engine()
+        if engine is not None:
+            engine._decoder_signal(name, *args)
+
+    @pyqtSlot()
+    def buffer_ready(self) -> None:
+        self._forward("_dec_buffer_ready")
+
+    @pyqtSlot()
+    def decoder_finished(self) -> None:
+        self._forward("_dec_finished")
+
+    def decoder_error(self, *args) -> None:  # connected in the decoder thread
+        self._forward("_dec_error", *args)
+
+    @pyqtSlot("qint64")
+    def duration_changed(self, ms) -> None:
+        self._forward("_dec_duration", ms)
+
+
+def _in_audio_thread(method):
+    """Run the engine method in the audio thread, under the engine's lock; a
+    caller on another thread waits for it and gets its exception. A closed
+    engine does nothing (None)."""
+
+    @functools.wraps(method)
+    def run(self, *args):
+        if self._closed:
+            return None
+        return self._feed.call(self._locked, method, args)
+
+    return run
+
+
+class EqEngine(QObject):
+    """Qt's FFmpeg decoder -> the equalizer -> an audio sink, pushed by a
+    timer; keeps the last samples played for the spectrum.
+
+    The feed runs in two threads of its own (:func:`media_thread`), so a
+    busy GUI thread does not slow it down. The decoder thread owns the
+    QAudioDecoder and reads each buffer as it comes into a queue (up to
+    MAX_AHEAD_SECONDS ahead of the sound card, counting what waits for the
+    equalizer). The equalizer thread keeps EQ_AHEAD_SECONDS of equalized
+    audio ready. The audio thread owns the pump timer and the sink: each
+    tick takes decoded audio from the queue and hands the sink the ready
+    audio it takes - nothing heavy runs there. The controls (load, play, pause, stop, seek, volume,
+    gains, reroute, close) run in the audio thread under the engine's lock
+    while the calling thread waits - they take effect before they return,
+    as on one thread; what they do to the decoder runs in the decoder
+    thread, the audio thread waiting (the decoder thread never waits for
+    another, nor takes the lock). The equalizer thread takes the lock only
+    to take a block and to hand back the result - the numpy work runs
+    outside it - and the audio thread never waits for it. The signals are this object's, which lives on the thread that
+    made it: their slots there run queued.
+
+    Seeking: QAudioDecoder has no seek, so :meth:`seek` takes the target
+    from the audio already decoded - ahead in the queue, or behind it in
+    the memory of the last HISTORY_SECONDS fed to the equalizer - when it
+    lies there, lets the decoder run on and drops what it decodes up to
+    the target when it lies ahead, and starts the decoder again from the
+    top otherwise. The equalizer starts from silence at the target - as a
+    fresh start there would. The decoder hands out one buffer per round
+    trip through its thread (21-24 ms of MP3 or Ogg, 85 ms of WAV): about
+    160x real time for an MP3 with the GUI thread idle, a third of that
+    with it busy in Python (measured), so a seek back beyond the memory
+    into minute 10 of an MP3 takes seconds.
+    """
+
+    finished_playing = pyqtSignal()
+    changed = pyqtSignal()
+    #: The track cannot be played; the reason.
+    failed = pyqtSignal(str)
+    #: The sound card plays too slow, too fast or not at all; the sentence
+    #: (core: PlaybackMonitor).
+    playback_problem = pyqtSignal(str)
+
+    def __init__(self, sink_factory=None, negotiate=None) -> None:
+        super().__init__()
+        _start_multimedia_here()
+        self.sink_factory = sink_factory or QtSink
+        #: desired QAudioFormat -> the one to open the sink with. The real
+        #: sound card is asked (routed_sink_format); a test sink takes all.
+        if negotiate is None:
+            negotiate = routed_sink_format if self.sink_factory is QtSink else (lambda fmt: fmt)
+        self.negotiate = negotiate
+        #: The rate the decoder delivers and the equalizer runs at (the
+        #: sound card's), the sink's (rate, channels, sample format), its
+        #: bytes per frame, and converted bytes the sink did not take yet.
+        self.rate = RATE
+        self._out_format = (RATE, 2, "Float")
+        self._out_bpf = 8
+        self._sink_format = None
+        self._carry = b""
+        self.monitor = PlaybackMonitor(RATE)
+        self.equalizer = Equalizer(RATE, 2)
+        self.eq_enabled = True
+        self._user_gains = [0.0] * len(BANDS)
+        self.state = "stopped"
+        self.error = ""
+        self.finished = False
+        self.loaded = False
+        self.path = ""
+        self.volume = 1.0
+        #: Decoded float stereo frames not through the equalizer yet (up to
+        #: MAX_AHEAD_SECONDS), and equalized ones the sink has not taken. The
+        #: equalizer runs when the sink takes audio, not when it is decoded:
+        #: run at decode time, a slider moved during playback was heard
+        #: 2.35 s later (measured) - after the queue ahead had played.
+        self._pending = bytearray()
+        self._ready = bytearray()
+        #: The memory: decoded frames the queue no longer holds (fed to the
+        #: equalizer, skipped by a seek ahead, dropped on the way to a
+        #: seek target), up to history_frames(), and the track frame after
+        #: its last - for a seek back without the decoder (_remember).
+        self._memory = DecodedMemory(lambda: history_frames(self.rate))
+        #: Frames fed to the equalizer since the chain (re)started, frames it
+        #: gave back (after its latency was dropped), whether its tail went out.
+        self._fed = 0
+        self._produced = 0
+        self._flushed = False
+        self._decoding_done = False
+        self._decoder_starts = 0
+        self._skip = 0
+        self._sink = None
+        #: The stopped sink whose stream stays open until the next one has
+        #: opened (_park_sink), and the timer that closes it otherwise.
+        self._parked = None
+        self._park_timer = None
+        #: Sound card streams opened again since the last play or seek.
+        self._sink_reopens = 0
+        #: Track frame the frames written to the sink count from (a seek
+        #: target); frames written since; frames read from the decoder
+        #: since its start; the frame decoding drops up to (None: none).
+        self._base_frames = 0
+        self._written_frames = 0
+        self._raw_frames = 0
+        self._drop_to: int | None = None
+        #: Where play() starts from a stop (a seek before playing).
+        self._start_frames = 0
+        self._duration = 0
+        self._decoded_frames = 0
+        self._recent = np.zeros((FRAME, 2), np.float32)
+        #: The spectrum's bars, worked out in the equalizer thread from
+        #: _recent while a visualizer asks for them (_bars_wanted bars, asked
+        #: at _bars_asked): its FFT used to run in the GUI thread on every
+        #: tick, and with the GIL shared with busy threads (transfers) a tick
+        #: took ~100x as long. (bars, monotonic time) - one reference, swapped.
+        self._bars: tuple | None = None
+        self._bars_wanted = 0
+        self._bars_asked = 0.0
+        #: Held by the audio thread while the feed changes (the decoder
+        #: thread never takes it); the position (ms) after each change, for
+        #: other threads - read without waiting for a step to end.
+        self._lock = threading.RLock()
+        self._position = 0
+        self._closed = False
+        #: Decoded float stereo chunks (bytes) and finally _END, from the
+        #: decoder thread to the audio thread; their bytes; errors the
+        #: decoder reported as (run, text).
+        self._queue = collections.deque()
+        self._queue_lock = threading.Lock()
+        self._queued_bytes = 0
+        self._decoder_errors = collections.deque()
+        #: The decoder thread's own: the decoder's start count, a buffer it
+        #: left unread (no room), its finished() while that buffer waits,
+        #: and True while it stops the decoder itself - QAudioDecoder emits
+        #: finished() from stop(), which is no end of the track.
+        self._decoder_run = 0
+        #: Frames the decoder read in its current run (the decoder thread's).
+        self._decoder_frames = 0
+        self._decoder_holding = False
+        self._decoder_finish_waiting = False
+        self._stopping_decoder = False
+        #: Set by the audio thread when it asked the decoder thread to read
+        #: the buffer it held, cleared there.
+        self._resume_posted = False
+        #: The equalizer thread's: a reset asked for by raising the
+        #: generation (the audio thread never touches the equalizer's
+        #: state), the generation it last reset at, a block being equalized,
+        #: and how long the last block took (s).
+        self._eq_generation = 0
+        self._eq_seen = 0
+        self._eq_busy = False
+        self._eq_last_batch = 0.0
+        self._decoder = None
+        self._timer = None
+        self._eq_timer = None
+        self._feed = _FeedHost(self, media_thread(AUDIO_THREAD))
+        self._decode = _DecodeHost(self, media_thread(DECODER_THREAD))
+        self._eq = _EqHost(self, media_thread(EQUALIZER_THREAD))
+        self._decode.call(self._build_decoder)
+        self._feed.call(self._build_timer)
+        self._eq.call(self._build_eq_timer)
+        _ENGINES.add(self)
+
+    def _build_decoder(self) -> None:
+        """In the decoder thread: the decoder, made there so its work and
+        signals stay there. A decoder made elsewhere and moved over still
+        decodes at the pace of the thread that made it: its FFmpeg backend
+        object does not move with it (measured: 15 buffers in 2 s with that
+        thread busy 130 ms per iteration)."""
+        from PyQt6.QtMultimedia import QAudioDecoder
+
+        host = self._decode
+        self._decoder = QAudioDecoder(host)
+        prime_notify_lookups(self._decoder)
+        self._decoder.setAudioFormat(_audio_format(self.rate))
+        self._decoder.bufferReady.connect(host.buffer_ready)
+        self._decoder.finished.connect(host.decoder_finished)
+        self._decoder.error.connect(host.decoder_error)
+        self._decoder.durationChanged.connect(host.duration_changed)
+
+    def _build_timer(self) -> None:
+        """In the audio thread: the pump timer."""
+        self._timer = QTimer(self._feed)
+        prime_notify_lookups(self._timer)
+        self._timer.setInterval(10)
+        self._timer.timeout.connect(self._feed.tick)
+        self._park_timer = QTimer(self._feed)
+        prime_notify_lookups(self._park_timer)
+        self._park_timer.setSingleShot(True)
+        self._park_timer.timeout.connect(self._feed.park_timeout)
+
+    def _build_eq_timer(self) -> None:
+        """In the equalizer thread: its timer."""
+        self._eq_timer = QTimer(self._eq)
+        prime_notify_lookups(self._eq_timer)
+        self._eq_timer.setInterval(10)
+        self._eq_timer.timeout.connect(self._eq.tick)
+
+    def _set_running(self, on: bool) -> None:
+        """Start or stop the pump and the equalizer's timer (audio thread;
+        the equalizer thread is told, not waited for)."""
+        if on:
+            self._timer.start()
+        else:
+            self._timer.stop()
+        self._eq.post(self._eq_signal, "_eq_run", on)
+
+    def _locked(self, method, args):
+        """*method(self, *args)* under the lock, in the audio thread."""
+        with self._lock:
+            if self._closed:
+                return None
+            if sip.isdeleted(self):
+                self._teardown()
+                return None
+            try:
+                return method(self, *args)
+            finally:
+                self._position = self._current_position()
+
+    def _signal(self, name: str, *args) -> None:
+        """The timer's tick or a decoder report, in the audio thread: the
+        step *name* under the lock. An exception is logged - raised into
+        Qt, PyQt would abort the process."""
+        try:
+            with self._lock:
+                if self._closed:
+                    return
+                if sip.isdeleted(self):  # its panel went without closing it
+                    self._teardown()
+                    return
+                try:
+                    getattr(self, name)(*args)
+                finally:
+                    self._position = self._current_position()
+        except Exception:  # noqa: BLE001 - see above
+            log.exception("Media Player: the audio feed failed in %s", name)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Stop for good and free the decoder, the timer and the sink (in
+        the audio thread); later calls do nothing. The panel's shutdown and
+        the exit call it."""
+        if self._closed:
+            return
+        self._feed.call(self._close_in_thread)
+
+    def _close_in_thread(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self._teardown()
+        # Outside the lock: the equalizer thread may wait for it.
+        try:
+            self._eq.call(self._eq_close)
+        except RuntimeError:  # its thread ended already (the exit)
+            log.debug("Media Player: the equalizer timer was not closed", exc_info=True)
+
+    def _teardown(self) -> None:
+        """In the audio thread, under the lock: everything stops and goes."""
+        self._closed = True
+        _ENGINES.discard(self)
+        if self._timer is not None and not sip.isdeleted(self._timer):
+            self._timer.stop()
+        if self._decoder is not None and not sip.isdeleted(self._decoder):
+            try:
+                self._decode.call(self._dec_close)
+            except RuntimeError:  # the decoder thread ended already (the exit)
+                log.debug("Media Player: the decoder was not closed", exc_info=True)
+        if self._park_timer is not None and not sip.isdeleted(self._park_timer):
+            self._park_timer.stop()
+        self._release_parked()
+        if self._sink is not None:
+            self._sink.stop()
+            self._sink = None
+        self._pending.clear()
+        self._ready.clear()
+        self._forget()
+        self._carry = b""
+        self._written_frames = self._base_frames = self._start_frames = 0
+        self.state = "stopped"
+        self._position = 0
+        self._eq.post(self._eq_close)  # close() waits for it, outside the lock
+        if self._timer is not None and not sip.isdeleted(self._timer):
+            sip.delete(self._timer)  # in its own thread: at once
+        if self._park_timer is not None and not sip.isdeleted(self._park_timer):
+            sip.delete(self._park_timer)
+        if not sip.isdeleted(self):
+            self.changed.emit()
+
+    @property
+    def gains_db(self) -> list[float]:
+        """The user's band gains (kept while the equalizer is off)."""
+        return list(self._user_gains)
+
+    @_in_audio_thread
+    def set_gains(self, gains) -> None:
+        self.equalizer.set_gains(gains)  # validates and clamps
+        self._user_gains = list(self.equalizer.gains_db)
+        if not self.eq_enabled:
+            self.equalizer.set_gains([0.0] * len(BANDS))
+
+    @_in_audio_thread
+    def set_eq_enabled(self, on: bool) -> None:
+        """Off is flat: the equalizer stays in the chain (taking it out
+        mid-track would jump by its latency)."""
+        self.eq_enabled = bool(on)
+        self.equalizer.set_gains(self._user_gains if on else [0.0] * len(BANDS))
+
+    @_in_audio_thread
+    def load(self, path: str) -> None:
+        self.stop()
+        self.path = path
+        self.error = ""
+        self.finished = False
+        self.loaded = True
+        self._duration = 0
+        self.monitor.reset()
+        self._decode.call(self._dec_set_source, path)
+        self.changed.emit()
+
+    @_in_audio_thread
+    def play(self) -> None:
+        if not self.loaded:
+            return
+        if self.state == "paused":
+            self.state = "playing"
+            if self._sink is not None:
+                self._sink.resume()
+            self._set_running(True)
+            self.changed.emit()
+            return
+        if self.state == "playing":
+            return
+        if not is_stream(self.path) and not os.path.isfile(self.path):
+            self._fail(tr("{path}: no such file").format(path=self.path))
+            return
+        # A start from stopped forgets an earlier failure: it blocked every
+        # seek and swallowed the next decoder error.
+        self.error = ""
+        self.finished = False
+        start_ms = self._start_frames * 1000 // self.rate
+        self._prepare_format()
+        self._base_frames = start_ms * self.rate // 1000 if self._start_frames else 0
+        self._start_frames = 0
+        self._written_frames = 0
+        self.monitor.pause()
+        self._sink_reopens = 0
+        self._sink = self._new_sink()
+        self.state = "playing"
+        # The decoder starts in its thread, not waited for; a file it cannot
+        # read is reported from there (_dec_error -> _fail stops all).
+        self._start_decoder(self._base_frames)
+        self._set_running(True)
+        self.changed.emit()
+
+    @_in_audio_thread
+    def pause(self) -> None:
+        if self.state == "playing":
+            self.state = "paused"
+            self._set_running(False)
+            self.monitor.pause()
+            if self._sink is not None:
+                self._sink.suspend()
+            self.changed.emit()
+
+    @_in_audio_thread
+    def stop(self) -> None:
+        self._set_running(False)
+        self._stop_decoder()
+        self._park_sink()
+        self._pending.clear()
+        self._ready.clear()
+        self._forget()
+        self._carry = b""
+        self._written_frames = 0
+        self._base_frames = 0
+        self._start_frames = 0
+        self.state = "stopped"
+        self.changed.emit()
+
+    @_in_audio_thread
+    def seek(self, ms) -> None:
+        """Play on from *ms* (clamped to the start); past the end the
+        track ends as if played. Paused stays paused, stopped starts there
+        on the next play(). A stream has no position to go to."""
+        if not self.loaded or self.error or is_stream(self.path):
+            return
+        target = max(0, int(ms)) * self.rate // 1000
+        if self.state == "stopped":
+            self._start_frames = target
+            self.changed.emit()
+            return
+        if self._duration > 0 and target >= self._duration * self.rate // 1000:
+            self._end_track()
+            return
+        current = self._base_frames + self._written_frames
+        pending_start = self._base_frames + self._fed  # track frame of the queue's first
+        ahead = len(self._pending) // 8
+        if pending_start <= target < pending_start + ahead:
+            # Decoded already, ahead in the queue: it starts at the target,
+            # what lies before goes to the memory; the decoder runs on.
+            self._remember(bytes(self._pending[:(target - pending_start) * 8]), pending_start)
+            del self._pending[:(target - pending_start) * 8]
+            self._reset_equalizer()
+        elif self._recall(target, pending_start):
+            self._reset_equalizer()
+        elif not self._decoding_done and target >= self._raw_frames:
+            self._restart_chain(target)
+        elif self._decoding_done and target >= current + ahead:
+            self._end_track()
+            return
+        else:
+            self._start_decoder(target)
+        self._base_frames = target
+        self._written_frames = 0
+        self._carry = b""
+        self.monitor.pause()
+        self._sink_reopens = 0
+        # What the sound card holds is from before the seek. The next sink
+        # opens before the old one stops: stopped first, its QIODevice was
+        # deleted and the new one got its address - and its wrapper was then
+        # marked deleted (PulseAudio backend): every write raised.
+        self._replace_sink()
+        if self.state == "paused":
+            self._sink.suspend()
+        self.changed.emit()
+
+    @_in_audio_thread
+    def set_volume(self, volume: float) -> None:
+        self.volume = max(0.0, min(1.0, volume))
+        if self._sink is not None:
+            self._sink.set_volume(self.volume)
+
+    @_in_audio_thread
+    def reroute(self) -> None:
+        """The output device was changed (Edit > Settings… > Audio): a
+        playing or paused track goes on through a new sink, which the sink
+        factory opens on the device now chosen. What the old sink still
+        held (at most its 250 ms buffer) is not played."""
+        if self._sink is None or self.state not in ("playing", "paused"):
+            return
+        position = self.position_ms()
+        old_rate = self.rate
+        self._carry = b""
+        self._prepare_format()
+        self.monitor.pause()
+        if self.rate != old_rate:
+            # Another rate: the decoder starts again at the position.
+            target = position * self.rate // 1000
+            self._start_decoder(target)
+            self._base_frames = target
+            self._written_frames = 0
+        self._sink_reopens = 0
+        self._replace_sink()  # the new one first, as seek() does
+        if self.state == "paused":
+            self._sink.suspend()
+
+    def position_ms(self) -> int:
+        """Where playback is; another thread gets the position after the
+        audio thread's last step (it does not wait for a running one)."""
+        if threading.get_ident() == self._feed.ident:
+            return self._current_position()
+        return self._position
+
+    def _remember(self, raw: bytes, start: int) -> None:
+        """Keep *raw* - decoded frames from track frame *start* on that
+        leave the queue (or never enter it) - in the memory."""
+        self._memory.append(raw, start)
+
+    def _forget(self, at: int = 0) -> None:
+        self._memory.forget(at)
+
+    def _recall(self, target: int, pending_start: int) -> bool:
+        """Start the queue at *target* from the memory when it holds that
+        frame and the audio still to come follows on its end: the queue's
+        first frame, or - on the way to a seek target - the decoder's next.
+        False when it cannot."""
+        memory = self._memory
+        if not memory.start <= target < memory.end:
+            return False
+        if self._drop_to is not None:
+            follows = not self._pending and memory.end == self._raw_frames
+        else:
+            follows = memory.end == pending_start
+        if not follows:
+            return False
+        self._pending[:0] = memory.take_from(target)
+        self._drop_to = None  # the decoder's next frames follow on
+        return True
+
+    def _current_position(self) -> int:
+        if self.state == "stopped":
+            return int(self._start_frames * 1000 // self.rate)
+        return int((self._base_frames + self._written_frames) * 1000 // self.rate)
+
+    def duration_ms(self) -> int:
+        """The track's length once the decoder knows it, else 0."""
+        return int(self._duration)
+
+    def current_bars(self, n_bars: int = 32):
+        """The spectrum of what was played last: the equalizer thread's bars
+        while playing (BARS_FRESH old at most), worked out here otherwise -
+        paused, stopped, the first ask, another bar count."""
+        now = time.monotonic()
+        self._bars_wanted, self._bars_asked = n_bars, now
+        cached = self._bars
+        if (cached is not None and len(cached[0]) == n_bars and self.state == "playing"
+                and now - cached[1] <= BARS_FRESH):
+            return cached[0]
+        bars = spectrum_bars(self._recent, self.rate, n_bars)
+        self._bars = (bars, now)
+        return bars
+
+    def _update_bars(self) -> None:
+        """In the equalizer thread: the bars of _recent, while a visualizer
+        asked within BARS_WANTED_FOR and the last ones are BARS_EVERY old."""
+        wanted = self._bars_wanted
+        now = time.monotonic()
+        if not wanted or now - self._bars_asked > BARS_WANTED_FOR:
+            return
+        cached = self._bars
+        if cached is not None and now - cached[1] < BARS_EVERY:
+            return
+        self._bars = (spectrum_bars(self._recent, self.rate, wanted), now)
+
+    def current_samples(self):
+        """The last FRAME frames written to the sound card (frames x 2,
+        float32), for the oscilloscope and the VU meter. Replaced, never
+        changed in place."""
+        return self._recent
+
+    # -- the chain -------------------------------------------------------------------------
+
+    def _prepare_format(self) -> None:
+        """Ask the sound card for its format; a new rate goes to the decoder
+        (which resamples) and the equalizer. Before the decoder starts."""
+        fmt = self.negotiate(_audio_format(RATE))
+        rate, channels, sample_format = format_tuple(fmt)
+        if sample_format not in SAMPLE_BYTES:
+            fmt = qt_format(rate, channels, "Float")
+            sample_format = "Float"
+        self._sink_format = fmt
+        self._out_format = (rate, channels, sample_format)
+        self._out_bpf = channels * SAMPLE_BYTES[sample_format]
+        if rate != self.rate:
+            self._stop_decoder()
+            self.rate = rate
+            self._decode.call(self._dec_set_rate, rate)
+            self.equalizer = Equalizer(rate, 2)
+            self.equalizer.set_gains(self._user_gains if self.eq_enabled else [0.0] * len(BANDS))
+            self._eq_generation += 1  # a block of the old one is discarded
+            self.monitor = PlaybackMonitor(rate)
+            self._recent = np.zeros((FRAME, 2), np.float32)
+
+    def _replace_sink(self) -> None:
+        """Open a new sink, then stop and free the old one."""
+        self._park_sink()
+        self._sink = self._new_sink()
+
+    def _park_sink(self) -> None:
+        """Silence the sink at once, but stop it - which deletes its stream's
+        QIODevice - only once the next sink has opened (_new_sink), or after
+        PARK_MS. Stopped first, the next stream's QIODevice got the deleted
+        one's C++ address and its wrapper was then marked deleted (PulseAudio
+        backend): every write raised - on a seek, a track change, a reroute."""
+        sink, self._sink = self._sink, None
+        if sink is None:
+            return
+        self._release_parked()
+        sink.suspend()
+        self._parked = sink
+        if self._park_timer is not None and not sip.isdeleted(self._park_timer):
+            self._park_timer.start(PARK_MS)
+
+    def _release_parked(self) -> None:
+        """Stop the parked sink (a factory that hands out one sink for all -
+        tests - keeps it when it is the sink in use again)."""
+        parked, self._parked = self._parked, None
+        if parked is not None and parked is not self._sink:
+            parked.stop()
+
+    def _park_timeout(self) -> None:
+        self._release_parked()
+
+    def _new_sink(self):
+        if self._sink_format is None:
+            self._prepare_format()
+        sink = self.sink_factory(self._sink_format)
+        sink.set_volume(self.volume)
+        sink.start()
+        self._sink = sink
+        self._release_parked()
+        if self._park_timer is not None and not sip.isdeleted(self._park_timer):
+            self._park_timer.stop()
+        return sink
+
+    def _stop_decoder(self) -> None:
+        """Stop the decoder; what it decoded and nobody took is gone."""
+        self._decode.call(self._dec_stop)
+
+    def _reset_equalizer(self) -> None:
+        """A fresh equalizer for audio that does not follow on what went
+        through it: what it holds is dropped (the equalizer thread resets
+        it before its next block; a block it works on now is discarded)."""
+        self._eq_generation += 1
+        self._ready.clear()
+        self._fed = self._produced = 0
+        self._flushed = False
+        # The equalizer's output lags by its latency: that many leading
+        # samples are dropped, and its flush supplies them at the end.
+        self._skip = self.equalizer.latency
+
+    def _restart_chain(self, drop_to: int) -> None:
+        """A fresh equalizer and queue for audio from frame *drop_to* on;
+        the decoder (running) drops what it decodes before it - into the
+        memory, like the queue's audio."""
+        self._remember(bytes(self._pending), self._base_frames + self._fed)
+        self._reset_equalizer()
+        self._pending.clear()
+        self._decoded_frames = 0
+        self._drop_to = drop_to if drop_to > self._raw_frames else None
+        self._decoding_done = False
+        self._resume_decoder()  # what it decodes now is dropped: it may go on at once
+
+    def _start_decoder(self, drop_to: int) -> None:
+        """Decode from the top, dropping the frames before *drop_to*. The
+        decoder thread starts the decoder later, nobody waits for it:
+        QAudioDecoder.start() opens and probes the file (20 ms for a local
+        WAV, as long as a slow mount takes), and play() and seek() held the
+        GUI thread for that. An error start() reports comes like any later
+        decoder error (_dec_error); a stop sent meanwhile runs after it."""
+        self._stop_decoder()
+        self._raw_frames = 0
+        self._pending.clear()
+        self._forget(0)  # it decodes from the top: the memory refills from there
+        self._restart_chain(drop_to)
+        self._decoder_starts += 1
+        self._decode.post_slot(self._decoder, "start",
+                               functools.partial(self._decoder_signal, "_dec_start"))
+
+    def _end_track(self) -> None:
+        """The end of the track, reached by a seek past it."""
+        self._set_running(False)
+        self._stop_decoder()
+        self._park_sink()
+        self._pending.clear()
+        self._ready.clear()
+        self._forget()
+        self._carry = b""
+        self._decoding_done = True
+        self._written_frames = self._base_frames = self._start_frames = 0
+        self.state = "stopped"
+        self.finished = True
+        self.changed.emit()
+        self.finished_playing.emit()
+
+    def _room(self) -> bool:
+        """Whether one more decoded chunk may be taken from the queue now."""
+        return len(self._pending) + len(self._ready) < MAX_AHEAD_SECONDS * self.rate * 8
+
+    def _drain(self) -> None:
+        """Take decoded audio from the queue while there is room; ask the
+        decoder thread for the buffer it held back once there is."""
+        while self._queue and self._room():
+            with self._queue_lock:
+                item = self._queue.popleft()
+                if item is not _END:
+                    self._queued_bytes -= len(item)
+            if item is _END:
+                self._decoder_done()
+            else:
+                self._take_decoded(item)
+        self._resume_decoder()
+
+    def _resume_decoder(self) -> None:
+        """Ask the decoder thread for the buffer it held back once there
+        is room for it."""
+        if (self._decoder_holding and not self._resume_posted and not self._closed
+                and self._decoder_room()):
+            self._resume_posted = True
+            self._decode.post(self._decoder_signal, "_dec_resume")
+
+    def _write_to(self, sink) -> int:
+        """Hand the sink what it takes now, in its format: converted bytes
+        it did not take last time first, then whole frames of the queue.
+        The bytes it had room for (0: it took nothing more)."""
+        if self._carry:
+            taken = sink.write(self._carry)
+            self._carry = self._carry[taken:]
+            if self._carry:
+                return 0
+        free = sink.bytes_free()
+        frames_free = free // self._out_bpf
+        if not frames_free:
+            return 0
+        count = min(frames_free, len(self._ready) // 8)
+        if not count:
+            return free
+        frames = np.frombuffer(bytes(self._ready[:count * 8]), np.float32).reshape(-1, 2)
+        del self._ready[:count * 8]
+        _rate, channels, sample_format = self._out_format
+        data = (frames.tobytes() if (channels, sample_format) == (2, "Float")
+                else convert_frames(frames, channels, sample_format))
+        taken = sink.write(data)
+        if taken < len(data):
+            self._carry = data[taken:]
+        # The frames count as played once handed over (the rest follows).
+        self._written_frames += count
+        self._recent = (frames[-FRAME:].copy() if len(frames) >= FRAME
+                        else np.concatenate([self._recent, frames])[-FRAME:])
+        return free
+
+    def _take_decoded(self, raw: bytes) -> None:
+        """A decoded chunk (float stereo) for the equalizer's queue; what
+        lies before a seek target is dropped."""
+        frames = len(raw) // 8
+        start = self._raw_frames
+        self._raw_frames += frames
+        offset = 0
+        if self._drop_to is not None:
+            if self._raw_frames <= self._drop_to:
+                self._remember(raw, start)
+                return  # before the seek target
+            offset = self._drop_to - start
+            self._remember(raw[:offset * 8], start)
+            self._drop_to = None
+        self._decoded_frames += frames - offset
+        self._pending += raw[offset * 8:]
+
+    # -- the equalizer thread (takes the lock only around its numpy work) ---------------------
+
+    def _eq_signal(self, name: str, *args) -> None:
+        """The equalizer timer's tick, or work posted to that thread. An
+        exception is logged - raised into Qt, PyQt would abort."""
+        try:
+            if self._closed:
+                return
+            if sip.isdeleted(self):  # the audio thread's next step tears all down
+                self._feed.post(self._signal, "_pump")
+                return
+            getattr(self, name)(*args)
+        except Exception:  # noqa: BLE001 - see above
+            log.exception("Media Player: the equalizer failed in %s", name)
+
+    def _eq_run(self, on: bool) -> None:
+        if self._eq_timer is None or sip.isdeleted(self._eq_timer):
+            return
+        if on:
+            self._eq_timer.start()
+            self._eq_step()  # at once: a start or a seek has nothing ready
+        else:
+            self._eq_timer.stop()
+
+    def _eq_close(self) -> None:
+        if self._eq_timer is not None and not sip.isdeleted(self._eq_timer):
+            self._eq_timer.stop()
+            sip.delete(self._eq_timer)  # in its own thread: at once
+
+    def _eq_step(self) -> None:
+        """Keep EQ_AHEAD_SECONDS of equalized audio ready (and, once the
+        decoder is done and the queue empty, the equalizer's tail). A block
+        is at least twice what the last one took to equalize, so a slow
+        equalizer (a GIL shared with a busy thread) still keeps up."""
+        if self.state == "playing":
+            self._update_bars()
+        with self._lock:
+            if self._closed or self._eq_busy:
+                return
+            if self._eq_seen != self._eq_generation:
+                self.equalizer.reset()
+                self._eq_seen = self._eq_generation
+            ready = len(self._ready) // 8
+            tail_due = self._decoding_done and not self._pending and not self._flushed
+            if not tail_due and (ready >= EQ_AHEAD_SECONDS * self.rate or not self._pending):
+                return
+            block = None
+            if self._pending:
+                want = max(HOP, int(EQ_AHEAD_SECONDS * self.rate) - ready,
+                           int(2 * self._eq_last_batch * self.rate))
+                count = min(len(self._pending) // 8, want)
+                raw = bytes(self._pending[:count * 8])
+                block = np.frombuffer(raw, np.float32).reshape(-1, 2)
+                del self._pending[:count * 8]
+                self._remember(raw, self._base_frames + self._fed)
+                self._fed += count
+                tail_due = self._decoding_done and not self._pending
+            generation, equalizer = self._eq_generation, self.equalizer
+            self._eq_busy = True
+        try:
+            started = time.perf_counter()
+            out = equalizer.process(block) if block is not None else None
+            tail = equalizer.flush() if tail_due else None
+            self._eq_last_batch = time.perf_counter() - started
+        except BaseException:
+            with self._lock:
+                self._eq_busy = False
+            raise
+        with self._lock:
+            # Busy until the result is in: the audio thread must not take
+            # the track for played while its last block is on the way.
+            self._eq_busy = False
+            if self._closed or generation != self._eq_generation:
+                return  # reset (a seek) meanwhile: this block is gone
+            if out is not None:
+                self._take(out)
+            if tail is not None:
+                self._flushed = True
+                if self._skip:
+                    tail = tail[self._skip:]
+                    self._skip = 0
+                self._take(tail[: max(0, self._fed - self._produced)])
+
+    def _take(self, frames) -> None:
+        """Equalized *frames* for the sink, after the latency is dropped."""
+        if self._skip and len(frames):
+            dropped = min(self._skip, len(frames))
+            frames = frames[dropped:]
+            self._skip -= dropped
+        if len(frames):
+            self._produced += len(frames)
+            self._ready += np.ascontiguousarray(frames, np.float32).tobytes()
+
+    def _decoder_done(self) -> None:
+        """The decoder's last buffer was taken from the queue."""
+        self._drop_to = None  # a seek past the real end: nothing follows
+        self._decoding_done = True  # the equalizer's tail follows the queue
+        if self._raw_frames == 0 and not self.error:
+            self._fail(tr("{name}: no audio could be decoded").format(
+                name=os.path.basename(self.path)))
+
+    def _take_decoder_errors(self) -> None:
+        """Fail on an error the decoder reported for its current run."""
+        while self._decoder_errors:
+            run, text = self._decoder_errors.popleft()
+            if run == self._decoder_run and not self.error and self.loaded:
+                self._fail(text)
+
+    # -- the decoder thread (never takes the lock, never waits for another thread) ----------
+
+    def _decoder_signal(self, name: str, *args) -> None:
+        """A decoder signal, or work the audio thread posted, in the decoder
+        thread. An exception is logged - raised into Qt, PyQt would abort."""
+        try:
+            if self._closed:
+                return
+            if sip.isdeleted(self):  # the audio thread's next step tears all down
+                self._feed.post(self._signal, "_pump")
+                return
+            getattr(self, name)(*args)
+        except Exception:  # noqa: BLE001 - see above
+            log.exception("Media Player: the decoder failed in %s", name)
+
+    def _decoder_room(self) -> bool:
+        """Whether the decoder may hand out one more buffer: what waits in
+        the queue, for the equalizer and for the sink stays below
+        MAX_AHEAD_SECONDS (the decoder waits until its buffer is read).
+        On the way to a seek target its audio is dropped - into the memory
+        - not played: it goes on while the queue holds less than the
+        memory's bound more. Bounded by the sound card's pace it stood
+        still for up to a feed tick after every MAX_AHEAD_SECONDS of audio
+        (tests/test_media_player_seek_far.py). Read from the audio thread
+        too: the drop target and the frame count may be a step old, which
+        only moves a wait by a buffer."""
+        with self._queue_lock:
+            queued = self._queued_bytes
+        limit = MAX_AHEAD_SECONDS * self.rate * 8
+        drop_to = self._drop_to
+        if drop_to is not None and self._decoder_frames < drop_to:
+            return queued < limit + history_frames(self.rate) * 8
+        return queued + len(self._pending) + len(self._ready) < limit
+
+    def _dec_set_source(self, path: str) -> None:
+        self._decoder.setSource(media_url(path))
+
+    def _dec_set_rate(self, rate: int) -> None:
+        self._decoder.setAudioFormat(_audio_format(rate))
+
+    def _dec_start(self) -> None:
+        """A new run of the decoder; its start() follows from Qt's event
+        loop (_ThreadHost.post_slot)."""
+        self._decoder_run += 1
+        self._decoder_frames = 0
+        self._decoder_holding = self._decoder_finish_waiting = False
+
+    def _dec_stop(self) -> None:
+        self._stopping_decoder = True
+        try:
+            self._decoder.stop()
+            # A buffer not read yet stays available after stop() and would
+            # be the first one read after the next start() - audio from the
+            # old position counted as the new run's first frames.
+            for _ in range(64):
+                if not self._decoder.bufferAvailable():
+                    break
+                self._decoder.read()
+        finally:
+            self._stopping_decoder = False
+        self._decoder_holding = self._decoder_finish_waiting = False
+        with self._queue_lock:
+            self._queue.clear()
+            self._queued_bytes = 0
+
+    def _dec_close(self) -> None:
+        self._dec_stop()
+        sip.delete(self._decoder)  # in its own thread: at once
+
+    def _dec_buffer_ready(self) -> None:
+        if not self._decoder_room():
+            # A full queue leaves the buffer with the decoder, which then
+            # waits; the audio thread asks for it once the sound card played
+            # some (_drain -> _dec_resume).
+            self._decoder_holding = True
+            return
+        self._dec_read()
+
+    def _dec_resume(self) -> None:
+        self._resume_posted = False
+        if self._decoder.bufferAvailable() and self._decoder_room():
+            self._dec_read()
+
+    def _dec_read(self) -> None:
+        self._decoder_holding = False
+        buffer = self._decoder.read()
+        if buffer.isValid() and buffer.byteCount() > 0:
+            size = buffer.byteCount() // 8 * 8
+            raw = buffer.constData().asstring(size)
+            self._decoder_frames += size // 8
+            with self._queue_lock:
+                self._queue.append(raw)
+                self._queued_bytes += len(raw)
+        if self._decoder_finish_waiting and not self._decoder.bufferAvailable():
+            self._dec_end()
+
+    def _dec_finished(self) -> None:
+        if self._stopping_decoder:
+            return  # stop() emits finished(): not the end of the track
+        if self._decoder.bufferAvailable():
+            self._decoder_finish_waiting = True  # the last buffer is not read yet
+            return
+        self._dec_end()
+
+    def _dec_end(self) -> None:
+        self._decoder_finish_waiting = False
+        with self._queue_lock:
+            self._queue.append(_END)
+
+    def _dec_error(self, *_args) -> None:
+        self._decoder_errors.append(
+            (self._decoder_run, self._decoder.errorString() or "the file could not be decoded"))
+        self._feed.post(self._signal, "_take_decoder_errors")
+
+    def _dec_duration(self, ms) -> None:
+        if int(ms) > 0:  # stop() reports -1
+            self._duration = int(ms)
+
+    def _fail(self, text: str) -> None:
+        self.error = text
+        self.stop()
+        self.changed.emit()
+        self.failed.emit(text)
+
+    def _reopen_sink(self) -> None:
+        """The sound card's stream is gone (not by a stop of ours): open it
+        once more, MAX_SINK_REOPENS times per play or seek, then fail with
+        one message instead of an error on every tick. What the old stream
+        held is not played again."""
+        if self._sink_reopens >= MAX_SINK_REOPENS:
+            # Not "the stream keeps closing" when there is nothing to play to.
+            self._fail(tr("No audio device: this computer has no sound card or other output to "
+                          "play to") if no_audio_device()
+                       else tr("The sound card's stream keeps closing; playback stopped"))
+            return
+        self._sink_reopens += 1
+        log.warning("Media Player: the sound card's stream was gone; opening it again")
+        self._carry = b""
+        self._replace_sink()
+        if self.state == "paused":
+            self._sink.suspend()
+
+    @_in_audio_thread
+    def _pump(self) -> None:
+        sink = self._sink
+        if sink is None:
+            return
+        if not getattr(sink, "alive", lambda: True)():
+            self._reopen_sink()
+            return
+        self._drain()
+        if self._sink is not sink:
+            return  # the end of the decoded audio failed the track
+        room = self._write_to(sink)
+        if self._pending or self._ready or self._carry or not self._decoding_done:
+            # Starved: the sound card had room, and after this tick at least
+            # half of it is still empty - nothing was ready, or making it
+            # (decoding, equalizing) took longer than the card took to play.
+            # A sink kept full has (almost) no room left after the write.
+            left = sink.bytes_free() if room else 0
+            starved = (not self._decoding_done and left >= self._out_bpf
+                       and 2 * left >= room)
+            problem = self.monitor.update(time.monotonic(), self._written_frames,
+                                          _backend_name(), starved=starved)
+            if problem:
+                log.warning("Media Player: %s", problem)
+                self.playback_problem.emit(problem)
+        else:
+            self.monitor.pause()  # the end drains the sound card: not a speed
+        if (self._decoding_done and self._flushed and not self._pending and not self._ready
+                and not self._carry and not self._eq_busy):
+            self._set_running(False)
+            # Everything was played: the sound card's stream (PulseAudio,
+            # PipeWire, a Bluetooth link) is not kept open while stopped.
+            self._park_sink()
+            self.state = "stopped"
+            self.finished = True
+            self.changed.emit()
+            self.finished_playing.emit()
+
+
+class SimpleEngine(QObject):
+    """Playback without numpy: QMediaPlayer, no equalizer, no spectrum."""
+
+    finished_playing = pyqtSignal()
+    changed = pyqtSignal()
+    #: The track cannot be played; the reason.
+    failed = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+        self._player = QMediaPlayer(self)
+        self._output = QAudioOutput(self)
+        prime_notify_lookups(self._player)
+        prime_notify_lookups(self._output)
+        device = audio_route.source_device("media")
+        if device is not None:
+            self._output.setDevice(device)
+        self._player.setAudioOutput(self._output)
+        self._player.mediaStatusChanged.connect(self._status)
+        self._player.errorOccurred.connect(lambda _e, text: self._fail(text))
+        self.state, self.error, self.finished, self.loaded, self.path = "stopped", "", False, False, ""
+        self.gains_db = [0.0] * 10
+        #: Where play() starts from a stop: QMediaPlayer ignores a
+        #: position set before it plays.
+        self._start_ms = 0
+
+    def _status(self, status) -> None:
+        from PyQt6.QtMultimedia import QMediaPlayer
+
+        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.state != "stopped":
+            self._ended()
+
+    def _ended(self) -> None:
+        self.state, self.finished, self._start_ms = "stopped", True, 0
+        self.changed.emit()
+        self.finished_playing.emit()
+
+    def _fail(self, text: str) -> None:
+        self.error = text or "the file could not be played"
+        self.state = "stopped"
+        self.changed.emit()
+        self.failed.emit(self.error)
+
+    def load(self, path: str) -> None:
+        self._player.stop()
+        self.path, self.error, self.finished, self.loaded = path, "", False, True
+        self.state, self._start_ms = "stopped", 0
+        self._player.setSource(media_url(path))
+
+    def play(self) -> None:
+        if not self.loaded or self.state == "playing":
+            return
+        start, self._start_ms = (self._start_ms if self.state == "stopped" else 0), 0
+        if self.state == "stopped":
+            self.error = ""   # as EqEngine.play
+        self.finished = False
+        self._player.play()
+        if start:
+            self._player.setPosition(start)
+        self.state = "playing"
+        self.changed.emit()
+
+    def pause(self) -> None:
+        if self.state != "playing":
+            return
+        self._player.pause()
+        self.state = "paused"
+        self.changed.emit()
+
+    def stop(self) -> None:
+        self._player.stop()
+        self.state, self._start_ms = "stopped", 0
+        self.changed.emit()
+
+    def seek(self, ms) -> None:
+        """As :meth:`EqEngine.seek`."""
+        if not self.loaded or self.error or is_stream(self.path):
+            return
+        ms = max(0, int(ms))
+        if self.state == "stopped":
+            self._start_ms = ms
+            self.changed.emit()
+            return
+        duration = self.duration_ms()
+        if duration > 0 and ms >= duration:
+            self._player.stop()
+            self._ended()
+            return
+        self._player.setPosition(ms)
+        self.changed.emit()
+
+    def duration_ms(self) -> int:
+        return max(0, int(self._player.duration()))
+
+    def set_volume(self, volume: float) -> None:
+        self._output.setVolume(volume)
+
+    def reroute(self) -> None:
+        """The output device was changed: QAudioOutput moves at once."""
+        from PyQt6.QtMultimedia import QMediaDevices
+
+        self._output.setDevice(audio_route.source_device("media")
+                               or QMediaDevices.defaultAudioOutput())
+
+    def set_gains(self, gains) -> None:
+        pass
+
+    def position_ms(self) -> int:
+        if self.state == "stopped":
+            return self._start_ms
+        return int(self._player.position())
+
+    def current_bars(self, n_bars: int = 32):
+        return None
+
+    def current_samples(self):
+        return None
+
+
+# -- the panel -----------------------------------------------------------------------
+
+
+def _backend_name() -> str:
+    """The audio backend this run plays through, for messages."""
+    try:
+        from core import multimedia_probe
+
+        backend = multimedia_probe.active_backend()
+    except Exception:  # noqa: BLE001 - a message must not fail
+        return ""
+    return BACKEND_LABELS.get(backend or "", "")
+
+
+#: Why the player stays off when Qt Multimedia decodes nothing here
+#: (core.multimedia_probe.ProbeResult.decoding).
+NO_DECODER_REASON = ("Qt Multimedia has no backend here that can decode audio files "
+                     "(its FFmpeg plugin is missing)")
+
+
+def default_engine():
+    """The engine a panel builds itself: the equalizer one with numpy."""
+    return EqEngine() if np is not None else SimpleEngine()
+
+
+class PendingEngine(QObject):
+    """Stands in for the engine until Qt Multimedia answered
+    (:meth:`PlayerPanel._start_engine`): it plays nothing, creates no
+    multimedia object and keeps what the panel asked for - the track, its
+    position, play, volume, gains - for the real engine. A panel whose
+    audio does not start keeps it, so the saved state stays intact."""
+
+    finished_playing = pyqtSignal()
+    changed = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = "stopped"
+        self.error = ""
+        self.path = ""
+        self.loaded = False
+        self.position = 0
+        self.wants_play = False
+        self.gains: list[float] | None = None
+
+    def load(self, path: str) -> None:
+        self.path, self.loaded, self.position, self.wants_play = path, True, 0, False
+
+    def play(self) -> None:
+        self.wants_play = self.loaded
+
+    def pause(self) -> None:
+        self.wants_play = False
+
+    def stop(self) -> None:
+        self.wants_play = False
+
+    def seek(self, ms) -> None:
+        self.position = max(0, int(ms))
+
+    def set_volume(self, volume: float) -> None:
+        pass  # the panel's slider holds it; attaching applies it
+
+    def set_gains(self, gains) -> None:
+        self.gains = [float(g) for g in gains]
+
+    def set_eq_enabled(self, on: bool) -> None:
+        pass  # the panel's check box holds it; attaching applies it
+
+    def position_ms(self) -> int:
+        return self.position
+
+    def duration_ms(self) -> int:
+        return 0
+
+    def current_bars(self, n_bars: int = 32):
+        return None
+
+    def current_samples(self):
+        return None
+
+
+#: The visualizations, in the order a click on them goes through them.
+VISUALIZER_NAMES = {
+    "spectrum": "Spectrum",
+    "mirror": "Mirrored spectrum",
+    "radial": "Radial spectrum",
+    "scope": "Oscilloscope",
+    "vu": "VU meter",
+    "line": "Line spectrum",
+    "waterfall": "Waterfall",
+    "polar": "Polar spectrum",
+    "lissajous": "Stereo scope",
+    "starfield": "Starfield",
+    "led": "LED equalizer",
+    "particles": "Particle columns",
+    "ribbon": "Wave ribbon",
+    "ridges": "Ridgelines",
+    "terrain": "Spectrum terrain",
+    "ring": "3D ring",
+    "kaleidoscope": "Kaleidoscope",
+    "bells": "Bell curves",
+}
+#: The faces drawn from the raw samples; the others from the spectrum bars.
+_SAMPLE_MODES = ("scope", "vu", "lissajous")
+#: The faces drawn from the spectrum's history (Visualizer.history).
+_HISTORY_MODES = ("ridges", "terrain")
+#: The faces whose picture turns with the onsets (Visualizer.phase).
+_PHASE_MODES = ("ribbon", "kaleidoscope")
+#: The faces that paint with numpy: without it they stay empty (an exception
+#: in paintEvent aborts the whole process under PyQt6). Nothing is lost:
+#: without numpy there are no bars and no samples to show either (tick).
+_NUMPY_PAINT_MODES = ("scope", "line", "polar", "lissajous", "led", "particles", "ribbon",
+                      "ridges", "terrain", "ring", "kaleidoscope", "bells")
+
+
+class ColourScheme(NamedTuple):
+    """A visualizer's colours (``#rrggbb``): the background, the bars from
+    quiet over middle to loud, and the peak caps."""
+
+    background: str
+    low: str
+    mid: str
+    high: str
+    peak: str
+
+
+#: The named colour schemes; "classic" is the look the visualizer always had.
+COLOUR_SCHEMES = {
+    "classic": ColourScheme("#101418", "#2ecc71", "#f1c40f", "#e74c3c", "#ecf0f1"),
+    "fire": ColourScheme("#140805", "#8b1a00", "#ff6a00", "#ffd84d", "#fff6e0"),
+    "ice": ColourScheme("#06111c", "#1b4f8a", "#3fa9f5", "#bdeaff", "#ffffff"),
+    "neon": ColourScheme("#0b0016", "#00e5ff", "#ff2bd6", "#faff00", "#ffffff"),
+    "mono": ColourScheme("#0c0c0c", "#555555", "#a0a0a0", "#e8e8e8", "#ffffff"),
+}
+#: Every scheme the menu offers: the named ones, the app theme's, the user's.
+SCHEME_NAMES = {
+    "classic": "Classic",
+    "fire": "Fire",
+    "ice": "Ice",
+    "neon": "Neon",
+    "mono": "Mono",
+    "theme": "Follow the theme",
+    "custom": "Custom",
+}
+DEFAULT_SCHEME = "classic"
+#: The colours a user picks for "custom" (the middle bar colour lies between
+#: low and high), and what they start as.
+CUSTOM_COLOURS = {"background": "#000000", "low": "#1e90ff", "high": "#ff1493",
+                  "peak": "#ffffff"}
+CUSTOM_LABELS = {"background": "Background", "low": "Quiet bars", "high": "Loud bars",
+                 "peak": "Peaks"}
+#: The least contrast a peak cap keeps on the background: WCAG 2.x success
+#: criterion 1.4.11 (non-text contrast) asks 3:1 of graphics that carry
+#: information. Black or white always reach it: one of them has at least
+#: sqrt(21) = 4.58:1 on any colour.
+MIN_PEAK_CONTRAST = 3.0
+
+#: The options: (lowest, highest, default).
+#: * bars - 8 is the fewest a radial or polar face still reads as round;
+#:   above 128 more than a quarter of the bars would only interpolate
+#:   between the same FFT bins (2048 frames: 21.5 Hz apart).
+#: * peak_fall - % of the height a peak cap falls a second; 45 is the
+#:   0.015 a frame at 30 frames a second the caps always fell.
+#: * smoothing - % of a bar's height kept when the sound gets quieter, a
+#:   frame at the default 30 fps (85: the old 0.85; at other rates the same
+#:   decay a second); at 95 a bar still falls to a tenth in 1.5 s.
+#: * fps - frames a second at most: below 10 it stutters, 60 is the usual
+#:   display refresh.
+#: Peak fall and smoothing are per second, so the frame rate cap does not
+#: change how the bars move.
+VISUAL_OPTIONS = {
+    "bars": (8, 128, 32),
+    "peak_fall": (5, 300, 45),
+    "smoothing": (0, 95, 85),
+    "fps": (10, 60, 30),
+}
+VISUAL_OPTION_LABELS = {
+    "bars": ("Bars", ""),
+    "peak_fall": ("Peak fall speed", " %/s"),
+    "smoothing": ("Smoothing", " %"),
+    "fps": ("Frame rate cap", " fps"),
+}
+#: A face may take half a frame at the highest frame rate cap - painting
+#: runs on the GUI thread, the other half is the rest of the window's.
+#: tests/test_media_player_visual_modes.py measures every face against it
+#: fullscreen (1920x1080) with the most bars and white noise (the worst case).
+PAINT_BUDGET_MS = 1000 / VISUAL_OPTIONS["fps"][1] / 2
+
+
+def clamp_option(name: str, value) -> int:
+    """*value* for option *name* within its range; anything but an int
+    gives the default (an unknown name raises KeyError)."""
+    low, high, default = VISUAL_OPTIONS[name]
+    if not isinstance(value, int) or isinstance(value, bool):
+        return default
+    return max(low, min(high, value))
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    """``#rrggbb`` a share *t* of the way from *a* to *b*."""
+    ca, cb = QColor(a), QColor(b)
+    return QColor(round(ca.red() + (cb.red() - ca.red()) * t),
+                  round(ca.green() + (cb.green() - ca.green()) * t),
+                  round(ca.blue() + (cb.blue() - ca.blue()) * t)).name()
+
+
+def readable_on(colour: str, background: str, minimum: float = MIN_PEAK_CONTRAST) -> str:
+    """*colour* when it has *minimum* contrast on *background*; else the
+    nearest step of it towards white or black that has (its hue kept as
+    far as it can be)."""
+    if contrast_ratio(colour, background) >= minimum:
+        return colour
+    for step in range(1, 11):
+        for target in ("#ffffff", "#000000"):
+            candidate = _mix(colour, target, step / 10)
+            if contrast_ratio(candidate, background) >= minimum:
+                return candidate
+    return "#ffffff"  # pragma: no cover - white or black always reach 4.58:1
+
+
+def peak_contrast(scheme: ColourScheme) -> float:
+    return contrast_ratio(scheme.peak, scheme.background)
+
+
+def custom_scheme(colours) -> ColourScheme:
+    """The scheme from the user's colours (a dict of CUSTOM_COLOURS keys);
+    a missing or broken colour is the default one, the peak is made
+    readable on the background."""
+    chosen = dict(CUSTOM_COLOURS)
+    if isinstance(colours, dict):
+        for key in CUSTOM_COLOURS:
+            value = colours.get(key)
+            if is_hex_colour(value):
+                chosen[key] = value.lower()
+    background = chosen["background"]
+    return ColourScheme(background, chosen["low"], _mix(chosen["low"], chosen["high"], 0.5),
+                        chosen["high"], readable_on(chosen["peak"], background))
+
+
+def theme_scheme(palette) -> ColourScheme:
+    """The scheme of the app theme: its base colour behind, its highlight
+    colour for the bars, its text colour (made readable) for the peaks."""
+    role = QPalette.ColorRole
+    background = palette.color(role.Base).name()
+    text = palette.color(role.Text).name()
+    highlight = palette.color(role.Highlight).name()
+    return ColourScheme(background, _mix(highlight, background, 0.45), highlight,
+                        _mix(highlight, text, 0.5), readable_on(text, background))
+
+
+def stereo_points(samples, n_points: int):
+    """The stereo scope's (goniometer's) points: x = (R - L) / sqrt(2),
+    y = (L + R) / sqrt(2), clipped to -1..1 - mono is a vertical line, the
+    left channel alone the diagonal to the top left, the right alone the one
+    to the top right. *n_points* evenly spaced over the samples."""
+    data = np.asarray(samples, np.float32)
+    if data.ndim == 2 and data.shape[1] >= 2:
+        left, right = data[:, 0], data[:, 1]
+    else:
+        left = right = data.reshape(-1) if data.ndim < 2 else data[:, 0]
+    if len(left) == 0:
+        return np.zeros(n_points, np.float32), np.zeros(n_points, np.float32)
+    index = np.linspace(0, len(left) - 1, n_points).astype(np.intp)
+    left, right = left[index], right[index]
+    root = math.sqrt(0.5)
+    return (np.clip((right - left) * root, -1.0, 1.0), np.clip((left + right) * root, -1.0, 1.0))
+
+
+#: The width of the traces (scopes, line and polar peaks, ribbon, ridges):
+#: one pixel. An antialiased pen wider than a pixel strokes a polyline as
+#: one outline path, and a trace that crosses itself (noise in the
+#: oscilloscope, any stereo scope) made that cost 79 ms for 256 points at
+#: 1280x720; drawn as separate segments it was 1 ms, and one pixel wide as
+#: a polyline (no stroker, no QLineF a segment) it is cheaper still: the
+#: stereo scope 11.3 -> 6.9 ms at 1920x1080 with white noise (measured).
+TRACE_WIDTH = 1.0
+
+
+def _points_are_doubles() -> bool:
+    """Whether a QPolygonF keeps its points as pairs of doubles (qreal is
+    double unless Qt was built with QT_COORD_TYPE=float)."""
+    probe = QPolygonF()
+    probe.fill(QPointF(), 1)
+    buffer = probe.data()
+    buffer.setsize(16)
+    np.frombuffer(buffer, np.float64)[:] = (1.5, -2.25)
+    return (probe[0].x(), probe[0].y()) == (1.5, -2.25)
+
+
+_DOUBLE_POINTS: bool | None = None
+
+
+def qpolygon(xs, ys) -> QPolygonF:
+    """The points (xs[i], ys[i]) as a QPolygonF, written into its buffer
+    from numpy: no QPointF object per point (a Python object each costs
+    about a microsecond, and a face draws thousands a frame)."""
+    global _DOUBLE_POINTS
+    xs = np.asarray(xs, np.float64).reshape(-1)
+    ys = np.asarray(ys, np.float64).reshape(-1)
+    count = min(len(xs), len(ys))
+    polygon = QPolygonF()
+    if count == 0:
+        return polygon
+    if _DOUBLE_POINTS is None:
+        _DOUBLE_POINTS = _points_are_doubles()
+    if not _DOUBLE_POINTS:  # pragma: no cover - a Qt with float coordinates
+        return QPolygonF([QPointF(x, y) for x, y in zip(xs[:count].tolist(),
+                                                         ys[:count].tolist())])
+    polygon.fill(QPointF(), count)
+    buffer = polygon.data()
+    buffer.setsize(count * 16)
+    view = np.frombuffer(buffer, np.float64).reshape(count, 2)
+    view[:, 0] = xs[:count]
+    view[:, 1] = ys[:count]
+    return polygon
+
+
+
+def _fill_with_smooth_edge(painter: QPainter, shape: QPolygonF, edge: QPolygonF, brush) -> None:
+    """Fill *shape* with *brush*, its visible edge (*edge*, a polyline along
+    it) smooth: the fill without antialiasing and a one pixel antialiased
+    line in the same brush over the edge. An antialiased fill of a large
+    shape costs most of a frame (the line spectrum: 7.5 of 10.6 ms at
+    1920x1080, measured); this looks the same (the line covers the steps
+    of the edge) at a third of it."""
+    hint = QPainter.RenderHint.Antialiasing
+    painter.setRenderHint(hint, False)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(brush)
+    painter.drawPolygon(shape)
+    painter.setRenderHint(hint, True)
+    painter.setPen(QPen(QBrush(brush), 1.0))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPolyline(edge)
+
+class Visualizer(QWidget):
+    """The sound as a picture, at up to the fps cap while playing. A left
+    click goes to the next face (:data:`VISUALIZER_NAMES`), a double click
+    (or F11) asks for fullscreen and Esc out of it, the right button opens
+    the menu: every face, every colour scheme, bar count and frame rate,
+    and what the host adds (:attr:`menu_hook`). Each face asks the engine
+    only for what it shows: the scopes and the VU meter (_SAMPLE_MODES)
+    for the raw samples (:meth:`current_samples`), every other face for an
+    FFT (:meth:`current_bars`) - the ridgelines and the terrain keep a
+    history of it (_HISTORY_MODES), the ribbon and the kaleidoscope turn
+    with its onsets (_PHASE_MODES). An engine without numpy answers None:
+    the face stays empty."""
+
+    #: The default bar count (VISUAL_OPTIONS["bars"]).
+    BARS = 32
+    MODES = tuple(VISUALIZER_NAMES)
+    #: Points of the oscilloscope's trace at most.
+    SCOPE_POINTS = 256
+    #: Points of the stereo scope, and the steps its older part fades in.
+    LISSAJOUS_POINTS = 512
+    LISSAJOUS_FADE = 4
+    #: Rows of the waterfall's history (over 4 s at 30 fps).
+    WATERFALL_ROWS = 128
+    #: Stars of the starfield; what they travel a second (of their depth)
+    #: in silence and on top with full bass; the bass is below BASS_HZ.
+    STAR_COUNT = 300
+    STAR_DRIFT = 0.15
+    STAR_BOOST = 1.2
+    STAR_NEAR = 0.04
+    BASS_HZ = 250.0
+    #: The LED equalizer: blocks a column at most (fewer when one would be
+    #: under LED_MIN_PITCH pixels), the share of a block that is gap.
+    LED_SEGMENTS = 24
+    LED_MIN_PITCH = 6
+    LED_GAP = 0.28
+    #: The particle columns: a dot is DOT_SHARE of a column wide (in pixels
+    #: within DOT_SIZE), a row DOT_PITCH dots above the next. A spark rises
+    #: from a bar that jumps by SPARK_ONSET or more to at least SPARK_FLOOR:
+    #: SPARK_SPAWN a frame and SPARK_MAX alive at most, rising SPARK_RISE of
+    #: the height a second (give or take 40 %) for SPARK_LIFE seconds.
+    DOT_SHARE = 0.62
+    DOT_SIZE = (2.0, 12.0)
+    DOT_PITCH = 1.5
+    SPARK_ONSET = 0.08
+    SPARK_FLOOR = 0.25
+    SPARK_SPAWN = 6
+    SPARK_MAX = 160
+    SPARK_RISE = 0.5
+    SPARK_LIFE = 1.2
+    #: The wave ribbon: its lines, the points of each, its twists across the
+    #: window, and its width against its height.
+    RIBBON_LINES = 9
+    RIBBON_POINTS = 120
+    RIBBON_TWISTS = 2.5
+    RIBBON_WIDTH = 0.7
+    #: Stretches of the ribbon, each in one colour from quiet (left) to loud.
+    RIBBON_COLOURS = 8
+    #: Radians the onset phase (:attr:`phase`) turns per unit of spectral
+    #: flux - the mean rise of the bars from one frame to the next: the beat
+    #: turns the ribbon and the kaleidoscope on, a still sound holds them.
+    FLUX_TURN = 3.0
+    #: Rows of the spectrum's history the ridgelines show; the terrain shows
+    #: the last TERRAIN_ROWS of them, the farthest TERRAIN_FAR times as far
+    #: away as the nearest.
+    HISTORY_ROWS = 28
+    TERRAIN_ROWS = 22
+    TERRAIN_FAR = 6.0
+    #: The ring's height against its width (a circle seen at a tilt), and
+    #: the size of its far side against its near side.
+    RING_TILT = 0.3
+    RING_FAR = 0.55
+    #: The kaleidoscope: KALEIDO_FOLD turns of the picture, each mirrored.
+    KALEIDO_FOLD = 6
+    #: The bell curves: bumps at most (more bars are grouped), points a bump.
+    BELLS_MAX = 32
+    BELL_POINTS = 25
+    #: How long the face's name shows after a switch.
+    LABEL_SECONDS = 1.5
+    #: In fullscreen the mouse pointer hides after this long without a move.
+    CURSOR_HIDE_MS = 2500
+    #: A tick repaints only when a value it shows moved by more than this
+    #: (0..1 scale: a tenth of a pixel at 1080 px). Paused or stopped the
+    #: engine hands out the same samples and the smoothing creeps towards
+    #: them for ever in floating point - the same picture 31 times a second
+    #: took 4 % of a core on the GUI thread.
+    STILL = 1e-4
+    #: The face now shown (one of MODES).
+    mode_changed = pyqtSignal(str)
+    #: The colour scheme, its custom colours, an option or hide_cursor changed.
+    settings_changed = pyqtSignal()
+    #: Fullscreen wanted (True) or not (False): double click, F11, Esc.
+    fullscreen_requested = pyqtSignal(bool)
+
+    def __init__(self, engine) -> None:
+        super().__init__()
+        # paintEvent fills every pixel (the background first): Qt need not
+        # paint the parent's background under the face each frame (0.4-0.6 ms
+        # of a 1920x1080 frame, measured).
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.engine = engine
+        self.mode = self.MODES[0]
+        self.options = {name: spec[2] for name, spec in VISUAL_OPTIONS.items()}
+        #: Hide the mouse pointer in fullscreen after CURSOR_HIDE_MS.
+        self.hide_cursor = True
+        #: Set by the host while the visualizer is shown fullscreen.
+        self.fullscreen = False
+        #: menu_hook(menu) adds the host's entries to the right-click menu.
+        self.menu_hook = None
+        #: The right-click menu last shown (a popup: never a blocking exec).
+        self.menu: QMenu | None = None
+        self.scheme = DEFAULT_SCHEME
+        self.custom_colours = dict(CUSTOM_COLOURS)
+        self.colours = COLOUR_SCHEMES[DEFAULT_SCHEME]
+        self._palette_cache: dict[str, QColor] = {}
+        self._lut = None
+        self.trace = None
+        self.lissajous = None
+        self.vu = [0.0, 0.0]
+        self.vu_peaks = [0.0, 0.0]
+        self.stars = None
+        self._rng = np.random.default_rng() if np is not None else None
+        #: Turns with the onsets (spectral flux), still while the sound is.
+        self.phase = 0.0
+        #: The particle columns' sparks: rows of (bar, height 0..1, age in
+        #: seconds, rise a second), or None.
+        self.sparks = None
+        #: The last bars as the engine gave them: what an onset rises from.
+        self._previous = None
+        #: (key, pictures) a face draws from (the LED blocks, the dots):
+        #: only the shown face's, for its size, bar count and scheme.
+        self._sprites = None
+        self._ring_cache = None
+        self._pen_cache: dict = {}
+        self._label_until = 0.0
+        self._clicks_from = self.mode
+        self._last_press = -(10 ** 9)
+        self._autohide = False
+        #: (mode, values) of the last picture a tick asked to paint.
+        self._shown = None
+        self._resize_bars(self.options["bars"])
+        self._apply_scheme()
+        self.setMinimumHeight(90)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.timer = QTimer(self)
+        self.timer.setInterval(round(1000 / self.options["fps"]))
+        self.timer.timeout.connect(self._timer_tick)
+        self._label_timer = QTimer(self)  # repaints once the name is due to go
+        self._label_timer.setSingleShot(True)
+        self._label_timer.timeout.connect(self.update)
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setSingleShot(True)
+        self._cursor_timer.timeout.connect(self._hide_pointer)
+        self._update_tooltip()
+
+    # -- the face ---------------------------------------------------------------------
+
+    def set_mode(self, mode: str, *, announce: bool = True) -> None:
+        """Show face *mode*; *announce* shows its name for a moment."""
+        if mode not in self.MODES:
+            raise ValueError(f"unknown visualization {mode!r}")
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self._sprites = None  # the last face's pictures (up to 100 MB at 4K) go
+        if announce:
+            self._label_until = time.monotonic() + self.LABEL_SECONDS
+            self._label_timer.start(int(self.LABEL_SECONDS * 1000) + 50)
+        self._update_tooltip()
+        self.tick()  # the new face shows the sound at once, paused too
+        self.update()
+        self.mode_changed.emit(mode)
+
+    def next_mode(self) -> None:
+        self.set_mode(self.MODES[(self.MODES.index(self.mode) + 1) % len(self.MODES)])
+
+    def _update_tooltip(self) -> None:
+        self.setToolTip(tr("{name} – click for the next visualization, double-click for "
+                           "fullscreen, right-click for more").format(
+            name=tr(VISUALIZER_NAMES[self.mode])))
+
+    # -- colours and options ------------------------------------------------------------
+
+    def set_scheme(self, name: str) -> None:
+        """Use colour scheme *name* (one of SCHEME_NAMES)."""
+        if name not in SCHEME_NAMES:
+            raise ValueError(f"unknown colour scheme {name!r}")
+        if name == self.scheme:
+            return
+        self.scheme = name
+        self._apply_scheme()
+        self.settings_changed.emit()
+
+    def set_custom_colours(self, colours) -> None:
+        """Take the valid ``#rrggbb`` entries of *colours* for the custom
+        scheme; the rest stays."""
+        if not isinstance(colours, dict):
+            return
+        changed = False
+        for key in CUSTOM_COLOURS:
+            value = colours.get(key)
+            if is_hex_colour(value) and value.lower() != self.custom_colours[key]:
+                self.custom_colours[key] = value.lower()
+                changed = True
+        if changed:
+            if self.scheme == "custom":
+                self._apply_scheme()
+            self.settings_changed.emit()
+
+    def set_option(self, name: str, value) -> None:
+        """Set option *name* (VISUAL_OPTIONS), clamped to its range."""
+        value = clamp_option(name, value)
+        if self.options[name] == value:
+            return
+        self.options[name] = value
+        if name == "bars":
+            self._resize_bars(value)
+        elif name == "fps":
+            self.timer.setInterval(round(1000 / value))
+        self.settings_changed.emit()
+        self.update()
+
+    def set_hide_cursor(self, on: bool) -> None:
+        on = bool(on)
+        if on == self.hide_cursor:
+            return
+        self.hide_cursor = on
+        self.set_cursor_autohide(self.fullscreen)
+        self.settings_changed.emit()
+
+    def _resize_bars(self, n: int) -> None:
+        self.levels = [0.0] * n
+        self.peaks = [0.0] * n
+        self._unit = [(math.cos(2 * math.pi * i / n - math.pi / 2),
+                       math.sin(2 * math.pi * i / n - math.pi / 2)) for i in range(n)]
+        # The polar face: the bars down the right half, then mirrored up the left.
+        half = [math.pi * (i + 0.5) / n for i in range(n)]
+        angles = [*half, *(2 * math.pi - a for a in reversed(half))]
+        self._polar_unit = [(math.sin(a), -math.cos(a)) for a in angles]
+        self.waterfall = np.zeros((self.WATERFALL_ROWS, n), np.uint8) if np is not None else None
+        self.history = np.zeros((self.HISTORY_ROWS, n), np.float32) if np is not None else None
+        self._bass = None
+        self.sparks = None
+        self._previous = None
+        self._sprites = None
+        self._ring_cache = None
+
+    def _apply_scheme(self) -> None:
+        if self.scheme == "custom":
+            colours = custom_scheme(self.custom_colours)
+        elif self.scheme == "theme":
+            colours = theme_scheme(self.palette())
+        else:
+            colours = COLOUR_SCHEMES[self.scheme]
+        self.colours = colours
+        background = colours.background
+        self._palette_cache = {
+            "background": QColor(background), "low": QColor(colours.low),
+            "mid": QColor(colours.mid), "high": QColor(colours.high),
+            "peak": QColor(colours.peak),
+            "grid": QColor(_mix(background, colours.peak, 0.22)),
+            "track": QColor(_mix(background, colours.peak, 0.08)),
+            "text": QColor(_mix(background, colours.peak, 0.6)),
+            # the oscilloscope's trace: the first bar colour that stands out
+            "trace": QColor(next((c for c in (colours.low, colours.mid, colours.high)
+                                  if contrast_ratio(c, background) >= MIN_PEAK_CONTRAST),
+                                 colours.peak)),
+        }
+        self._lut = None
+        self._sprites = None
+        self._ring_cache = None
+        self._pen_cache = {}
+        self.update()
+
+    def _colour(self, key: str) -> QColor:
+        return self._palette_cache[key]
+
+    def _level_hex(self, level: float) -> str:
+        """Quiet over middle to loud, like the bars' gradient."""
+        level = min(1.0, max(0.0, level))
+        if level < 0.6:
+            a, b, t = self.colours.low, self.colours.mid, level / 0.6
+        else:
+            a, b, t = self.colours.mid, self.colours.high, (level - 0.6) / 0.4
+        return _mix(a, b, t)
+
+    #: Steps of the level colours' table: as fine as a colour channel, so
+    #: the table's colour is the mixed one within one step of a channel.
+    LEVEL_STEPS = 256
+
+    def _level_colours(self) -> list:
+        """The level colours (:meth:`_level_hex`) as a table of LEVEL_STEPS
+        QColors for this scheme. Mixing a colour per bar each frame (radial:
+        128 a frame, two QColor and a name() each) cost more than drawing
+        the bars."""
+        table = self._pen_cache.get("levels")
+        if table is None:
+            last = self.LEVEL_STEPS - 1
+            table = [QColor(self._level_hex(i / last)) for i in range(self.LEVEL_STEPS)]
+            self._pen_cache["levels"] = table
+        return table
+
+    def _level_colour(self, level: float) -> QColor:
+        level = min(1.0, max(0.0, level))  # NaN goes to 0: max(0.0, nan) is 0.0
+        return self._level_colours()[int(level * (self.LEVEL_STEPS - 1) + 0.5)]
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange and getattr(self, "scheme", "") == "theme":
+            self._apply_scheme()
+
+    # -- the mouse, the keys and the menu -------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt
+        if event.button() == Qt.MouseButton.LeftButton:
+            stamp = event.timestamp()
+            if stamp - self._last_press > QApplication.doubleClickInterval():
+                self._clicks_from = self.mode  # a new run of clicks starts here
+            self._last_press = stamp
+            self.next_mode()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt
+        """Fullscreen on or off. The press that opened the double click
+        (press, release, double click) went to the next face: that is taken
+        back, the face is the one before the run of clicks."""
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        recent = 0 <= event.timestamp() - self._last_press <= QApplication.doubleClickInterval()
+        if recent and self._clicks_from in self.MODES and self._clicks_from != self.mode:
+            self.set_mode(self._clicks_from, announce=False)
+        self.fullscreen_requested.emit(not self.fullscreen)
+        event.accept()
+
+    def _fullscreen_key(self, event) -> bool | None:
+        """The fullscreen state F11 / Esc asks for, or None for other keys."""
+        if event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier:
+            return None
+        if event.key() == Qt.Key.Key_F11:
+            return not self.fullscreen
+        if event.key() == Qt.Key.Key_Escape and self.fullscreen:
+            return False
+        return None
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride and self._fullscreen_key(event) is not None:
+            event.accept()  # F11 / Esc are the visualizer's, not a window shortcut
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt
+        wanted = self._fullscreen_key(event)
+        if wanted is None:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+        self.fullscreen_requested.emit(wanted)
+
+    def set_cursor_autohide(self, on: bool) -> None:
+        """Hide the pointer after CURSOR_HIDE_MS without a move (when
+        :attr:`hide_cursor`); off shows it again."""
+        self._autohide = bool(on) and self.hide_cursor
+        self.setMouseTracking(self._autohide)
+        if self._autohide:
+            self._cursor_timer.start(self.CURSOR_HIDE_MS)
+        else:
+            self._cursor_timer.stop()
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _hide_pointer(self) -> None:
+        if self._autohide:
+            self.setCursor(Qt.CursorShape.BlankCursor)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt
+        if self._autohide:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._cursor_timer.start(self.CURSOR_HIDE_MS)
+        super().mouseMoveEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt
+        if self.menu is not None:
+            self.menu.deleteLater()  # one menu per right click, not one more each time
+        self.menu = self.build_menu()
+        self.menu.popup(event.globalPos())
+        event.accept()
+
+    def build_menu(self) -> QMenu:
+        """The right-click menu: the faces, the colour schemes, bars and
+        frame rate, then what :attr:`menu_hook` adds. Every entry carries
+        its ``(kind, value)`` as data."""
+        menu = QMenu(self)
+
+        def choices(title: str, kind: str, items, current, apply) -> None:
+            sub = menu.addMenu(title)
+            group = QActionGroup(sub)
+            for value, label in items:
+                action = sub.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(value == current)
+                action.setData((kind, value))
+                group.addAction(action)
+                action.triggered.connect(lambda _checked=False, v=value: apply(v))
+
+        choices(tr("Visualization"), "mode",
+                [(m, tr(VISUALIZER_NAMES[m])) for m in self.MODES], self.mode,
+                lambda m: self.set_mode(m))
+        choices(tr("Colours"), "scheme",
+                [(s, tr(label)) for s, label in SCHEME_NAMES.items()], self.scheme,
+                self.set_scheme)
+        low, high, _default = VISUAL_OPTIONS["bars"]
+        bar_counts = sorted({low, 16, 32, 64, high, self.options["bars"]})
+        choices(tr("Bars"), "bars", [(n, str(n)) for n in bar_counts if low <= n <= high],
+                self.options["bars"], lambda n: self.set_option("bars", n))
+        low, high, _default = VISUAL_OPTIONS["fps"]
+        rates = sorted({low, 15, 30, high, self.options["fps"]})
+        choices(tr("Frame rate cap"), "fps",
+                [(n, tr("{n} fps").format(n=n)) for n in rates if low <= n <= high],
+                self.options["fps"], lambda n: self.set_option("fps", n))
+        if callable(self.menu_hook):
+            self.menu_hook(menu)
+        return menu
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt
+        menu = getattr(self, "menu", None)
+        if menu is not None and not sip.isdeleted(menu) and menu.isVisible():
+            menu.close()  # an open popup takes every click until it closes
+        super().hideEvent(event)
+
+    # -- the data ---------------------------------------------------------------------
+
+    def _samples(self):
+        getter = getattr(self.engine, "current_samples", None)
+        if np is None or not callable(getter):
+            return None
+        return getter()
+
+    def reset_stars(self, seed=None) -> None:
+        """New stars (*seed*: the same field every time, for tests)."""
+        if np is None:
+            return
+        self._rng = np.random.default_rng(seed)
+        n = self.STAR_COUNT
+        self.stars = np.column_stack([self._rng.uniform(-1, 1, n), self._rng.uniform(-1, 1, n),
+                                      self._rng.uniform(self.STAR_NEAR, 1, n)])
+
+    def _bass_level(self, values) -> float:
+        if self._bass is None:
+            centres = bar_centres(RATE, FRAME, len(values))
+            self._bass = max(1, int(np.count_nonzero(centres < self.BASS_HZ)))
+        return float(np.mean(values[:self._bass]))
+
+    def _move_stars(self, values) -> None:
+        if self.stars is None:
+            self.reset_stars()
+        speed = self.STAR_DRIFT + self.STAR_BOOST * self._bass_level(values)
+        stars = self.stars
+        stars[:, 2] -= speed / self.options["fps"]
+        gone = ((stars[:, 2] <= self.STAR_NEAR) | (np.abs(stars[:, 0]) > stars[:, 2] * 1.2)
+                | (np.abs(stars[:, 1]) > stars[:, 2] * 1.2))
+        count = int(np.count_nonzero(gone))
+        if count:
+            stars[gone, 0] = self._rng.uniform(-1, 1, count)
+            stars[gone, 1] = self._rng.uniform(-1, 1, count)
+            stars[gone, 2] = 1.0
+
+    def _move_sparks(self, rise) -> bool:
+        """The particle columns' sparks: the alive ones rise and age, new ones
+        start where a bar jumped (*rise*: each bar's rise since the last
+        frame, None for none). True while any is alive."""
+        fps = self.options["fps"]
+        sparks = self.sparks
+        if sparks is not None and len(sparks):
+            sparks[:, 1] += sparks[:, 3] / fps
+            sparks[:, 2] += 1.0 / fps
+            sparks = sparks[(sparks[:, 2] < self.SPARK_LIFE) & (sparks[:, 1] < 1.1)]
+        if rise is not None and self._rng is not None:
+            levels = np.asarray(self.levels, np.float64)
+            jumped = np.nonzero((rise >= self.SPARK_ONSET) & (levels >= self.SPARK_FLOOR))[0]
+            if len(jumped) > self.SPARK_SPAWN:
+                jumped = self._rng.choice(jumped, self.SPARK_SPAWN, replace=False)
+            count = len(jumped)
+            if count:
+                new = np.column_stack([jumped + self._rng.uniform(-0.3, 0.3, count),
+                                       levels[jumped], np.zeros(count),
+                                       self.SPARK_RISE * self._rng.uniform(0.6, 1.4, count)])
+                sparks = new if sparks is None or not len(sparks) else np.vstack([sparks, new])
+                sparks = sparks[-self.SPARK_MAX:]
+        self.sparks = sparks
+        return sparks is not None and len(sparks) > 0
+
+    def _timer_tick(self) -> None:
+        """The timer's tick: nothing while nobody can see the face (a closed
+        dock, another tab) - its FFT took 2-3 % of a core for nothing."""
+        if self.isVisible():
+            self.tick()
+
+    def _paint_if_moved(self, values) -> None:
+        """Repaint unless *values* - what the face shows - are those of the
+        last picture, within STILL."""
+        values = np.asarray(values, np.float32)
+        shown = self._shown
+        if (shown is not None and shown[0] == self.mode and shown[1].shape == values.shape
+                and (values.size == 0 or float(np.max(np.abs(values - shown[1]))) <= self.STILL)):
+            return
+        self._shown = (self.mode, values)
+        self.update()
+
+    def tick(self) -> None:
+        if self.mode in _SAMPLE_MODES:
+            samples = self._samples()
+            if samples is None:
+                return
+            if self.mode == "scope":
+                self.trace = waveform(samples, max(2, min(self.SCOPE_POINTS, self.width())))
+                self._paint_if_moved(self.trace)
+            elif self.mode == "lissajous":
+                self.lissajous = stereo_points(samples, self.LISSAJOUS_POINTS)
+                self._paint_if_moved(np.concatenate(self.lissajous))
+            else:
+                levels = vu_levels(samples)
+                for i in (0, 1):
+                    value = levels[i]
+                    self.vu[i] = value if value > self.vu[i] else self.vu[i] * 0.85 + value * 0.15
+                    self.vu_peaks[i] = max(levels[2 + i], self.vu_peaks[i] - 0.01)
+                self._paint_if_moved([*self.vu, *self.vu_peaks])
+            return
+        n = self.options["bars"]
+        bars = self.engine.current_bars(n)
+        if bars is None or np is None:
+            return
+        values = np.zeros(n, np.float32)
+        count = min(n, len(bars))
+        values[:count] = np.asarray(bars, np.float32)[:count]
+        # an engine's broken numbers (NaN, inf) must not reach the painting
+        values = np.clip(np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        previous, self._previous = self._previous, values
+        rise = None
+        if previous is not None and previous.shape == values.shape:
+            rise = np.maximum(values - previous, 0.0)
+            self.phase = (self.phase + self.FLUX_TURN * float(rise.mean())) % (4 * math.pi)
+        fps = self.options["fps"]
+        keep = (self.options["smoothing"] / 100.0) ** (VISUAL_OPTIONS["fps"][2] / fps)
+        fall = self.options["peak_fall"] / 100.0 / fps
+        levels, peaks = list(self.levels), list(self.peaks)
+        for i in range(n):
+            value = float(values[i])
+            levels[i] = value if value > levels[i] else levels[i] * keep + value * (1.0 - keep)
+            peaks[i] = max(levels[i], peaks[i] - fall)
+        self.levels, self.peaks = levels, peaks
+        if self.mode == "waterfall":  # scrolls on: it always moves
+            self.waterfall[:-1] = self.waterfall[1:]
+            self.waterfall[-1] = np.round(np.clip(values, 0.0, 1.0) * 255).astype(np.uint8)
+        elif self.mode == "starfield":  # the stars drift on in silence too
+            self._move_stars(values)
+        elif self.mode in _HISTORY_MODES:
+            self.history[:-1] = self.history[1:]
+            self.history[-1] = levels
+            # a copy: the history changes in place, the last picture's must not
+            self._paint_if_moved(self.history.copy())
+            return
+        elif self.mode == "particles" and self._move_sparks(rise):
+            pass  # sparks in the air: it moves
+        elif self.mode in _PHASE_MODES:
+            self._paint_if_moved([*levels, *peaks, self.phase])
+            return
+        else:
+            self._paint_if_moved([*levels, *peaks])
+            return
+        self._shown = None
+        self.update()
+
+    # -- painting ---------------------------------------------------------------------
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt
+        painter = QPainter(self)
+        try:
+            painter.fillRect(self.rect(), self._colour("background"))
+            if self.width() < 8 or self.height() < 8:
+                return
+            if np is None and self.mode in _NUMPY_PAINT_MODES:
+                return
+            getattr(self, f"_paint_{self.mode}")(painter)
+            if time.monotonic() < self._label_until:
+                self._paint_label(painter)
+        finally:
+            painter.end()
+
+    def _gradient(self, y_quiet: float, y_loud: float) -> QLinearGradient:
+        gradient = QLinearGradient(0, y_quiet, 0, y_loud)
+        gradient.setColorAt(0.0, self._colour("low"))
+        gradient.setColorAt(0.6, self._colour("mid"))
+        gradient.setColorAt(1.0, self._colour("high"))
+        return gradient
+
+    def _paint_spectrum(self, painter: QPainter) -> None:
+        """The bars in one call and the peaks in another (drawRects): a
+        fillRect per bar and per peak was 256 calls a frame."""
+        width = self.width() / len(self.levels)
+        bottom = self.height()
+        height = bottom - 4
+        bar_width = max(1.0, width - 2)
+        bars, caps = [], []
+        for i, (level, peak) in enumerate(zip(self.levels, self.peaks)):
+            x = i * width + 1
+            bar = max(2.0, level * height)
+            bars.append(QRectF(x, bottom - bar, bar_width, bar))
+            caps.append(QRectF(x, bottom - peak * height - 3, bar_width, 2))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._gradient(bottom, 0))
+        painter.drawRects(bars)
+        painter.setBrush(self._colour("peak"))
+        painter.drawRects(caps)
+
+    def _paint_mirror(self, painter: QPainter) -> None:
+        width = self.width() / len(self.levels)
+        mid = self.height() / 2
+        reach = mid - 3
+        bar_width = max(1.0, width - 2)
+        ups, downs, caps = [], [], []
+        for i, (level, peak) in enumerate(zip(self.levels, self.peaks)):
+            x = i * width + 1
+            bar = max(1.0, level * reach)
+            ups.append(QRectF(x, mid - bar, bar_width, bar))
+            downs.append(QRectF(x, mid, bar_width, bar))
+            caps.append(QRectF(x, mid - peak * reach - 2, bar_width, 1.5))
+            caps.append(QRectF(x, mid + peak * reach + 0.5, bar_width, 1.5))
+        painter.setPen(Qt.PenStyle.NoPen)  # three calls, not four a bar (as the spectrum)
+        painter.setBrush(self._gradient(mid, 0))
+        painter.drawRects(ups)
+        painter.setBrush(self._gradient(mid, self.height()))
+        painter.drawRects(downs)
+        painter.setBrush(self._colour("peak"))
+        painter.drawRects(caps)
+
+    def _paint_radial(self, painter: QPainter) -> None:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy = self.width() / 2, self.height() / 2
+        radius = min(cx, cy)
+        inner = radius * 0.22
+        reach = max(1.0, radius - inner - 2)
+        pen = QPen()
+        pen.setWidthF(max(1.5, 2 * math.pi * inner / len(self.levels) * 0.6))
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        caps = []
+        for (ux, uy), level, peak in zip(self._unit, self.levels, self.peaks):
+            pen.setColor(self._level_colour(level))
+            painter.setPen(pen)
+            outer = inner + max(1.0, level * reach)
+            painter.drawLine(QPointF(cx + ux * inner, cy + uy * inner),
+                             QPointF(cx + ux * outer, cy + uy * outer))
+            tip = inner + peak * reach + 2
+            caps.append(QRectF(cx + ux * tip - 1, cy + uy * tip - 1, 2, 2))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._colour("peak"))
+        painter.drawRects(caps)
+        painter.setPen(QPen(self._colour("grid"), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), inner - 2, inner - 2)
+
+    def _paint_scope(self, painter: QPainter) -> None:
+        mid = self.height() / 2
+        painter.setPen(QPen(self._colour("grid"), 1))
+        painter.drawLine(QPointF(0, mid), QPointF(self.width(), mid))
+        trace = self.trace
+        if trace is None or len(trace) < 2:
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(self._colour("trace"))
+        pen.setWidthF(TRACE_WIDTH)
+        painter.setPen(pen)
+        values = np.asarray(trace, np.float64)
+        painter.drawPolyline(qpolygon(np.linspace(0.0, self.width() - 1, len(values)),
+                                      mid - values * (mid - 2)))
+
+    def _paint_vu(self, painter: QPainter) -> None:
+        margin = 6
+        label_width = 14
+        track_left = margin + label_width
+        track_width = max(1.0, self.width() - track_left - margin)
+        row = (self.height() - 3 * margin) / 2
+        gradient = QLinearGradient(track_left, 0, track_left + track_width, 0)
+        gradient.setColorAt(0.0, self._colour("low"))
+        gradient.setColorAt(0.75, self._colour("mid"))  # -15 dBFS
+        gradient.setColorAt(0.9, self._colour("high"))  # -6 dBFS
+        cap = self._colour("peak")
+        painter.setPen(cap)
+        for i, name in enumerate(("L", "R")):
+            top = margin + i * (row + margin)
+            painter.drawText(QRectF(margin, top, label_width, row),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+            painter.fillRect(QRectF(track_left, top, track_width, row), self._colour("track"))
+            painter.fillRect(QRectF(track_left, top, track_width * self.vu[i], row), gradient)
+            peak_x = track_left + track_width * self.vu_peaks[i]
+            painter.fillRect(QRectF(peak_x - 1, top, 2, row), cap)
+        tick = self._colour("grid")
+        for db in range(10, int(VU_RANGE_DB), 10):  # a tick every 10 dB
+            x = track_left + track_width * (1 - db / VU_RANGE_DB)
+            painter.fillRect(QRectF(x, self.height() - margin + 1, 1, margin - 2), tick)
+
+    #: The line spectrum's grid: frequency and label, on its log axis.
+    LINE_GRID = ((100, "100"), (1000, "1k"), (10000, "10k"))
+
+    def _paint_line(self, painter: QPainter) -> None:
+        """The bars as a filled curve over a log frequency axis (40 Hz to
+        16 kHz, like the bars), a grid at 100 Hz, 1 kHz and 10 kHz, the
+        peaks as a line on top."""
+        w, h = self.width(), self.height()
+        n = len(self.levels)
+        top = min(16000.0, RATE / 2)
+        painter.setPen(QPen(self._colour("grid"), 1))
+        grid = [(math.log(freq / 40.0) / math.log(top / 40.0) * w, label)
+                for freq, label in self.LINE_GRID]
+        for x, _label in grid:
+            painter.drawLine(QPointF(x, 0), QPointF(x, h))
+        reach = h - 4
+        xs = (np.arange(n) + 0.5) / n * w
+        ys = h - np.asarray(self.levels, np.float64) * reach
+        edge_x = np.concatenate(([0.0], xs, [w]))
+        edge_y = np.concatenate(([ys[0]], ys, [ys[-1]]))
+        gradient = self._gradient(h, 0)
+        _fill_with_smooth_edge(painter, qpolygon(np.concatenate(([0.0], edge_x, [w])),
+                                                 np.concatenate(([h], edge_y, [h]))),
+                               qpolygon(edge_x, edge_y), gradient)
+        pen = QPen(self._colour("peak"))
+        pen.setWidthF(TRACE_WIDTH)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(qpolygon(xs, h - np.asarray(self.peaks, np.float64) * reach - 2))
+        painter.setPen(self._colour("text"))
+        for x, label in grid:  # over the curve: the axis stays readable
+            painter.drawText(QPointF(x + 3, painter.fontMetrics().ascent() + 2), label)
+
+    def _waterfall_image(self) -> QImage:
+        """The history as an image of bars x rows (newest at the bottom), a
+        colour per level from the background over the bar colours."""
+        if self._lut is None:
+            stops = [(0.0, self.colours.background), (0.15, self.colours.low),
+                     (0.6, self.colours.mid), (1.0, self.colours.high)]
+            at = np.linspace(0.0, 1.0, 256)
+            channels = []
+            for shift in (16, 8, 0):
+                values = [(int(colour[1:], 16) >> shift) & 0xFF for _pos, colour in stops]
+                channels.append(np.interp(at, [pos for pos, _c in stops], values))
+            red, green, blue = (np.round(c).astype(np.uint32) for c in channels)
+            self._lut = (0xFF000000 | (red << 16) | (green << 8) | blue).astype(np.uint32)
+        pixels = np.ascontiguousarray(self._lut[self.waterfall])
+        rows, cols = pixels.shape
+        image = QImage(pixels.data, cols, rows, cols * 4, QImage.Format.Format_RGB32)
+        return image.copy()  # owns its pixels: the array goes when this returns
+
+    def _paint_waterfall(self, painter: QPainter) -> None:
+        if self.waterfall is None:
+            return
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        painter.drawImage(QRectF(0, 0, self.width(), self.height()), self._waterfall_image())
+
+    def _paint_polar(self, painter: QPainter) -> None:
+        """The bars as one closed shape around the middle - low to high
+        from the top down the right, mirrored on the left - filled from the
+        quiet colour inside to the loud one outside; the peaks outlined."""
+        cx, cy = self.width() / 2, self.height() / 2
+        radius = min(cx, cy)
+        inner = radius * 0.18
+        reach = max(1.0, radius - inner - 3)
+        gradient = QRadialGradient(QPointF(cx, cy), radius)
+        gradient.setColorAt(inner / radius, self._colour("low"))
+        gradient.setColorAt(0.6, self._colour("mid"))
+        gradient.setColorAt(1.0, self._colour("high"))
+        levels = np.asarray(self.levels, np.float64)
+        peaks = np.asarray(self.peaks, np.float64)
+        unit = np.asarray(self._polar_unit, np.float64)
+        ux = np.concatenate((unit[:, 0], unit[:1, 0]))  # closed: back to the first point
+        uy = np.concatenate((unit[:, 1], unit[:1, 1]))
+        radii = inner + np.concatenate((levels, levels[::-1], levels[:1])) * reach
+        tips = inner + np.concatenate((peaks, peaks[::-1], peaks[:1])) * reach + 2
+        outline = qpolygon(cx + ux * radii, cy + uy * radii)
+        _fill_with_smooth_edge(painter, outline, outline, gradient)
+        pen = QPen(self._colour("peak"))
+        pen.setWidthF(TRACE_WIDTH)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(qpolygon(cx + ux * tips, cy + uy * tips))
+
+    def _paint_lissajous(self, painter: QPainter) -> None:
+        """Left against right, turned 45 degrees: mono stands upright, a wide
+        stereo image spreads sideways, out of phase lies flat."""
+        cx, cy = self.width() / 2, self.height() / 2
+        reach = min(cx, cy) - 3
+        painter.setPen(QPen(self._colour("grid"), 1))
+        painter.drawLine(QPointF(cx - reach, cy), QPointF(cx + reach, cy))
+        painter.drawLine(QPointF(cx, cy - reach), QPointF(cx, cy + reach))
+        diagonal = reach * math.sqrt(0.5)
+        for sign in (-1, 1):  # the L and R axes
+            painter.drawLine(QPointF(cx - sign * diagonal, cy - diagonal),
+                             QPointF(cx + sign * diagonal, cy + diagonal))
+        painter.setPen(self._colour("text"))
+        metrics = painter.fontMetrics()
+        ascent = metrics.ascent()
+        # L and R beside their axes' upper ends, M right of the upright axis.
+        painter.drawText(QPointF(cx - diagonal - metrics.horizontalAdvance("L") - 3,
+                                 cy - diagonal + ascent), "L")
+        painter.drawText(QPointF(cx + diagonal + 3, cy - diagonal + ascent), "R")
+        painter.drawText(QPointF(cx + 4, cy - reach + ascent), "M")
+        points = self.lissajous
+        if points is None:
+            return
+        xs = cx + np.asarray(points[0], np.float64) * reach
+        ys = cy - np.asarray(points[1], np.float64) * reach
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Like a phosphor screen: the older part of the trace fades into the
+        # background, the newest is in the loud colour. Each part a polyline
+        # TRACE_WIDTH wide that starts where the last ended.
+        parts = self.LISSAJOUS_FADE
+        size = math.ceil((len(xs) - 1) / parts)
+        for part in range(parts):
+            pen = QPen(QColor(_mix(self.colours.background, self.colours.high,
+                                   (part + 1) / parts)))
+            pen.setWidthF(TRACE_WIDTH)
+            painter.setPen(pen)
+            start, stop = part * size, min(len(xs), (part + 1) * size + 1)
+            if stop - start >= 2:
+                painter.drawPolyline(qpolygon(xs[start:stop], ys[start:stop]))
+
+    def _paint_starfield(self, painter: QPainter) -> None:
+        """Stars flying at the viewer, faster with the bass: near ones big
+        and in the peak colour, far ones small and in the quiet colour."""
+        if self.stars is None:
+            self.reset_stars()
+        if self.stars is None:
+            return  # no numpy
+        cx, cy = self.width() / 2, self.height() / 2
+        stars = self.stars
+        depth = stars[:, 2]
+        sx = cx + stars[:, 0] / depth * cx
+        sy = cy + stars[:, 1] / depth * cy
+        for low, high, key, size in ((0.75, 1.01, "low", 1.0), (0.5, 0.75, "mid", 1.6),
+                                     (0.25, 0.5, "high", 2.2), (0.0, 0.25, "peak", 3.0)):
+            chosen = (depth >= low) & (depth < high)
+            if not chosen.any():
+                continue
+            pen = QPen(self._colour(key))
+            pen.setWidthF(size)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawPoints(QPolygonF([QPointF(float(x), float(y))
+                                          for x, y in zip(sx[chosen], sy[chosen])]))
+
+    # -- the faces drawn from pictures: the LED equalizer, the particle columns -----------
+
+    def _pictures(self, build):
+        """The pictures the shown face draws from, made by build(width,
+        height) once for this size, bar count and scheme (the scheme drops
+        them: :meth:`_apply_scheme`)."""
+        key = (self.mode, self.width(), self.height(), len(self.levels))
+        if self._sprites is None or self._sprites[0] != key:
+            self._sprites = (key, build(self.width(), self.height()))
+        return self._sprites[1]
+
+    def _columns(self, width: int) -> tuple[list[int], int]:
+        """Each bar's column: its left pixel, and the width all share (a
+        gap of a quarter column between)."""
+        step = width / len(self.levels)
+        return ([int(round(i * step + step * 0.12)) for i in range(len(self.levels))],
+                max(1, int(round(step * 0.76))))
+
+    def _blank(self, width: int, height: int) -> QImage:
+        image = QImage(width, height, QImage.Format.Format_RGB32)
+        image.fill(self._colour("background"))
+        return image
+
+    def led_layout(self, height: float) -> tuple[int, float, float]:
+        """(blocks a column, pixels from one block to the next, pixels of
+        gap between two)."""
+        segments = max(3, min(self.LED_SEGMENTS, int(height // self.LED_MIN_PITCH)))
+        pitch = max(1.0, (height - 2) / segments)
+        return segments, pitch, max(1.0, round(pitch * self.LED_GAP))
+
+    def _led_pictures(self, width: int, height: int):
+        """Every block lit (a colour per block, quiet to loud) and every
+        block unlit (the same, dimmed into the background); the top pixel
+        row and the height of each block."""
+        segments, pitch, gap = self.led_layout(height)
+        lefts, column = self._columns(width)
+        lit, unlit = self._blank(width, height), self._blank(width, height)
+        tops, heights = [], []
+        for k in range(segments):
+            top = int(round(height - 1 - (k + 1) * pitch))
+            tops.append(top)
+            heights.append(max(1, int(round(height - 1 - k * pitch - gap)) - top))
+        gaps = [(0, lefts[0])] + [(left + column, following - left - column)
+                                  for left, following in zip(lefts, [*lefts[1:], width])]
+        background = self._colour("background")
+        for image, dim in ((lit, False), (unlit, True)):
+            painter = QPainter(image)
+            for k in range(segments):  # a row of blocks across, then the gaps cut in
+                colour = self._level_hex((k + 0.5) / segments)
+                if dim:
+                    colour = _mix(self.colours.background, colour, 0.18)
+                painter.fillRect(0, tops[k], width, heights[k], QColor(colour))
+            for left, gap in gaps:
+                if gap > 0:
+                    painter.fillRect(left, 0, gap, height, background)
+            painter.end()
+        return lit, unlit, tops, heights
+
+    def _paint_led(self, painter: QPainter) -> None:
+        """Columns of blocks with gaps, lit from the bottom up to the level
+        in a colour per block, the unlit ones dimly there, the highest block
+        reached lately (the peak) in the peak colour, falling."""
+        lit, unlit, tops, heights = self._pictures(self._led_pictures)
+        segments = len(tops)
+        painter.drawImage(0, 0, unlit)
+        lefts, column = self._columns(self.width())
+        bottom = self.height()
+        cap = self._colour("peak")
+        for left, level, peak in zip(lefts, self.levels, self.peaks):
+            on = min(segments, int(level * segments + 0.5))
+            if on:
+                top = tops[on - 1]
+                painter.drawImage(QPoint(left, top), lit, QRect(left, top, column, bottom - top))
+            high = min(segments, int(peak * segments + 0.5))
+            if high:
+                painter.fillRect(left, tops[high - 1], column, heights[high - 1], cap)
+
+    def _dot_layout(self, width: float, height: float) -> tuple[float, float, int]:
+        """(dot size, pixels from one row of dots to the next, rows)."""
+        step = width / len(self.levels)
+        size = min(max(step * self.DOT_SHARE, self.DOT_SIZE[0]), self.DOT_SIZE[1])
+        pitch = max(size * self.DOT_PITCH, 3.0)
+        return size, pitch, max(1, int((height - 4) // pitch))
+
+    def _dot_pictures(self, width: int, height: int):
+        """Every dot unlit (dimmed), lit (a colour per row, quiet to loud)
+        and in the peak colour: one column drawn, then copied to each bar."""
+        size, pitch, rows = self._dot_layout(width, height)
+        step = width / len(self.levels)
+        strip_width = max(1, int(math.ceil(step)))
+        pictures = []
+        for kind in ("unlit", "lit", "peak"):
+            strip = self._blank(strip_width, height)
+            painter = QPainter(strip)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            for r in range(rows):
+                if kind == "peak":
+                    colour = self.colours.peak
+                else:
+                    colour = self._level_hex((r + 0.5) / rows)
+                    if kind == "unlit":
+                        colour = _mix(self.colours.background, colour, 0.16)
+                painter.setBrush(QColor(colour))
+                painter.drawEllipse(QPointF(strip_width / 2, height - 2 - (r + 0.5) * pitch),
+                                    size / 2, size / 2)
+            painter.end()
+            image = self._blank(width, height)
+            painter = QPainter(image)
+            for i in range(len(self.levels)):
+                painter.drawImage(int(round(i * step + (step - strip_width) / 2)), 0, strip)
+            painter.end()
+            pictures.append(image)
+        return pictures
+
+    def _paint_particles(self, painter: QPainter) -> None:
+        """The bars as columns of round dots, the unlit ones dimly there, the
+        peak as a dot in the peak colour; sparks rise from a band that
+        jumps and fade as they age."""
+        unlit, lit, peak = self._pictures(self._dot_pictures)
+        width, height = self.width(), self.height()
+        size, pitch, rows = self._dot_layout(width, height)
+        step = width / len(self.levels)
+        column = max(1, int(math.ceil(step)))
+        painter.drawImage(0, 0, unlit)
+        for i, (level, top_level) in enumerate(zip(self.levels, self.peaks)):
+            left = int(round(i * step + (step - column) / 2))
+            on = min(rows, int(level * rows + 0.5))
+            if on:
+                top = max(0, int(height - 2 - on * pitch))
+                painter.drawImage(QPoint(left, top), lit, QRect(left, top, column, height - top))
+            high = min(rows, int(top_level * rows + 0.5))
+            if high:
+                top = max(0, int(height - 2 - high * pitch))
+                painter.drawImage(QPoint(left, top), peak,
+                                  QRect(left, top, column, int(math.ceil(pitch)) + 1))
+        sparks = self.sparks
+        if sparks is None or not len(sparks):
+            return
+        xs = (sparks[:, 0] + 0.5) * step
+        ys = height - 2 - sparks[:, 1] * rows * pitch
+        age = sparks[:, 2] / self.SPARK_LIFE
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen()
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setWidthF(max(2.0, size * 0.7))
+        for low, high, key in ((0.0, 1 / 3, "peak"), (1 / 3, 2 / 3, "high"), (2 / 3, 2.0, "mid")):
+            chosen = (age >= low) & (age < high)
+            if chosen.any():
+                pen.setColor(self._colour(key))
+                painter.setPen(pen)
+                painter.drawPoints(qpolygon(xs[chosen], ys[chosen]))
+
+    # -- the faces that turn with the onsets: the ribbon, the kaleidoscope ----------------
+
+    def ribbon_curves(self, width: float, height: float):
+        """The ribbon's lines: x (RIBBON_POINTS) and y (RIBBON_LINES x
+        points). Its height follows the bands from left (bass) to right
+        (treble), pinched at both ends; it twists RIBBON_TWISTS times - its
+        lines meet where it shows its edge - and the twist moves with
+        :attr:`phase`."""
+        levels = np.asarray(self.levels, np.float64)
+        n = len(levels)
+        u = np.linspace(0.0, 1.0, self.RIBBON_POINTS)
+        smooth = np.convolve(np.pad(levels, 2, mode="edge"), [1 / 9, 2 / 9, 3 / 9, 2 / 9, 1 / 9],
+                             "valid")
+        amplitude = 0.2 + 0.8 * np.sqrt(np.interp(u * (n - 1), np.arange(n), smooth))
+        envelope = np.sin(np.pi * u) ** 0.6
+        theta = 2 * np.pi * self.RIBBON_TWISTS * u + self.phase
+        wave = 0.7 * np.sin(theta) + 0.3 * np.sin(2 * np.pi * 1.3 * u - 0.5 * self.phase)
+        offsets = np.linspace(-1.0, 1.0, self.RIBBON_LINES)[:, None]
+        shape = (wave + self.RIBBON_WIDTH * offsets * np.cos(theta)) / (1 + self.RIBBON_WIDTH)
+        ys = height / 2 - height * 0.46 * envelope * amplitude * shape
+        return u * width, ys
+
+    def _paint_ribbon(self, painter: QPainter) -> None:
+        """A ribbon of thin lines in the scheme's colours from left (quiet)
+        to right (loud), its middle line in the peak colour. One pixel wide
+        and a colour per stretch: a wider pen goes through Qt's path stroker
+        and a gradient pen is several times dearer (measured)."""
+        width, height = self.width(), self.height()
+        xs, ys = self.ribbon_curves(width, height)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        middle = self.RIBBON_LINES // 2
+        stretches = self.RIBBON_COLOURS
+        bounds = np.linspace(0, len(xs) - 1, stretches + 1).round().astype(int)
+        pen = QPen()
+        pen.setWidthF(1.0)
+        for s in range(stretches):
+            start, stop = int(bounds[s]), int(bounds[s + 1]) + 1
+            pen.setColor(self._level_colour((s + 0.5) / stretches))
+            painter.setPen(pen)
+            for j in range(self.RIBBON_LINES):
+                if j != middle:
+                    painter.drawPolyline(qpolygon(xs[start:stop], ys[j, start:stop]))
+        pen.setColor(self._colour("peak"))
+        painter.setPen(pen)
+        painter.drawPolyline(qpolygon(xs, ys[middle]))
+
+    def kaleido_rotation(self) -> float:
+        """The kaleidoscope's turn (radians): one of its mirror axes."""
+        return self.phase * 0.5
+
+    def _paint_kaleidoscope(self, painter: QPainter) -> None:
+        """A petal (bass), orbs (middle) and spikes (treble) in a wedge,
+        turned KALEIDO_FOLD times and each copy mirrored - an N-fold
+        symmetric picture, turning with the onsets; orbs in the peak colour
+        mark the peaks."""
+        width, height = self.width(), self.height()
+        cx, cy = width / 2, height / 2
+        radius = max(1.0, min(cx, cy) - 2)
+        fold = self.KALEIDO_FOLD
+        alpha = math.pi / fold
+        groups = [float(part.mean()) if len(part) else 0.0
+                  for part in np.array_split(np.asarray(self.levels, np.float64), 6)]
+        peak = max(self.peaks) if self.peaks else 0.0
+
+        def at(r: float, angle: float) -> QPointF:
+            return QPointF(r * math.cos(angle), r * math.sin(angle))
+
+        length = radius * (0.35 + 0.6 * (groups[0] + groups[1]) / 2)
+        petal = QPainterPath(at(radius * 0.06, alpha * 0.5))
+        petal.cubicTo(at(length * 0.5, alpha * 1.7), at(length * 0.95, alpha * 1.1),
+                      at(length, alpha * 0.45))
+        petal.cubicTo(at(length * 0.75, -alpha * 0.1), at(length * 0.35, alpha * 0.05),
+                      at(radius * 0.06, alpha * 0.5))
+        orbs = QPainterPath()
+        for j, level in enumerate(groups[2:4]):
+            centre = at(radius * (0.3 + 0.18 * j + 0.25 * level), alpha * (0.3 + 0.4 * j))
+            size = radius * (0.03 + 0.09 * level)
+            orbs.addEllipse(centre, size, size)
+        spikes = QPainterPath()
+        for j, level in enumerate(groups[4:6]):
+            r = radius * (0.55 + 0.1 * j + 0.3 * level)
+            reach = radius * (0.06 + 0.16 * level)
+            angle = alpha * (0.85 - 0.5 * j)
+            spikes.addPolygon(QPolygonF([at(r - reach, angle), at(r, angle + alpha * 0.12),
+                                         at(r + reach, angle), at(r, angle - alpha * 0.12)]))
+            spikes.closeSubpath()
+        marks = QPainterPath()
+        marks.addEllipse(at(radius * (0.16 + 0.12 * peak), alpha * 0.5), radius * 0.035,
+                         radius * 0.035)
+        turn = math.degrees(self.kaleido_rotation())
+        copies = []
+        for k in range(fold):
+            for mirrored in (False, True):
+                transform = QTransform()
+                transform.translate(cx, cy)
+                transform.rotate(turn + k * 360.0 / fold)
+                if mirrored:
+                    transform.scale(1, -1)
+                copies.append(transform)
+        # a hollow in the petal (a translucent halo round it was tried: a
+        # large alpha-blended fill took the dearest frame to the budget)
+        hollow = QTransform.fromScale(0.58, 0.58).map(petal)
+        layers = ((petal, self._colour("low")),
+                  (hollow, self._colour("track")), (orbs, self._colour("mid")),
+                  (spikes, self._colour("high")), (marks, self._colour("peak")))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)  # a pen's stroke would cost more than the fills
+        for path, colour in layers:
+            painter.setBrush(colour)
+            for transform in copies:
+                painter.setTransform(transform)
+                painter.drawPath(path)
+        painter.resetTransform()
+
+    # -- the faces drawn from the history: the ridgelines, the terrain --------------------
+
+    def _depth_pens(self, rows: int) -> list:
+        """A pen per history row, back to front: the scheme's colours from
+        quiet (far) to loud (near), the far ones dimmed into the background;
+        the front row in the peak colour (readable on any background)."""
+        key = ("depth", rows)
+        pens = self._pen_cache.get(key)
+        if pens is None:
+            pens = []
+            for k in range(rows):
+                depth = k / max(1, rows - 1)
+                if k == rows - 1:
+                    colour = self._colour("peak")
+                else:
+                    colour = QColor(_mix(self.colours.background, self._level_hex(depth),
+                                         0.3 + 0.6 * depth))
+                pen = QPen(colour)
+                pen.setWidthF(1.0)  # wider goes through the path stroker: 100x dearer
+                pens.append(pen)
+            self._pen_cache[key] = pens
+        return pens
+
+    def ridge_layout(self, width: float, height: float) -> list:
+        """Per history row, back to front: (baseline y, the height full sound
+        rises to, left x, right x) - the far rows higher up the window,
+        narrower and flatter, like ridges in the distance."""
+        rows = self.HISTORY_ROWS
+        top, bottom = height * 0.32, height - 3
+        spacing = (bottom - top) / (rows - 1)
+        reach = min(height * 0.28, spacing * 7)
+        layout = []
+        for k in range(rows):
+            depth = k / (rows - 1)
+            half = width * 0.4 * (0.72 + 0.28 * depth)
+            layout.append((top + k * spacing, reach * (0.75 + 0.25 * depth),
+                           width / 2 - half, width / 2 + half))
+        return layout
+
+    def sun_layout(self, width: float, height: float):
+        """The sun behind the ridges: (centre x, centre y on the horizon,
+        radius - larger with the bass), or None when there is no room."""
+        if width < 120 or height < 120:
+            return None
+        bass = self._bass_level(np.asarray(self.levels, np.float32))
+        return (width / 2, height * 0.32, min(width, height) * 0.15 * (1.0 + 0.6 * bass))
+
+    def _paint_sun(self, painter: QPainter, cx: float, cy: float, radius: float) -> None:
+        """Rays into the sky and the upper half of a disc in stripes that
+        thin out towards the horizon."""
+        far = math.hypot(self.width(), self.height())
+        rays = []
+        for i in range(1, 36):
+            angle = math.pi + math.pi * i / 36
+            dx, dy = math.cos(angle), math.sin(angle)
+            rays.append(QLineF(cx + dx * radius * 1.2, cy + dy * radius * 1.2,
+                               cx + dx * far, cy + dy * far))
+        painter.setPen(QPen(self._colour("grid"), 1))
+        painter.drawLines(rays)
+        gradient = QLinearGradient(0, cy - radius, 0, cy)
+        gradient.setColorAt(0.0, self._colour("high"))
+        gradient.setColorAt(1.0, self._colour("mid"))
+        stripes = 9
+        band = radius / stripes
+        for i in range(stripes):
+            top = cy - radius + i * band
+            thick = band * (1.0 - 0.75 * i / stripes)
+            middle = top + thick / 2
+            half = math.sqrt(max(0.0, radius * radius - (cy - middle) ** 2))
+            painter.fillRect(QRectF(cx - half, top, 2 * half, thick), gradient)
+
+    def _paint_ridges(self, painter: QPainter) -> None:
+        """The spectrum's history as ridgelines, the newest in front: each
+        ridge filled with the background, so it hides the ones behind; a
+        striped sun that grows with the bass behind them."""
+        width, height = self.width(), self.height()
+        sun = self.sun_layout(width, height)
+        if sun is not None:
+            self._paint_sun(painter, *sun)
+        history = self.history
+        n = history.shape[1]
+        u = (np.arange(n) + 0.5) / n
+        envelope = np.sin(np.pi * u) ** 0.6
+        margin = width * 0.04
+        pens = self._depth_pens(len(history))
+        background = QBrush(self._colour("background"))
+        hint = QPainter.RenderHint.Antialiasing
+        for k, (base, reach, left, right) in enumerate(self.ridge_layout(width, height)):
+            xs = np.concatenate(([margin, left], left + u * (right - left),
+                                 [right, width - margin]))
+            ys = np.concatenate(([base, base], base - history[k] * envelope * reach, [base, base]))
+            ridge = qpolygon(xs, ys)
+            # the fill hides what is behind; its edge lies under the line, so
+            # it needs no antialiasing (ten times dearer with it, measured)
+            painter.setRenderHint(hint, False)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(background)
+            painter.drawPolygon(ridge)
+            painter.setRenderHint(hint, True)
+            painter.setPen(pens[k])
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(ridge)
+
+    def terrain_horizon(self, height: float) -> float:
+        return height * 0.3
+
+    def terrain_points(self, width: float, height: float):
+        """The last TERRAIN_ROWS of the history as a landscape in
+        perspective, back to front: x, y and the ground under each point
+        (rows x bars). A row TERRAIN_FAR times as far away is that much
+        narrower, lower and nearer the horizon."""
+        history = self.history[-self.TERRAIN_ROWS:]
+        rows, n = history.shape
+        horizon = self.terrain_horizon(height)
+        depth = np.linspace(self.TERRAIN_FAR, 1.0, rows)[:, None]
+        u = (np.arange(n) + 0.5) / n - 0.5
+        xs = width / 2 + u[None, :] * width * 1.15 / depth
+        base = np.broadcast_to(horizon + (height - 4 - horizon) / depth, (rows, n)).copy()
+        return xs, base - history * height * 0.5 / depth, base
+
+    def _paint_terrain(self, painter: QPainter) -> None:
+        """A wireframe landscape of the spectrum's history receding to the
+        horizon, coloured dots on its front half, the peaks as dots above
+        the front row."""
+        width, height = self.width(), self.height()
+        xs, ys, base = self.terrain_points(width, height)
+        rows, n = xs.shape
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self._colour("grid"), 1))
+        for i in range(0, n, max(1, n // 24)):
+            painter.drawPolyline(qpolygon(xs[:, i], ys[:, i]))
+        for k, pen in enumerate(self._depth_pens(rows)):
+            painter.setPen(pen)
+            painter.drawPolyline(qpolygon(xs[k], ys[k]))
+        history = self.history[-rows:]
+        front = slice(rows // 2, rows)
+        fx, fy, levels = xs[front], ys[front], history[front]
+        pen = QPen()
+        pen.setCapStyle(Qt.PenCapStyle.SquareCap)  # round antialiased points: 6x dearer
+        pen.setWidthF(2.5)
+        for low, high, key in ((0.35, 0.65, "mid"), (0.65, 2.0, "high")):
+            chosen = (levels >= low) & (levels < high)
+            if chosen.any():
+                pen.setColor(self._colour(key))
+                painter.setPen(pen)
+                painter.drawPoints(qpolygon(fx[chosen], fy[chosen]))
+        peaks = np.asarray(self.peaks, np.float64)
+        pen.setColor(self._colour("peak"))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setWidthF(3.5)
+        painter.setPen(pen)
+        painter.drawPoints(qpolygon(xs[-1], base[-1] - peaks * height * 0.5 - 4))
+
+    # -- the ring, the bell curves ---------------------------------------------------------
+
+    def _ring_frame(self, width: float, height: float) -> tuple[float, float, float, float]:
+        """The ring's ellipse: (centre x, centre y, half width, half height)."""
+        rx = max(1.0, min(width * 0.42, height * 0.3 / self.RING_TILT))
+        ry = rx * self.RING_TILT
+        return width / 2, height - ry - max(4.0, height * 0.06), rx, ry
+
+    def ring_layout(self, width: float, height: float):
+        """The foot of each bar on a ring seen at a tilt (an ellipse RING_TILT
+        as high as wide), bar 0 nearest: x, y and its size against the
+        nearest (RING_FAR on the far side)."""
+        n = len(self.levels)
+        angles = 2 * np.pi * np.arange(n) / n + np.pi / 2
+        cx, cy, rx, ry = self._ring_frame(width, height)
+        sines = np.sin(angles)
+        return (cx + rx * np.cos(angles), cy + ry * sines,
+                self.RING_FAR + (1.0 - self.RING_FAR) * (sines + 1) / 2)
+
+    def ring_colours(self) -> list:
+        """A colour per bar going round the ring through the scheme's
+        colours - quiet in front, loud at the back, and round again (no seam)
+        - each made readable on the background."""
+        n = len(self.levels)
+        key = (n, self.colours)
+        if self._ring_cache is None or self._ring_cache[0] != key:
+            background = self.colours.background
+            colours = [readable_on(self._level_hex(1 - abs(2 * i - n) / n), background)
+                       for i in range(n)]
+            # as drawn: the far side a third of the way into the background
+            _xs, _ys, scales = self.ring_layout(1.0, 1.0)
+            drawn = [QColor(_mix(c, background, (1.0 - float(scale)) / (1.0 - self.RING_FAR) / 3))
+                     for c, scale in zip(colours, scales)]
+            self._ring_cache = (key, colours, drawn)
+        return self._ring_cache[1]
+
+    def _paint_ring(self, painter: QPainter) -> None:
+        """The bars standing on a tilted ring, the far ones smaller and drawn
+        first, the near ones over them; the peaks as ticks in the peak
+        colour."""
+        width, height = self.width(), self.height()
+        xs, ys, scales = self.ring_layout(width, height)
+        self.ring_colours()
+        colours = self._ring_cache[2]
+        n = len(self.levels)
+        cx, cy, rx, ry = self._ring_frame(width, height)
+        reach = max(1.0, (cy - ry - 4) / self.RING_FAR)  # a full far bar ends at the top
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self._colour("grid"), 1))
+        painter.setBrush(self._colour("track"))
+        painter.drawEllipse(QPointF(cx, cy), rx, ry)
+        painter.setBrush(self._colour("background"))
+        painter.drawEllipse(QPointF(cx, cy), rx * 0.55, ry * 0.55)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        cap = self._colour("peak")
+        bar = 2 * math.pi * rx / n * 0.5
+        for i in np.argsort(ys, kind="stable").tolist():
+            scale = float(scales[i])
+            x, y, thick = float(xs[i]), float(ys[i]), max(1.0, bar * scale)
+            rise = self.levels[i] * reach * scale
+            if rise >= 1:
+                painter.fillRect(QRectF(x - thick / 2, y - rise, thick, rise), colours[i])
+            top = self.peaks[i] * reach * scale
+            if top >= 1:
+                painter.fillRect(QRectF(x - thick / 2, y - top - 3, thick, 2), cap)
+
+    def _bell_frame(self, width: float, height: float):
+        """(where each group of bars starts, the centre x of each, one
+        standard deviation in pixels, the baseline y, the height a full
+        group rises to)."""
+        n = len(self.levels)
+        groups = min(n, self.BELLS_MAX)
+        return ((np.arange(groups) * n) // groups, (np.arange(groups) + 0.5) / groups * width,
+                width / groups * 0.5, height - 3, max(1.0, height - 8))
+
+    def bell_shapes(self, width: float, height: float):
+        """A gaussian bump per group of bars (BELLS_MAX at most): x and y
+        (groups x BELL_POINTS, three standard deviations either side) and
+        each group's level (its loudest bar)."""
+        starts, centres, sigma, base, reach = self._bell_frame(width, height)
+        loudest = np.maximum.reduceat(np.asarray(self.levels, np.float64), starts)
+        offsets = np.linspace(-3.0, 3.0, self.BELL_POINTS)
+        kernel = np.exp(-0.5 * offsets ** 2)
+        xs = centres[:, None] + offsets[None, :] * sigma
+        return xs, base - loudest[:, None] * reach * kernel[None, :], loudest
+
+    def _paint_bells(self, painter: QPainter) -> None:
+        """Bumps filled from the quiet to the loud colour, the louder ones in
+        front, outlined in their level's colour; the peaks as ticks."""
+        width, height = self.width(), self.height()
+        xs, ys, loudest = self.bell_shapes(width, height)
+        starts, centres, sigma, base, reach = self._bell_frame(width, height)
+        painter.fillRect(QRectF(0, base, width, 1), self._colour("grid"))
+        gradient = self._gradient(height, 0)
+        pen = QPen()
+        pen.setWidthF(1.0)  # wider goes through the path stroker
+        hint = QPainter.RenderHint.Antialiasing
+        for g in np.argsort(loudest, kind="stable").tolist():
+            bump = qpolygon(np.concatenate(([xs[g, 0]], xs[g], [xs[g, -1]])),
+                            np.concatenate(([base], ys[g], [base])))
+            # the fill's edge lies under the antialiased outline, so it needs
+            # no antialiasing: faster in each of three interleaved A/B runs
+            # (cheapest frame 3.8-5.5 ms against 7.2-9.4 ms at 1920x1080);
+            # 1.6 % of the pixels differ, all on the outlines
+            painter.setRenderHint(hint, False)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(gradient)
+            painter.drawPolygon(bump)
+            painter.setRenderHint(hint, True)
+            pen.setColor(self._level_colour(float(loudest[g])))
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(bump)
+        tops = np.maximum.reduceat(np.asarray(self.peaks, np.float64), starts)
+        cap = self._colour("peak")
+        for centre, top in zip(centres.tolist(), tops.tolist()):
+            painter.fillRect(QRectF(centre - sigma * 0.8, base - top * reach - 3, sigma * 1.6, 2),
+                             cap)
+
+    def _paint_label(self, painter: QPainter) -> None:
+        text = tr(VISUALIZER_NAMES[self.mode])
+        metrics = painter.fontMetrics()
+        box = QRectF(4, 4, metrics.horizontalAdvance(text) + 12, metrics.height() + 6)
+        painter.fillRect(box, QColor(0, 0, 0, 170))
+        painter.setPen(QColor("#ecf0f1"))
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+
+
+class VisualizerWindow(QWidget):
+    """The visualizer on its own: a resizable window (Detach) or the whole
+    screen (Fullscreen). Closing it gives the visualizer back to the panel
+    (:attr:`closed`)."""
+
+    closed = pyqtSignal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        from ui.icon_provider import set_window_icon
+
+        set_window_icon(self, "media-player")
+        self.setWindowTitle(tr("Media Player – Visualization"))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        from ui.close_corner import add_close_corner
+
+        # The title row (hidden in fullscreen): it had no way to close it.
+        add_close_corner(self)
+        self.resize(640, 360)
+        #: True while the panel itself closes it (attaching).
+        self.closing_quietly = False
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt
+        super().closeEvent(event)
+        if event.isAccepted() and not self.closing_quietly:
+            self.closed.emit()
+
+
+class VisualizerSettingsDialog(QDialog):
+    """The visualizer's settings: face, colour scheme and custom colours,
+    the options (VISUAL_OPTIONS ranges) and the pointer in fullscreen.
+    Changes apply at once; the panel saves them."""
+
+    def __init__(self, visualizer: Visualizer, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from ui.icon_provider import set_window_icon
+
+        set_window_icon(self, "audio-settings")
+        self.setWindowTitle(tr("Media Player Visualizer"))
+        self.visualizer = visualizer
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.mode_box = QComboBox()
+        for mode in Visualizer.MODES:
+            self.mode_box.addItem(tr(VISUALIZER_NAMES[mode]), mode)
+        self.mode_box.currentIndexChanged.connect(
+            lambda _i: self._apply(lambda: visualizer.set_mode(self.mode_box.currentData())))
+        form.addRow(tr("Visualization"), self.mode_box)
+        self.scheme_box = QComboBox()
+        for name, label in SCHEME_NAMES.items():
+            self.scheme_box.addItem(tr(label), name)
+        self.scheme_box.currentIndexChanged.connect(
+            lambda _i: self._apply(lambda: visualizer.set_scheme(self.scheme_box.currentData())))
+        form.addRow(tr("Colours"), self.scheme_box)
+        colours = QHBoxLayout()
+        self.colour_buttons: dict[str, QPushButton] = {}
+        for key, label in CUSTOM_LABELS.items():
+            button = QPushButton(tr(label))
+            button.setToolTip(tr("Pick the colour (Custom scheme)"))
+            button.clicked.connect(lambda _checked=False, k=key: self._choose(k))
+            self.colour_buttons[key] = button
+            colours.addWidget(button)
+        form.addRow(tr("Custom colours"), colours)
+        self.contrast_note = QLabel(tr("The peak colour was adjusted: it would not stand out "
+                                       "on the background."))
+        self.contrast_note.setWordWrap(True)
+        form.addRow("", self.contrast_note)
+        self.spins: dict[str, QSpinBox] = {}
+        for name, (low, high, _default) in VISUAL_OPTIONS.items():
+            label, suffix = VISUAL_OPTION_LABELS[name]
+            spin = QSpinBox()
+            spin.setObjectName(name)
+            spin.setRange(low, high)
+            spin.setSuffix(suffix)
+            spin.valueChanged.connect(
+                lambda value, n=name: self._apply(lambda: visualizer.set_option(n, value)))
+            self.spins[name] = spin
+            form.addRow(tr(label), spin)
+        self.cursor_check = QCheckBox(tr("Hide the mouse pointer in fullscreen"))
+        self.cursor_check.toggled.connect(
+            lambda on: self._apply(lambda: visualizer.set_hide_cursor(on)))
+        form.addRow("", self.cursor_check)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        from ui.close_corner import add_close_corner
+
+        self.close_corner = add_close_corner(self)
+        self._syncing = False
+        visualizer.mode_changed.connect(self.sync)
+        visualizer.settings_changed.connect(self.sync)
+        self.sync()
+
+    def _apply(self, change) -> None:
+        if not self._syncing:
+            change()
+
+    def sync(self, *_args) -> None:
+        """Show what the visualizer has now."""
+        vis = self.visualizer
+        self._syncing = True
+        try:
+            self.mode_box.setCurrentIndex(self.mode_box.findData(vis.mode))
+            self.scheme_box.setCurrentIndex(self.scheme_box.findData(vis.scheme))
+            for name, spin in self.spins.items():
+                spin.setValue(vis.options[name])
+            self.cursor_check.setChecked(vis.hide_cursor)
+            custom = vis.scheme == "custom"
+            for key, button in self.colour_buttons.items():
+                button.setEnabled(custom)
+                button.setIcon(self._swatch(vis.custom_colours[key]))
+            self.contrast_note.setVisible(custom and vis.colours.peak != vis.custom_colours["peak"])
+        finally:
+            self._syncing = False
+
+    @staticmethod
+    def _swatch(colour: str) -> QIcon:
+        pixmap = QPixmap(14, 14)
+        pixmap.fill(QColor(colour))
+        return QIcon(pixmap)
+
+    def _choose(self, key: str) -> None:
+        from PyQt6.QtWidgets import QColorDialog
+
+        chosen = QColorDialog.getColor(QColor(self.visualizer.custom_colours[key]), self,
+                                       tr(CUSTOM_LABELS[key]))
+        if chosen.isValid():
+            self.pick_colour(key, chosen)
+
+    def pick_colour(self, key: str, colour: QColor) -> None:
+        """Custom colour *key* is now *colour* (the colour dialog's answer)."""
+        self.visualizer.set_custom_colours({key: colour.name()})
+        self.sync()
+
+
+class SeekSlider(QSlider):
+    """The position slider: a click on the groove jumps there at once
+    (QSlider's own click only steps a page); dragging the handle works as
+    usual and seeks on release."""
+
+    jumped = pyqtSignal(int)
+
+    def __init__(self) -> None:
+        super().__init__(Qt.Orientation.Horizontal)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt
+        if event.button() != Qt.MouseButton.LeftButton or self.maximum() <= self.minimum():
+            super().mousePressEvent(event)
+            return
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        handle = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                      QStyle.SubControl.SC_SliderHandle, self)
+        pos = event.position().toPoint()
+        if handle.contains(pos):
+            super().mousePressEvent(event)  # a drag starts
+            return
+        groove = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                      QStyle.SubControl.SC_SliderGroove, self)
+        span = max(1, groove.width() - handle.width())
+        x = pos.x() - groove.x() - handle.width() // 2
+        value = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                               max(0, min(span, x)), span, opt.upsideDown)
+        self.setValue(value)
+        self.jumped.emit(value)
+        event.accept()
+
+
+class PlaylistDelegate(QStyledItemDelegate):
+    """A playlist row is as wide as the list, whatever its title: the view
+    stretches a row to its width, so the text is cut with "…" there."""
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt
+        return QSize(0, super().sizeHint(option, index).height())
+
+
+class PlaylistWidget(QListWidget):
+    """The playlist: rows reorder by dragging (InternalMove); files dropped
+    from a file pane or the desktop go to :attr:`dropped`."""
+
+    #: The QMimeData of a drop from outside.
+    dropped = pyqtSignal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setAcceptDrops(True)
+        # Every row the same size: without it any change to one row (the
+        # playing row's bold font and icon, its length once read) made the
+        # view lay out every row again - 16 ms per track change with 2000
+        # tracks, twice. A title wider than the list is cut with "…" (the
+        # tooltip holds the path) instead of widening all rows sideways.
+        self.setUniformItemSizes(True)
+        self.setItemDelegate(PlaylistDelegate(self))
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._fit_icon_size()
+
+    def _fit_icon_size(self) -> None:
+        """The playing row's icon as high as a line of text: that row is as
+        high as the others (it was 26 px against 15)."""
+        edge = self.fontMetrics().height()
+        self.setIconSize(QSize(edge, edge))
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt
+        if event.type() == QEvent.Type.FontChange:
+            self._fit_icon_size()
+        super().changeEvent(event)
+
+    @staticmethod
+    def accepts(mime) -> bool:
+        """A pane drag or local file URLs (no filesystem access here)."""
+        if mime is None:
+            return False
+        if mime.hasFormat(TRANSFER_MIME_TYPE):
+            return True
+        return mime.hasUrls() and any(u.isLocalFile() for u in mime.urls())
+
+    def _internal(self, event) -> bool:
+        return event.source() is self
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt
+        if self._internal(event):
+            super().dragEnterEvent(event)
+        elif self.accepts(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt
+        if self._internal(event):
+            super().dragMoveEvent(event)
+        elif self.accepts(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt
+        if self._internal(event):
+            super().dropEvent(event)  # the items move; their objects stay
+            return
+        mime = event.mimeData()
+        if not self.accepts(mime):
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        self.dropped.emit(mime)
+
+
+#: The pane drag payload's MIME type (ui.file_pane.TRANSFER_MIME_TYPE).
+TRANSFER_MIME_TYPE = "application/x-axross-transfer"
+_PATH_ROLE = Qt.ItemDataRole.UserRole
+#: A track's length in seconds when known (0: unknown).
+_DURATION_ROLE = Qt.ItemDataRole.UserRole + 1
+#: The state is saved this long after the last change, and every this many
+#: seconds while playing (the position).
+_SAVE_DELAY_MS = 1000
+_SAVE_EVERY_SECONDS = 30.0
+
+
+def _local_drop_context(mime):
+    """Without the extension API (a panel on its own): local files only -
+    file:// URLs, or a pane drag from the local disk."""
+    from types import SimpleNamespace
+
+    try:
+        from ui.file_pane import decode_transfer_payload
+    except ImportError:  # pragma: no cover - outside axross
+        decode_transfer_payload = None
+    payload = decode_transfer_payload(mime) if decode_transfer_payload else None
+    if payload is not None:
+        if payload.get("filesystem") == "Local" and payload["paths"]:
+            return SimpleNamespace(is_local=True, paths=tuple(payload["paths"]), backend=None)
+        return None
+    if mime.hasUrls():
+        paths = tuple(u.toLocalFile() for u in mime.urls() if u.isLocalFile())
+        if paths:
+            return SimpleNamespace(is_local=True, paths=paths, backend=None)
+    return None
+
+
+class PlayerPanel(QWidget):
+    """The player. Given an *engine* (the tests) it uses it at once.
+    Without one it comes up with the controls off and builds its engine
+    only after core.multimedia_probe found that Qt Multimedia answers
+    (*audio_probe*, run through *run_in_background*): Qt starts its backend
+    in the thread of the first multimedia object, here the GUI thread, and
+    a GPU driver or an audio server that hangs there froze the whole window
+    (axross-full showed no window: QAudioDecoder() -> cuInit, for ever).
+    When the probe fails the panel says why and stays off."""
+
+    #: The title of the track now playing ("" when none).
+    track_changed = pyqtSignal(str)
+    #: The audio did not start; the text the panel shows.
+    engine_failed = pyqtSignal(str)
+
+    def __init__(self, engine=None, state_path=None, run_in_background=None, *,
+                 engine_factory=None, audio_probe=None, open_audio_settings=None,
+                 open_mixer=None, output_lister=None) -> None:
+        super().__init__()
+        #: opens the Audio Mixer panel (the host's), None: no menu entry
+        self._open_mixer = open_mixer
+        #: Qt's outputs as (id, description) for the Output menu (a seam);
+        #: None: asked after core.multimedia_probe answered ok
+        self._output_lister = output_lister
+        #: the sleep timer: minutes chosen (0 off, -1 end of the track) and
+        #: its deadline (time.monotonic()), the fade-out under way
+        self.sleep_minutes = 0
+        self._sleep_deadline = 0.0
+        self._sleep_fading = False
+        #: open_audio_settings() opens Edit > Settings… > Audio (the host
+        #: window's); None: no "Audio Settings…" button.
+        self.open_audio_settings = open_audio_settings
+        #: engine_factory() -> engine, called on the GUI thread once the probe passed.
+        self._engine_factory = engine_factory or default_engine
+        #: audio_probe() -> core.multimedia_probe.ProbeResult; blocks, so it
+        #: runs through run_in_background.
+        self._audio_probe = audio_probe
+        self.engine_ready = engine is not None
+        #: The text shown when the audio did not start ("" otherwise).
+        self.audio_error = ""
+        #: Why, in a few words (the probe's reason; "" while it may play).
+        self.audio_reason = ""
+        self._shut_down = False
+        self.engine = engine if engine is not None else PendingEngine()
+        if self.engine_ready:
+            self._connect_engine(self.engine)
+        self.repeat = "off"
+        self.shuffle = False
+        self.muted = False
+        self._current: QListWidgetItem | None = None
+        #: The row the playing track had when it was removed: next goes on
+        #: from there.
+        self._resume_row: int | None = None
+        self._history: list[QListWidgetItem] = []
+        #: Removed rows' temporary copies that were still playing: deleted
+        #: once the engine moves on (another track, stop, end).
+        self._doomed: set[str] = set()
+        #: Temporary folders an add_remote is still copying into: kept
+        #: when their last copy goes meanwhile.
+        self._filling: set[str] = set()
+        self._round: set[int] = set()
+        self._rng = random.Random()
+        self._fail_streak = 0
+        self._track_ms = 0
+        self._title = ""
+        #: run_in_background(work, on_done, on_error) - the extension API's;
+        #: None runs the work at once.
+        self.run_in_background = run_in_background
+        #: drop_context(mime) -> what a drop is about (the extension API's);
+        #: None: local files only.
+        self.drop_resolver = None
+        self._state_path = state_path
+        self._state_unreadable = False
+        self._restoring = False
+        #: What the file held while a restore checks its tracks (_state).
+        self._restore_pending: dict | None = None
+        self._last_save = time.monotonic()
+        root = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.cover = QLabel()
+        self.cover.setFixedSize(72, 72)
+        self.cover.setStyleSheet("background: #20262c;")
+        self.now_playing = QLabel(tr("Nothing playing"))
+        # A file's name and its tags (title, artist) are anyone's text: as
+        # rich text "<img width=…>" in them would lay the panel out.
+        self.now_playing.setTextFormat(Qt.TextFormat.PlainText)
+        self.now_playing.setWordWrap(True)
+        top.addWidget(self.cover)
+        top.addWidget(self.now_playing, 1)
+        root.addLayout(top)
+        #: "Starting audio…" until the engine is there, or why it is not.
+        self.audio_status = QLabel(tr("Starting audio…"))
+        self.audio_status.setWordWrap(True)
+        self.audio_status.setVisible(not self.engine_ready)
+        root.addWidget(self.audio_status)
+        # Shown while audio is off: check again, or choose another backend
+        # or device first.
+        self.retry_button = QPushButton(tr("Try Again"))
+        self.retry_button.setToolTip(tr("Check the audio again and start the player when it "
+                                        "answers"))
+        self.retry_button.clicked.connect(self.retry_audio)
+        self.audio_settings_button = QPushButton(tr("Audio Settings…"))
+        self.audio_settings_button.setToolTip(tr("Edit → Settings… → Audio: backend, devices, "
+                                                 "volume and a test"))
+        self.audio_settings_button.clicked.connect(self._open_audio_settings)
+        audio_row = QHBoxLayout()
+        audio_row.setContentsMargins(0, 0, 0, 0)
+        audio_row.addWidget(self.retry_button)
+        audio_row.addWidget(self.audio_settings_button)
+        audio_row.addStretch(1)
+        root.addLayout(audio_row)
+        self._show_audio_buttons(False)
+        position = QHBoxLayout()
+        self.seek_slider = SeekSlider()
+        self.seek_slider.setRange(0, 0)
+        self.seek_slider.setSingleStep(SEEK_STEP_MS)
+        self.seek_slider.setPageStep(SEEK_BIG_STEP_MS)
+        self.seek_slider.setToolTip(tr("Position: click or drag to seek (←/→ ±5 s, "
+                                       "Shift ±30 s)"))
+        self.seek_slider.jumped.connect(self.seek_to)
+        self.seek_slider.sliderReleased.connect(
+            lambda: self.seek_to(self.seek_slider.sliderPosition()))
+        self.seek_slider.sliderMoved.connect(lambda _v: self._refresh_time())
+        self.seek_slider.actionTriggered.connect(self._slider_action)
+        self.time_label = QLabel("0:00 / 0:00")
+        position.addWidget(self.seek_slider, 1)
+        position.addWidget(self.time_label)
+        root.addLayout(position)
+        controls = QHBoxLayout()
+        self.prev_button = QPushButton()
+        self.play_button = QPushButton()
+        self.stop_button = QPushButton()
+        self.next_button = QPushButton()
+        self.back15_button = QPushButton()
+        self.forward15_button = QPushButton()
+        self.shuffle_button = QPushButton()
+        self.repeat_button = QPushButton()
+        self.prev_button.setToolTip(tr("Previous (Ctrl+←); after 3 s: start of the track"))
+        self.play_button.setToolTip(tr("Play / pause (Space)"))
+        self.stop_button.setToolTip(tr("Stop"))
+        self.next_button.setToolTip(tr("Next (Ctrl+→)"))
+        self.back15_button.setToolTip(tr("Back 15 seconds (← 5 s, Shift+← 30 s)"))
+        self.forward15_button.setToolTip(tr("Forward 15 seconds (→ 5 s, Shift+→ 30 s)"))
+        self.back15_button.setAccessibleName(tr("Back 15 seconds"))
+        self.forward15_button.setAccessibleName(tr("Forward 15 seconds"))
+        self.back15_button.clicked.connect(lambda: self.skip(-SKIP_BUTTON_MS))
+        self.forward15_button.clicked.connect(lambda: self.skip(SKIP_BUTTON_MS))
+        self.shuffle_button.setCheckable(True)
+        self.shuffle_button.setToolTip(tr("Shuffle"))
+        self.repeat_button.setCheckable(True)
+        self.prev_button.clicked.connect(self.previous_track)
+        self.play_button.clicked.connect(self.toggle_play)
+        self.stop_button.clicked.connect(lambda: self.engine.stop())
+        self.next_button.clicked.connect(self.next_track)
+        self.shuffle_button.toggled.connect(self.set_shuffle)
+        self.repeat_button.clicked.connect(self._cycle_repeat)
+        self.mute_button = QPushButton()
+        self.mute_button.setCheckable(True)
+        self.mute_button.setToolTip(tr("Mute (M)"))
+        self.mute_button.toggled.connect(self.set_muted)
+        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(80)
+        self.volume.setToolTip(tr("Volume (+/-, mouse wheel)"))
+        self.volume.valueChanged.connect(lambda _v: self._apply_volume())
+        # Room for a narrow dock (~340 px): the buttons and the volume give
+        # way down to these widths; wider they keep their own. The row was
+        # 343 px at least and the playlist's 424, so the panel was cut off
+        # on the right in a 366 px dock - its error text with it.
+        controls.setSpacing(2)
+        for widget in (self.prev_button, self.back15_button, self.play_button, self.stop_button,
+                       self.forward15_button, self.next_button,
+                       self.shuffle_button, self.repeat_button):
+            widget.setMinimumWidth(30)
+            controls.addWidget(widget)
+        self.mute_button.setMinimumWidth(30)
+        self.volume.setMinimumWidth(48)
+        controls.addStretch(1)
+        self.sleep_label = QLabel("")
+        self.sleep_label.setToolTip(tr("The sleep timer"))
+        self.sleep_label.setVisible(False)
+        controls.addWidget(self.sleep_label)
+        controls.addWidget(self.mute_button)
+        controls.addWidget(self.volume)
+        #: Output, Sleep Timer, Audio Mixer: the sound menu
+        self.sound_button = QToolButton()
+        self.sound_button.setText("…")
+        self.sound_button.setToolTip(tr("Output device, sleep timer, Audio Mixer"))
+        self.sound_button.setAccessibleName(tr("Sound options"))
+        self.sound_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.sound_menu = QMenu(self.sound_button)
+        self.sound_menu.aboutToShow.connect(self._fill_sound_menu)
+        self.sound_button.setMenu(self.sound_menu)
+        controls.addWidget(self.sound_button)
+        root.addLayout(controls)
+        self._sleep_timer = QTimer(self)
+        self._sleep_timer.setInterval(1000)
+        self._sleep_timer.timeout.connect(self._sleep_tick)
+        self.visualizer = Visualizer(self.engine)
+        self.visualizer.menu_hook = self._visualizer_menu
+        self.visualizer.fullscreen_requested.connect(self.set_fullscreen)
+        #: The visualizer's place in the panel; while it is in its own
+        #: window (Detach, Fullscreen) a note with Attach stands there.
+        self.visual_box = QWidget()
+        visual_layout = QVBoxLayout(self.visual_box)
+        visual_layout.setContentsMargins(0, 0, 0, 0)
+        visual_layout.addWidget(self.visualizer, 1)
+        self.visual_placeholder = QWidget()
+        placeholder = QHBoxLayout(self.visual_placeholder)
+        placeholder.setContentsMargins(0, 0, 0, 0)
+        placeholder.addWidget(QLabel(tr("The visualization is in its own window.")), 1)
+        attach = QPushButton(tr("Attach"))
+        attach.setToolTip(tr("Put the visualization back into the panel"))
+        attach.clicked.connect(self.attach_visualizer)
+        placeholder.addWidget(attach)
+        self.visual_placeholder.setVisible(False)
+        visual_layout.addWidget(self.visual_placeholder)
+        root.addWidget(self.visual_box)
+        #: The visualizer's own window while detached or fullscreen (None: in the panel).
+        self.visual_window: VisualizerWindow | None = None
+        self._fullscreen = False
+        #: Fullscreen came from the panel (leaving it attaches) or from the window.
+        self._fullscreen_from_panel = False
+        #: The visualizer settings dialog while it is open.
+        self.visual_settings: VisualizerSettingsDialog | None = None
+        # The equalizer: a header row (fold, on/off, preset) that stays, and
+        # the band sliders below it that fold away - the playlist gets the room.
+        self._eq_open = True
+        self.eq_toggle = QToolButton()
+        self.eq_toggle.setCheckable(True)
+        self.eq_toggle.setChecked(True)
+        self.eq_toggle.setAutoRaise(True)
+        self.eq_toggle.setArrowType(Qt.ArrowType.DownArrow)  # drawn by the style: no font needed
+        self.eq_toggle.setToolTip(tr("Show / hide the equalizer bands"))
+        self.eq_toggle.setAccessibleName(tr("Show / hide the equalizer bands"))
+        self.eq_toggle.toggled.connect(self.set_equalizer_open)
+        self.eq_check = QCheckBox(tr("Equalizer"))
+        self.eq_check.setChecked(True)
+        self.preset = QComboBox()
+        self.preset.addItems(list(PRESETS))
+        self.preset.currentTextChanged.connect(self.apply_preset)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(self.eq_toggle)
+        header.addWidget(self.eq_check)
+        header.addWidget(self.preset, 1)
+        eq = QGridLayout()
+        eq.setContentsMargins(0, 0, 0, 0)
+        self.sliders: list[QSlider] = []
+        for i, freq in enumerate(BANDS):
+            slider = QSlider(Qt.Orientation.Vertical)
+            slider.setRange(-int(MAX_GAIN_DB), int(MAX_GAIN_DB))
+            slider.setMinimumHeight(80)
+            slider.valueChanged.connect(lambda _v: self._sliders_moved())
+            self.sliders.append(slider)
+            eq.addWidget(slider, 0, i, Qt.AlignmentFlag.AlignHCenter)
+            label = QLabel(f"{freq // 1000}k" if freq >= 1000 else str(freq))
+            eq.addWidget(label, 1, i, Qt.AlignmentFlag.AlignHCenter)
+        self.eq_body = QWidget()
+        self.eq_body.setLayout(eq)
+        self.eq_box = QWidget()
+        box = QVBoxLayout(self.eq_box)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addLayout(header)
+        box.addWidget(self.eq_body)
+        if not isinstance(self.engine, EqEngine) and np is None:
+            for widget in (self.eq_check, self.preset, self.eq_body):
+                widget.setEnabled(False)
+            self.eq_box.setToolTip(tr("The equalizer and the visualizations need numpy "
+                                      "(pip install numpy)."))
+        self.eq_check.toggled.connect(self._eq_toggled)
+        root.addWidget(self.eq_box)
+        # The playlist folds away (the visualizer gets the room); the toggle stays.
+        self._playlist_open = True
+        self.playlist_toggle = QToolButton()
+        self.playlist_toggle.setCheckable(True)
+        self.playlist_toggle.setChecked(True)
+        self.playlist_toggle.setAutoRaise(True)
+        self.playlist_toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self.playlist_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.playlist_toggle.setText(tr("Playlist"))
+        self.playlist_toggle.setToolTip(tr("Show / hide the playlist"))
+        self.playlist_toggle.setAccessibleName(tr("Show / hide the playlist"))
+        self.playlist_toggle.toggled.connect(self.set_playlist_open)
+        root.addWidget(self.playlist_toggle)
+        self.playlist = PlaylistWidget()
+        self.playlist.setToolTip(tr("Drop files or folders here; drag rows to reorder. "
+                                    "Enter plays, Delete removes."))
+        self.playlist.itemDoubleClicked.connect(lambda _item: self.play_selected())
+        self.playlist.dropped.connect(self._on_drop)
+        root.addWidget(self.playlist, 1)
+        self.playlist_buttons = QWidget()
+        row = QHBoxLayout(self.playlist_buttons)
+        row.setContentsMargins(0, 0, 0, 0)
+        add = QPushButton(tr("Add…"))
+        add.clicked.connect(self._add_dialog)
+        stream = QPushButton(tr("URL…"))
+        stream.setToolTip(tr("Add a stream by its URL (internet radio, http / https)"))
+        stream.clicked.connect(self._url_dialog)
+        remove = QPushButton(tr("Remove"))
+        remove.clicked.connect(self._remove_selected)
+        clear = QPushButton(tr("Clear"))
+        clear.clicked.connect(self.clear_playlist)
+        # Loading and saving a playlist file share one button with a menu,
+        # so the row still fits a narrow dock (~340 px).
+        m3u = QPushButton(tr("M3U"))
+        m3u.setToolTip(tr("Load or save the list as an M3U playlist"))
+        m3u_menu = QMenu(m3u)
+        load = m3u_menu.addAction(tr("Load Playlist…"))
+        load.setToolTip(tr("Load an M3U playlist (replaces the list)"))
+        load.triggered.connect(self._load_dialog)
+        save = m3u_menu.addAction(tr("Save Playlist…"))
+        save.setToolTip(tr("Save the list as an M3U playlist"))
+        save.triggered.connect(self._save_dialog)
+        m3u.setMenu(m3u_menu)
+        self.playlist_file_menu = m3u_menu
+        for button in (add, stream, remove, clear):
+            # A push button is 80 px at least by the style; its text needs less.
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 16)
+        # ... plus the menu's arrow
+        m3u.setMinimumWidth(m3u.fontMetrics().horizontalAdvance(m3u.text()) + 32)
+        for button in (add, stream, remove, clear):
+            row.addWidget(button)
+        row.addStretch(1)
+        row.addWidget(m3u)
+        root.addWidget(self.playlist_buttons)
+        self.note = QLabel("")
+        self.note.setTextFormat(Qt.TextFormat.PlainText)  # names files
+        self.note.setWordWrap(True)
+        root.addWidget(self.note)
+        self._update_repeat_button()
+        #: The output device the engine plays on (core.audio_route), to see a change.
+        self._output_device = audio_route.source_output_id("media")
+        audio_route.notifier().changed.connect(self._audio_settings_saved)
+        self._take_shared_eq()  # axross's equalizer, as the Audio Mixer shows it
+        self._apply_volume()
+        self._update_control_icons()
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        for widget in [self, *self.findChildren(QWidget)]:
+            widget.installEventFilter(self)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(_SAVE_DELAY_MS)
+        self._save_timer.timeout.connect(self.save_state)
+        model = self.playlist.model()
+        for signal in (model.rowsInserted, model.rowsRemoved, model.rowsMoved):
+            signal.connect(self._schedule_save)
+        self.volume.valueChanged.connect(self._schedule_save)
+        self.visualizer.mode_changed.connect(self._schedule_save)
+        self.visualizer.settings_changed.connect(self._schedule_save)
+        # Files dropped anywhere on the panel (the visualizer, the controls,
+        # a folded playlist) go to the playlist too.
+        self.setAcceptDrops(True)
+        self._clock = QTimer(self)
+        self._clock.setInterval(250)
+        self._clock.timeout.connect(self._refresh_time)
+        self._clock.start()
+        self._set_transport_enabled(self.engine_ready)
+        if self._state_path:
+            self.restore_state()
+        if not self.engine_ready:
+            self._start_engine()
+
+    # -- the engine ------------------------------------------------------------------------
+
+    def _connect_engine(self, engine) -> None:
+        engine.finished_playing.connect(self._next_after_end)
+        engine.changed.connect(self._refresh)
+        engine.changed.connect(self._release_doomed)
+        failed = getattr(engine, "failed", None)
+        if failed is not None:
+            failed.connect(self._track_failed)
+        problem = getattr(engine, "playback_problem", None)
+        if problem is not None:
+            problem.connect(self._playback_problem)
+
+    def _playback_problem(self, text: str) -> None:
+        """The sound card plays too slow, too fast or not at all: said in
+        the panel and as a notice, with what to do."""
+        self.note.setText(text)
+        self.engine_failed.emit(text)
+
+    def _set_transport_enabled(self, on: bool) -> None:
+        for button in (self.prev_button, self.play_button, self.stop_button, self.next_button):
+            button.setEnabled(on)
+
+    def _start_engine(self) -> None:
+        """Probe Qt Multimedia off the GUI thread; the engine follows."""
+        probe = self._audio_probe
+        if probe is None:
+            from core import multimedia_probe
+
+            probe = multimedia_probe.probe
+        self._background(probe, self._probe_done, self._probe_failed)
+
+    def _gone(self) -> bool:
+        return self._shut_down or sip.isdeleted(self)
+
+    def _probe_done(self, result) -> None:
+        if self._gone():
+            return  # the panel closed meanwhile: no engine any more
+        if not result.ok:
+            self._audio_failed(result.reason)
+            return
+        if getattr(result, "decoding", True) is False:
+            # No engine: nothing to play, and a started decoder deleted at
+            # the exit crashed the process (tests/test_media_player_no_decoder.py).
+            self._audio_failed(tr(NO_DECODER_REASON))
+            return
+        try:
+            engine = self._engine_factory()
+        except Exception as exc:  # noqa: BLE001 - shown, the rest of axross goes on
+            log.warning("Media Player: the engine could not be built", exc_info=True)
+            self._audio_failed(str(exc) or type(exc).__name__)
+            return
+        self._attach_engine(engine)
+
+    def _probe_failed(self, exc) -> None:
+        if not self._gone():
+            self._audio_failed(str(exc) or type(exc).__name__)
+
+    def _audio_failed(self, reason: str) -> None:
+        text = tr("Audio does not start on this system: {reason}. The Media Player is off; "
+                  "everything else works.").format(reason=reason)
+        self.audio_error = text
+        self.audio_reason = reason
+        self.audio_status.setText(text)
+        self.audio_status.setVisible(True)
+        self._show_audio_buttons(True)
+        self._set_transport_enabled(False)
+        log.warning("Media Player: %s", text)
+        self.engine_failed.emit(text)
+
+    def _show_audio_buttons(self, on: bool) -> None:
+        self.retry_button.setVisible(on)
+        self.audio_settings_button.setVisible(on and self.open_audio_settings is not None)
+
+    def retry_audio(self) -> None:
+        """Try Again: check Qt Multimedia once more (this run's answer is
+        forgotten, core.multimedia_probe.reset) and build the engine when it
+        answers now - after a changed backend or device, a started audio
+        server, a plugged-in card."""
+        if self._gone() or self.engine_ready:
+            return
+        self._show_audio_buttons(False)
+        self.audio_error = ""
+        self.audio_reason = ""
+        self.audio_status.setText(tr("Starting audio…"))
+        self.audio_status.setVisible(True)
+        if self._audio_probe is None:
+            from core import multimedia_probe
+
+            multimedia_probe.reset()
+        self._start_engine()
+
+    def _open_audio_settings(self) -> None:
+        if self.open_audio_settings is not None:
+            self.open_audio_settings()
+
+    def _attach_engine(self, engine) -> None:
+        """Use *engine* from now on and hand it what was asked for while
+        the panel waited: the track (at its position, playing if asked),
+        the volume, the gains and the equalizer switch."""
+        pending = self.engine if isinstance(self.engine, PendingEngine) else None
+        self.engine = engine
+        self._connect_engine(engine)
+        self.visualizer.engine = engine
+        self.engine_ready = True
+        self.audio_error = ""
+        self.audio_status.setVisible(False)
+        self._show_audio_buttons(False)
+        self._set_transport_enabled(True)
+        self._apply_volume()
+        if pending is None:
+            return
+        if pending.gains is not None:
+            engine.set_gains(pending.gains)
+        if isinstance(engine, EqEngine):
+            engine.set_eq_enabled(self.eq_check.isChecked())
+        if pending.loaded:
+            engine.load(pending.path)
+            if pending.position > 0:
+                engine.seek(pending.position)
+            if self._current is not None and self._row_of(self._current) >= 0 \
+                    and self._current.data(_PATH_ROLE) == pending.path:
+                self._read_tags(pending.path)
+            if pending.wants_play:
+                engine.play()
+                self.visualizer.timer.start()
+        self._refresh()
+        self._refresh_time()
+
+    # -- playlist --------------------------------------------------------------------------
+
+    def add_files(self, paths) -> int:
+        """Add local files, folders (bounded) and M3U playlists at once;
+        how many tracks were added."""
+        found, _skipped, _truncated = collect_local(paths)
+        for path, title in found:
+            self._append(path, title)
+        return len(found)
+
+    def _append(self, path: str, title: str = "", duration: int = 0) -> QListWidgetItem:
+        item = QListWidgetItem(title or default_title(path))
+        item.setData(_PATH_ROLE, path)
+        item.setData(_DURATION_ROLE, int(duration or 0))
+        item.setToolTip(plain_tooltip(path))
+        self.playlist.addItem(item)
+        return item
+
+    def add_collected(self, found, skipped: int = 0, truncated: bool = False):
+        """Append what collect_local / fetch_remote found and say so in the
+        note; the first added item (None when nothing was)."""
+        first = None
+        for path, title in found:
+            item = self._append(path, title)
+            first = first or item
+        self._say_added(len(found), skipped, truncated)
+        return first
+
+    def _say_added(self, count: int, skipped: int = 0, truncated: bool = False) -> None:
+        parts = []
+        if count:
+            parts.append(tr("Added {count} track(s).").format(count=count))
+        if skipped:
+            parts.append(tr("Skipped {count} entry(s): not audio, not readable, or in a "
+                            "folder nested too deep.")
+                         .format(count=skipped))
+        if truncated:
+            parts.append(tr("Only the first {count} tracks were taken.")
+                         .format(count=MAX_DROP_FILES))
+        self.note.setText(" ".join(parts) or tr("Nothing to add."))
+
+    def add_remote(self, backend, paths, *, play_first: bool = False, failed=None) -> None:
+        """Add the tracks among *paths* of a remote *backend*: listed, then
+        copied one by one to a bounded temporary folder (copy_remote), all
+        off the GUI thread. Each track lands in the playlist once copied -
+        the first plays at once with *play_first* - instead of after the
+        whole selection: eight 4 MB tracks at 40 MB/s started after 958 ms
+        (tests/test_media_player_remote_progressive.py). A copy that fails
+        (a bound, the connection) stops the rest; *failed(exc)* is told
+        and the note says it - the tracks copied before stay."""
+        paths = list(paths)
+
+        def say_failed(exc) -> None:
+            if self._gone():
+                return
+            self.note.setText(tr("Cannot add: {error}").format(error=exc))
+            if failed is not None:
+                failed(exc)
+
+        def listed(result) -> None:
+            remote, skipped, truncated = result
+            if self._gone():
+                return
+            if not remote:
+                self._say_added(0, skipped, truncated)
+                return
+            # Made here, on the GUI thread, once the panel is known to be
+            # there: made by the listing's worker, a folder made after
+            # deactivate() had emptied _TEMP_FOLDERS stayed behind - the host
+            # drops a result that comes after the unload, so this never ran.
+            try:
+                folder = remote_temp_folder()
+            except OSError as exc:
+                say_failed(exc)
+                return
+            self._filling.add(folder)
+            copy_next({"remote": remote, "skipped": skipped, "truncated": truncated,
+                       "folder": folder, "index": 0, "total": 0})
+
+        def copy_next(job) -> None:
+            path, name = job["remote"][job["index"]]
+            self._background(
+                lambda: copy_remote(backend, path, name, job["folder"], job["index"],
+                                    job["total"]),
+                lambda result: copied(job, result),
+                lambda exc: copy_failed(job, exc))
+
+        def copied(job, result) -> None:
+            target, job["total"] = result
+            if self._gone():
+                return  # the folder goes with the extension
+            name = job["remote"][job["index"]][1]
+            item = self._append(target, name)
+            job["index"] += 1
+            count = len(job["remote"])
+            if job["index"] == 1 and play_first:
+                self.play_item(item)
+            if job["index"] < count:
+                self.note.setText(tr("Copied {done} of {count} track(s)…").format(
+                    done=job["index"], count=count))
+                copy_next(job)
+            else:
+                self._filled(job["folder"])
+                self._say_added(count, job["skipped"], job["truncated"])
+
+        def copy_failed(job, exc) -> None:
+            if job["index"] == 0:
+                _forget_temp(job["folder"])  # nothing of it is in the playlist
+            self._filled(job["folder"])
+            say_failed(exc)
+
+        self._background(lambda: list_remote(backend, paths), listed, say_failed)
+
+    def _filled(self, folder: str) -> None:
+        """An add_remote is done with *folder*: it goes if the rows of all
+        its copies were removed meanwhile."""
+        self._filling.discard(folder)
+        if folder in _TEMP_FOLDERS and not _has_copies(folder):
+            _forget_temp(folder)
+
+    def _playing_copy(self, path: str) -> bool:
+        engine = self.engine
+        return bool(getattr(engine, "loaded", False)) and getattr(engine, "path", "") == path \
+            and getattr(engine, "state", "stopped") != "stopped"
+
+    def _drop_copies(self, paths) -> None:
+        """Delete the temporary copies among *paths* (rows just removed)
+        that no other row plays; the one playing goes once it stops."""
+        temp = {p for p in paths if isinstance(p, str) and _is_temp_copy(p)}
+        if not temp:
+            return
+        kept = {self.playlist.item(i).data(_PATH_ROLE) for i in range(self.playlist.count())}
+        for path in temp - kept:
+            if self._playing_copy(path):
+                self._doomed.add(path)
+            else:
+                self._delete_copy(path)
+
+    def _release_doomed(self) -> None:
+        """The engine changed: delete the removed copies it no longer plays."""
+        for path in list(self._doomed):
+            if not self._playing_copy(path):
+                self._doomed.discard(path)
+                self._delete_copy(path)
+
+    def _delete_copy(self, path: str) -> None:
+        delete_temp_copy(path, keep_folder=_temp_folder_of(path) in self._filling)
+
+    def _background(self, work, done, failed) -> None:
+        if self.run_in_background is not None:
+            self.run_in_background(work, done, failed)
+            return
+        try:
+            result = work()
+        except Exception as exc:  # noqa: BLE001 - shown like the host shows it
+            failed(exc)
+            return
+        done(result)
+
+    def _on_drop(self, mime) -> None:
+        """Files dropped from a pane or the desktop: local ones collected,
+        remote ones copied to a bounded temporary folder - both off the GUI
+        thread."""
+        resolve = self.drop_resolver or _local_drop_context
+        ctx = resolve(mime)
+        if ctx is None:
+            self.note.setText(tr("Cannot add these: their connection is gone or they are no "
+                                 "files."))
+            return
+        paths = list(ctx.paths)
+
+        def failed(exc) -> None:
+            self.note.setText(tr("Cannot add: {error}").format(error=exc))
+
+        if getattr(ctx, "is_local", True):
+            self._background(lambda: collect_local(paths),
+                             lambda r: self.add_collected(*r), failed)
+            return
+        self.add_remote(ctx.backend, paths)
+
+    def _add_dialog(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+
+        pattern = " ".join(f"*{s}" for s in AUDIO_SUFFIXES + PLAYLIST_SUFFIXES)
+        paths, _f = QFileDialog.getOpenFileNames(self, tr("Add tracks"), "",
+                                                 f"{tr('Audio')} ({pattern})")
+        if paths:
+            self._background(lambda: collect_local(paths), lambda r: self.add_collected(*r),
+                             lambda exc: self.note.setText(str(exc)))
+
+    def _url_dialog(self) -> None:
+        """Add a stream by its URL (internet radio, a file on a web server)."""
+        from PyQt6.QtWidgets import QInputDialog
+
+        url, ok = QInputDialog.getText(self, tr("Add stream"),
+                                       tr("Stream URL (http or https):"))
+        if ok:
+            self.add_stream(url.strip())
+
+    def add_stream(self, url: str) -> bool:
+        """Append the stream *url*; False (and a note why) when it is none."""
+        if not is_stream(url):
+            self.note.setText(tr("Not a stream URL: only http:// and https:// are played"))
+            return False
+        self._append(url)
+        self._say_added(1)
+        return True
+
+    def _load_dialog(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+
+        path, _f = QFileDialog.getOpenFileName(self, tr("Load playlist"), "",
+                                               f"{tr('Playlists')} (*.m3u *.m3u8)")
+        if path:
+            self.load_playlist(path)
+
+    def _save_dialog(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+
+        path, _f = QFileDialog.getSaveFileName(self, tr("Save playlist"), "playlist.m3u8",
+                                               f"{tr('Playlists')} (*.m3u8 *.m3u)")
+        if path:
+            if not path.lower().endswith(PLAYLIST_SUFFIXES):
+                path += ".m3u8"
+            self.save_playlist(path)
+
+    def _entries(self) -> list[PlaylistEntry]:
+        out = []
+        for item in self._items():
+            path = item.data(_PATH_ROLE)
+            title = item.text() if item.text() != default_title(path) else ""
+            out.append(PlaylistEntry(path, title, int(item.data(_DURATION_ROLE) or 0)))
+        return out
+
+    def save_playlist(self, path: str) -> None:
+        try:
+            written, left_out = write_playlist(path, self._entries())
+        except OSError as exc:
+            self.note.setText(tr("Cannot save the playlist: {error}").format(error=exc))
+            return
+        text = tr("Saved {count} track(s) to {name}.").format(count=written,
+                                                              name=os.path.basename(path))
+        if left_out:
+            text += " " + tr("{count} remote track(s) left out: they are temporary copies.") \
+                .format(count=left_out)
+        self.note.setText(text)
+
+    def load_playlist(self, path: str) -> None:
+        """Replace the list by the playlist at *path* (nothing changes when
+        it is refused). Read off the GUI thread, as restore_state does: it
+        checks every entry (up to MAX_PLAYLIST_ENTRIES ``isfile`` calls),
+        and one on a dead mount froze the window. Only the last load asked
+        for fills the list."""
+        self._playlist_loads = getattr(self, "_playlist_loads", 0) + 1
+        token = self._playlist_loads
+
+        def failed(exc) -> None:
+            if token != self._playlist_loads:
+                return
+            if not isinstance(exc, (PlaylistError, OSError)):
+                raise exc
+            self.note.setText(tr("Cannot load {name}: {error}").format(
+                name=os.path.basename(path), error=exc))
+
+        def done(result) -> None:
+            if token == self._playlist_loads:
+                self._fill_from_playlist(path, *result)
+
+        self.note.setText(tr("Loading {name}…").format(name=os.path.basename(path)))
+        self._background(lambda: read_playlist(path), done, failed)
+
+    def _fill_from_playlist(self, path: str, entries, skipped: int) -> None:
+        self._remove_all_rows()
+        for entry in entries:
+            self._append(entry.path, entry.title, entry.duration)
+        text = tr("Loaded {count} track(s) from {name}.").format(count=len(entries),
+                                                                 name=os.path.basename(path))
+        if skipped:
+            text += " " + tr("Skipped {count} entry(s): missing, not audio or not a local "
+                             "file.").format(count=skipped)
+        self.note.setText(text)
+
+    def _row_of(self, item) -> int:
+        if item is None:
+            return -1
+        try:
+            return self.playlist.row(item)
+        except RuntimeError:  # the item is gone
+            return -1
+
+    def current_row(self) -> int:
+        """The playing track's row; -1 when none (or it was removed)."""
+        return self._row_of(self._current)
+
+    def _remove_selected(self) -> None:
+        rows = sorted({self.playlist.row(i) for i in self.playlist.selectedItems()})
+        if not rows:
+            return
+        playing = self.current_row()
+        if playing in rows:
+            # It plays on; next continues with what followed it.
+            self._resume_row = playing - sum(1 for r in rows if r < playing)
+            self._current = None
+        removed = []
+        for row in reversed(rows):
+            item = self.playlist.takeItem(row)
+            removed.append(item.data(_PATH_ROLE))
+            if item in self._history:
+                self._history = [h for h in self._history if h is not item]
+            self._round.discard(id(item))
+        self._drop_copies(removed)
+
+    def clear_playlist(self) -> None:
+        self._remove_all_rows()
+
+    def _remove_all_rows(self) -> None:
+        self._current = None
+        self._resume_row = None
+        self._history.clear()
+        self._round.clear()
+        removed = []
+        while self.playlist.count():
+            removed.append(self.playlist.takeItem(self.playlist.count() - 1).data(_PATH_ROLE))
+        self._drop_copies(removed)
+
+    def play_selected(self) -> None:
+        item = self.playlist.currentItem()
+        if item is None and self.playlist.count():
+            self.playlist.setCurrentRow(0)
+            item = self.playlist.currentItem()
+        if item is None:
+            return
+        self._fail_streak = 0
+        self.play_item(item)
+
+    def play_item(self, item: QListWidgetItem, *, record: bool = True) -> None:
+        self._set_current(item)
+        path = item.data(_PATH_ROLE)
+        if record:
+            self._history.append(item)
+            del self._history[:-1000]  # bounded
+            self._round.add(id(item))
+        self.note.setText("")
+        self.engine.load(path)
+        self._release_doomed()  # the copy of a removed row that played until now
+        self._track_ms = 0
+        self._read_tags(path)
+        self.engine.play()
+        self.visualizer.timer.start()
+
+    def _set_current(self, item) -> None:
+        old = self._current
+        if old is not None and self._row_of(old) >= 0:
+            self._mark(old, False)
+        self._current = item
+        self._resume_row = None
+        if item is not None:
+            self._mark(item, True)
+            self.playlist.setCurrentItem(item)
+            self.playlist.scrollToItem(item)
+            self._set_title(item.text())
+        self._schedule_save()
+
+    def _mark(self, item, playing: bool) -> None:
+        font = QFont(item.font())
+        font.setBold(playing)
+        item.setFont(font)
+        item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+                     if playing else QIcon())
+
+    def _set_title(self, title: str) -> None:
+        self._title = title
+        self.now_playing.setToolTip(plain_tooltip(title))
+        self.track_changed.emit(title)
+
+    def toggle_play(self) -> None:
+        if self.engine.state == "playing":
+            self.engine.pause()
+        elif self.engine.state == "paused":
+            self.engine.play()
+        elif self._current is not None and self._row_of(self._current) >= 0 \
+                and self.engine.loaded and self.engine.path == self._current.data(_PATH_ROLE):
+            self._fail_streak = 0
+            self.engine.play()  # a stopped track (maybe at a restored position)
+            self.visualizer.timer.start()
+        else:
+            self.play_selected()
+
+    # -- next / previous -------------------------------------------------------------------
+
+    def _items(self) -> list[QListWidgetItem]:
+        return [self.playlist.item(i) for i in range(self.playlist.count())]
+
+    def _next_item(self) -> QListWidgetItem | None:
+        count = self.playlist.count()
+        if not count:
+            return None
+        if self.shuffle:
+            items = self._items()
+            fresh = [i for i in items if id(i) not in self._round and i is not self._current]
+            if not fresh:
+                if self.repeat != "all":
+                    return None
+                self._round.clear()  # a new round
+                fresh = [i for i in items if i is not self._current] or items
+            return self._rng.choice(fresh)
+        row = self.current_row()
+        if row < 0 and self._resume_row is not None:
+            nxt = self._resume_row
+        else:
+            nxt = row + 1
+        if nxt >= count:
+            return self.playlist.item(0) if self.repeat == "all" else None
+        return self.playlist.item(max(0, nxt))
+
+    def _previous_item(self) -> tuple[QListWidgetItem | None, bool]:
+        """The track ⏮ goes to and whether that is a step back in the
+        shuffle history (played again without being recorded)."""
+        count = self.playlist.count()
+        if not count:
+            return None, False
+        if self.shuffle:
+            while len(self._history) >= 2:
+                candidate = self._history[-2]
+                if self._row_of(candidate) >= 0:
+                    self._history.pop()
+                    return candidate, True
+                del self._history[-2]
+        row = self.current_row()
+        if row < 0:
+            row = self._resume_row if self._resume_row is not None else 0
+        if row - 1 >= 0:
+            return self.playlist.item(min(row - 1, count - 1)), False
+        if self.repeat == "all":
+            return self.playlist.item(count - 1), False
+        return self.playlist.item(0), False
+
+    def next_track(self) -> None:
+        """⏭: the next track (repeat one does not hold it)."""
+        item = self._next_item()
+        if item is not None:
+            self._fail_streak = 0
+            self.play_item(item)
+
+    def previous_track(self) -> None:
+        """⏮: the start of this track once it played a little, else the
+        previous one."""
+        if self._row_of(self._current) >= 0 and self.engine.position_ms() > RESTART_AFTER_MS:
+            self.engine.seek(0)
+            return
+        item, back = self._previous_item()
+        if item is not None:
+            self._fail_streak = 0
+            self.play_item(item, record=not back)
+
+    def _next_after_end(self) -> None:
+        self._fail_streak = 0
+        if self.sleep_minutes < 0:  # the sleep timer: at the end of this track
+            self.sleep_minutes = 0
+            self._show_sleep()
+            self.visualizer.timer.stop()
+            self.note.setText(tr("The sleep timer stopped the music at the end of the track."))
+            return
+        if self.repeat == "one" and self._row_of(self._current) >= 0:
+            self.play_item(self._current, record=False)
+            return
+        item = self._next_item()
+        if item is not None:
+            self.play_item(item)
+        else:
+            self.visualizer.timer.stop()
+
+    def _track_failed(self, reason: str) -> None:
+        """An unplayable track: marked, noted and skipped - unless no track
+        of the list played, which ends it instead of looping."""
+        item = self._current
+        name = item.text() if self._row_of(item) >= 0 else os.path.basename(self.engine.path)
+        if self._row_of(item) >= 0:
+            item.setToolTip(plain_tooltip(f"{item.data(_PATH_ROLE)}\n{tr('Cannot play')}: {reason}"))
+            item.setForeground(QColor("#c0392b"))
+        self._fail_streak += 1
+        if self._fail_streak >= max(1, self.playlist.count()):
+            self.note.setText(tr("Cannot play {name}: {reason}. No track in the list could be "
+                                 "played.").format(name=name, reason=reason))
+            self.visualizer.timer.stop()
+            return
+        self.note.setText(tr("Cannot play {name}: {reason} – skipped.").format(name=name,
+                                                                               reason=reason))
+        # Not from inside the engine's signal: a list of broken files would
+        # recurse one level per file.
+        QTimer.singleShot(0, self._skip_failed)
+
+    def _skip_failed(self) -> None:
+        if self.engine.state != "stopped" or not self.engine.error:
+            return  # the user started something else meanwhile
+        item = self._next_item()
+        note = self.note.text()
+        if item is not None:
+            self.play_item(item)
+            self.note.setText(note)
+
+    # -- shuffle and repeat ------------------------------------------------------------------
+
+    def set_shuffle(self, on: bool) -> None:
+        self.shuffle = bool(on)
+        if self.shuffle_button.isChecked() != self.shuffle:
+            self.shuffle_button.setChecked(self.shuffle)
+        current = self._current if self._row_of(self._current) >= 0 else None
+        self._round = {id(current)} if current is not None else set()
+        self._history = [current] if current is not None else []
+        self._schedule_save()
+
+    def set_repeat(self, mode: str) -> None:
+        if mode not in REPEAT_MODES:
+            raise ValueError(f"repeat is one of {REPEAT_MODES}, not {mode!r}")
+        self.repeat = mode
+        self._update_repeat_button()
+        self._schedule_save()
+
+    def _cycle_repeat(self) -> None:
+        index = REPEAT_MODES.index(self.repeat)
+        self.set_repeat(REPEAT_MODES[(index + 1) % len(REPEAT_MODES)])
+
+    def _update_repeat_button(self) -> None:
+        self._set_control(self.repeat_button, "repeat-one" if self.repeat == "one" else "repeat")
+        self.repeat_button.setChecked(self.repeat != "off")
+        label = {"off": tr("off"), "all": tr("all"), "one": tr("one")}[self.repeat]
+        self.repeat_button.setToolTip(tr("Repeat: {mode} (click: off → all → one)")
+                                      .format(mode=label))
+
+    # -- seeking ---------------------------------------------------------------------------
+
+    def seek_to(self, ms: int) -> None:
+        if self.engine.loaded:
+            self.engine.seek(max(0, int(ms)))
+            self._refresh_time()
+
+    def seek_relative(self, delta_ms: int) -> None:
+        if self.engine.loaded:
+            self.seek_to(max(0, self.engine.position_ms() + int(delta_ms)))
+
+    def skip(self, delta_ms: int) -> None:
+        """The -15 s / +15 s buttons: from where the track is, never before its
+        start; past its end it ends as usual (a moment before the end, so
+        repeat, the next track and the sleep timer do what they always do)."""
+        if not self.engine.loaded:
+            return
+        target = max(0, self.engine.position_ms() + int(delta_ms))
+        duration = self._duration()
+        if delta_ms > 0 and duration > 0:
+            target = min(target, max(0, duration - SKIP_END_MARGIN_MS))
+        self.seek_to(target)
+
+    def _slider_action(self, action: int) -> None:
+        # Keyboard steps on the slider (Page Up/Down, Home, End); a drag
+        # seeks on release, a click through `jumped`.
+        moves = (QAbstractSlider.SliderAction.SliderNoAction.value,
+                 QAbstractSlider.SliderAction.SliderMove.value)
+        if action not in moves and not self.seek_slider.isSliderDown():
+            QTimer.singleShot(0, lambda: self.seek_to(self.seek_slider.sliderPosition()))
+
+    def _duration(self) -> int:
+        duration = 0
+        getter = getattr(self.engine, "duration_ms", None)
+        if getter is not None:
+            duration = int(getter() or 0)
+        return duration or int(self._track_ms or 0)
+
+    # -- volume ------------------------------------------------------------------------------
+
+    def set_muted(self, on: bool) -> None:
+        self.muted = bool(on)
+        if self.mute_button.isChecked() != self.muted:
+            self.mute_button.setChecked(self.muted)
+        self._set_control(self.mute_button, "volume-x" if self.muted else "volume")
+        self._apply_volume()
+        self._schedule_save()
+
+    def _apply_volume(self) -> None:
+        """The slider's level (perceptual), scaled by the master volume and
+        the Media Player's channel of the Audio Mixer (core.audio_route)."""
+        level = 0.0 if self.muted else perceptual_to_linear(self.volume.value() / 100)
+        self.engine.set_volume(level * audio_route.source_gain("media")
+                               * self._sleep_fade_factor())
+
+    def _audio_settings_saved(self, saved) -> None:
+        """Edit > Settings… > Audio saved: the volume at once, a new output
+        device for the running engine where it can move (else its next
+        playback takes it)."""
+        if self._gone():
+            return
+        self._apply_volume()
+        self._take_shared_eq()
+        if audio_route.source_output_id("media") != self._output_device:
+            self._output_device = audio_route.source_output_id("media")
+            reroute = getattr(self.engine, "reroute", None)
+            if callable(reroute):
+                try:
+                    reroute()
+                except Exception:  # noqa: BLE001 - the player goes on on the old device
+                    log.warning("Media Player: the output device could not be changed",
+                                exc_info=True)
+
+    # -- the sound menu: output, sleep timer, Audio Mixer --------------------------------------
+
+    #: The sleep timer's choices: minutes (0 off, -1 at the end of the track).
+    SLEEP_CHOICES = (0, 15, 30, 45, 60, 90, -1)
+    #: Seconds the music fades out before the sleep timer pauses it.
+    SLEEP_FADE_SECONDS = 8.0
+
+    def _fill_sound_menu(self) -> None:
+        menu = self.sound_menu
+        menu.clear()
+        output = menu.addMenu(tr("Output"))
+        self._fill_output_menu(output)
+        # A sleep timer for a player that cannot play would pause nothing.
+        if not self.no_sound_reason():
+            self._fill_sleep_menu(menu.addMenu(tr("Sleep Timer")))
+        if callable(self._open_mixer):
+            menu.addSeparator()
+            mixer = menu.addAction(tr("Audio Mixer…"))
+            mixer.setData(("mixer", None))
+            mixer.triggered.connect(lambda _c=False: self._open_mixer())
+
+    def _fill_sleep_menu(self, sleep: QMenu) -> None:
+        group = QActionGroup(sleep)
+        for minutes in self.SLEEP_CHOICES:
+            label = (tr("Off") if minutes == 0 else tr("At the End of the Track") if minutes < 0
+                     else tr("{n} minutes").format(n=minutes))
+            action = sleep.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(minutes == self.sleep_minutes)
+            action.setData(("sleep", minutes))
+            group.addAction(action)
+            action.triggered.connect(lambda _c=False, m=minutes: self.set_sleep_timer(m))
+
+    def no_sound_reason(self) -> str:
+        """Why the player cannot play ("" when it can, or may once the
+        audio check answers): its audio did not start, or the check
+        answered that Qt Multimedia does not work here."""
+        if self.audio_error:
+            return self.audio_reason or self.audio_error
+        if self._output_lister is not None or self.engine_ready:
+            return ""
+        from core import multimedia_probe as MPROBE
+
+        cached = MPROBE.cached()
+        if cached is not None and not cached.ok:
+            return cached.reason or tr("unknown error")
+        return ""
+
+    def _outputs(self) -> list[tuple[str, str]] | None:
+        """Qt's outputs, or None while the probe has not answered ok."""
+        if self._output_lister is not None:
+            return list(self._output_lister())
+        from core import multimedia_probe as MPROBE
+
+        cached = MPROBE.cached()
+        if cached is None or not cached.ok:
+            return None
+        from core.audio_route import qt_audio_outputs
+
+        return qt_audio_outputs()
+
+    def _fill_output_menu(self, menu: QMenu) -> None:
+        """Same as the output, then every device: the Media Player's channel
+        of the Audio Mixer (``media_output``)."""
+        reason = self.no_sound_reason()
+        if reason:
+            # Not "the devices are listed once the audio check answered": it
+            # did, and there is no sound to send anywhere.
+            note = menu.addAction(tr("No sound: {reason}").format(reason=reason))
+            note.setEnabled(False)
+            return
+        chosen = audio_route.settings().media_output
+        group = QActionGroup(menu)
+        try:
+            outputs = self._outputs()
+        except Exception:  # noqa: BLE001 - the menu says it instead
+            log.warning("Media Player: the outputs could not be listed", exc_info=True)
+            outputs = None
+        entries = [("", tr("Same as the output"))]
+        if outputs is None:
+            entries.append((None, tr("(the devices are listed once the audio check answered)")))
+        else:
+            entries += [(ident, desc or ident) for ident, desc in outputs]
+            if chosen and chosen not in {i for i, _d in outputs}:
+                entries.append((chosen, tr("{device} (not connected)").format(device=chosen)))
+        for ident, label in entries:
+            action = menu.addAction(label)
+            if ident is None:
+                action.setEnabled(False)
+                continue
+            action.setCheckable(True)
+            action.setChecked(ident == chosen)
+            action.setData(("output", ident))
+            group.addAction(action)
+            action.triggered.connect(lambda _c=False, i=ident: self.set_output(i))
+
+    def set_output(self, device_id: str) -> None:
+        """Play on *device_id* ("" - the output's): saved as the Media
+        Player's channel of the Audio Mixer; the engine moves at once where
+        it can (_audio_settings_saved)."""
+        try:
+            audio_route.update(media_output=device_id)
+        except (OSError, ValueError) as exc:
+            self.note.setText(tr("Could not save the output: {error}").format(error=exc))
+
+    def set_sleep_timer(self, minutes: int) -> None:
+        """Pause after *minutes* (fading out over the last seconds), at the
+        end of the track for -1, never for 0."""
+        self._end_sleep_fade()
+        self.sleep_minutes = int(minutes)
+        if minutes > 0:
+            self._sleep_deadline = time.monotonic() + minutes * 60
+            self._sleep_timer.start()
+        else:
+            self._sleep_timer.stop()
+        self._show_sleep()
+
+    def _show_sleep(self) -> None:
+        if self.sleep_minutes == 0:
+            self.sleep_label.setVisible(False)
+            return
+        if self.sleep_minutes < 0:
+            text = tr("Sleep: end of track")
+        else:
+            left = max(0, int(self._sleep_deadline - time.monotonic() + 59) // 60)
+            text = tr("Sleep: {n} min").format(n=left)
+        self.sleep_label.setText(text)
+        self.sleep_label.setVisible(True)
+
+    def _sleep_tick(self) -> None:
+        if self._gone() or self.sleep_minutes <= 0:
+            self._sleep_timer.stop()
+            return
+        left = self._sleep_deadline - time.monotonic()
+        if left <= 0:
+            self._sleep_now()
+            return
+        if left <= self.SLEEP_FADE_SECONDS:
+            self._sleep_fading = True
+            self._sleep_timer.setInterval(200)
+            self._apply_volume()
+        self._show_sleep()
+
+    def _sleep_fade_factor(self) -> float:
+        if not self._sleep_fading or self.sleep_minutes <= 0:
+            return 1.0
+        left = self._sleep_deadline - time.monotonic()
+        return max(0.0, min(1.0, left / self.SLEEP_FADE_SECONDS))
+
+    def _sleep_now(self) -> None:
+        """The timer is up: pause, the volume back as it was, the timer off."""
+        if getattr(self.engine, "state", "") == "playing":
+            self.toggle_play()
+        self.sleep_minutes = 0
+        self._sleep_timer.stop()
+        self._end_sleep_fade()
+        self._show_sleep()
+        self.note.setText(tr("The sleep timer paused the music."))
+
+    def _end_sleep_fade(self) -> None:
+        self._sleep_timer.setInterval(1000)
+        if self._sleep_fading:
+            self._sleep_fading = False
+            self._apply_volume()
+
+    def step_volume(self, steps: int) -> None:
+        self.volume.setValue(self.volume.value() + steps * VOLUME_STEP)
+
+    # -- keyboard (while the panel has the focus) --------------------------------------------
+
+    _ARROWS = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
+               Qt.Key.Key_PageUp, Qt.Key.Key_PageDown, Qt.Key.Key_Home, Qt.Key.Key_End)
+
+    def _key_action(self, widget, event):
+        """What a key pressed in *widget* (this panel or a child) does, or
+        None to leave it to the widget. Caught as ShortcutOverride too, so
+        the panel's keys win over the main window's shortcuts while it has
+        the focus - and only then."""
+        key = event.key()  # an int; Qt.Key is an IntEnum
+        mods = event.modifiers() & (Qt.KeyboardModifier.ShiftModifier
+                                    | Qt.KeyboardModifier.ControlModifier
+                                    | Qt.KeyboardModifier.AltModifier
+                                    | Qt.KeyboardModifier.MetaModifier)
+        none = mods == Qt.KeyboardModifier.NoModifier
+        shift = mods == Qt.KeyboardModifier.ShiftModifier
+        ctrl = mods == Qt.KeyboardModifier.ControlModifier
+        if isinstance(widget, QComboBox):
+            return None
+        if isinstance(widget, QSlider) and widget is not self.seek_slider \
+                and key in self._ARROWS and not ctrl:
+            return None
+        if isinstance(widget, QAbstractButton) and key in (
+                Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            return None
+        if key == Qt.Key.Key_Space and none:
+            return self.toggle_play
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and none:
+            return self.play_selected
+        if key == Qt.Key.Key_Delete and none:
+            return self._remove_selected
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            sign = 1 if key == Qt.Key.Key_Right else -1
+            if none:
+                return lambda: self.seek_relative(sign * SEEK_STEP_MS)
+            if shift:
+                return lambda: self.seek_relative(sign * SEEK_BIG_STEP_MS)
+            if ctrl:
+                return self.next_track if sign > 0 else self.previous_track
+            return None
+        if key == Qt.Key.Key_M and none:
+            return lambda: self.set_muted(not self.muted)
+        if key == Qt.Key.Key_Plus and (none or shift):
+            return lambda: self.step_volume(1)
+        if key == Qt.Key.Key_Minus and none:
+            return lambda: self.step_volume(-1)
+        return None
+
+    def _owns(self, widget) -> bool:
+        """*widget* is this panel, inside it, or inside the visualizer's
+        own window (isAncestorOf stops at a window's edge)."""
+        if widget is self or self.isAncestorOf(widget):
+            return True
+        window = getattr(self, "visual_window", None)
+        return window is not None and not sip.isdeleted(window) and (
+            widget is window or window.isAncestorOf(widget))
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt
+        kind = event.type()
+        if kind not in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
+            return False
+        if not isinstance(obj, QWidget) or not self._owns(obj):
+            return False
+        action = self._key_action(obj, event)
+        if action is None:
+            return False
+        event.accept()
+        if kind == QEvent.Type.KeyPress:
+            action()
+        return True
+
+    # -- equalizer ---------------------------------------------------------------------
+
+    def apply_preset(self, name: str) -> None:
+        gains = PRESETS.get(name)
+        if gains is None:
+            return
+        self._setting = True
+        for slider, gain in zip(self.sliders, gains):
+            slider.setValue(round(gain))
+        self._setting = False
+        self.engine.set_gains(list(gains))
+        self._share_eq()
+
+    def _sliders_moved(self) -> None:
+        if getattr(self, "_setting", False):
+            return
+        gains = [float(s.value()) for s in self.sliders]
+        self.engine.set_gains(gains)
+        from core.audio_eq import preset_of
+
+        name = preset_of(gains)
+        self._setting = True
+        if self.preset.findText(name) < 0:
+            self.preset.addItem(name)
+        self.preset.setCurrentText(name)
+        self._setting = False
+        self._share_eq()
+
+    # -- the equalizer is axross's one (core.audio_eq): shared with the Audio Mixer --
+
+    def _share_eq(self) -> None:
+        """The row changed: saved as axross's equalizer (soon - a slider
+        drag is many changes), which the Audio Mixer and the voice follow."""
+        if getattr(self, "_setting", False) or getattr(self, "_taking_eq", False):
+            return
+        timer = getattr(self, "_eq_share_timer", None)
+        if timer is None:
+            timer = self._eq_share_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(250)
+            timer.timeout.connect(self._save_shared_eq)
+        timer.start()
+
+    def _flush_shared_eq(self) -> None:
+        """A change still waiting for _share_eq's timer is saved now (the
+        panel closes, the extension unloads). Left to the timer, it was lost
+        after shutdown() (_gone) - and a closed panel's timer saved and
+        published it at any later time, re-tuning whatever played then (a
+        restored track's first sample measured 6% high,
+        tests/test_media_player_eq_share_on_close.py)."""
+        timer = getattr(self, "_eq_share_timer", None)
+        if timer is not None and not sip.isdeleted(timer) and timer.isActive():
+            timer.stop()
+            self._save_shared_eq()
+
+    def _save_shared_eq(self) -> None:
+        if self._gone():
+            return
+        try:
+            audio_route.update(eq_enabled=self.eq_check.isChecked(),
+                               eq_preset=self.preset.currentText(),
+                               eq_gains=[float(s.value()) for s in self.sliders])
+        except (OSError, ValueError):
+            log.warning("Media Player: the equalizer could not be saved", exc_info=True)
+
+    def _take_shared_eq(self) -> None:
+        """axross's equalizer (at the start, and when the Audio Mixer
+        changed it) shown in the row and applied to the engine."""
+        saved = audio_route.settings()
+        gains = [float(g) for g in saved.eq_gains]
+        if [float(s.value()) for s in self.sliders] == [float(round(g)) for g in gains] and \
+                self.eq_check.isChecked() == saved.eq_enabled and \
+                self.preset.currentText() == saved.eq_preset:
+            return
+        self._taking_eq = True
+        self._setting = True
+        try:
+            for slider, gain in zip(self.sliders, gains):
+                slider.setValue(round(gain))
+            if self.preset.findText(saved.eq_preset) < 0:
+                self.preset.addItem(saved.eq_preset)
+            self.preset.setCurrentText(saved.eq_preset)
+            self.eq_check.setChecked(saved.eq_enabled)
+        finally:
+            self._setting = False
+            self._taking_eq = False
+        set_gains = getattr(self.engine, "set_gains", None)  # an engine without an equalizer
+        if callable(set_gains):
+            set_gains(gains)
+        if isinstance(self.engine, EqEngine):
+            self.engine.set_eq_enabled(saved.eq_enabled)
+
+    def set_equalizer_open(self, open_: bool) -> None:
+        """Show the band sliders or fold them away; the header row (the
+        fold button, on/off, the preset) stays, and so do the gains."""
+        open_ = bool(open_)
+        self._eq_open = open_
+        self.eq_body.setVisible(open_)
+        if self.eq_toggle.isChecked() != open_:
+            self.eq_toggle.blockSignals(True)
+            self.eq_toggle.setChecked(open_)
+            self.eq_toggle.blockSignals(False)
+        self.eq_toggle.setArrowType(Qt.ArrowType.DownArrow if open_ else Qt.ArrowType.RightArrow)
+        self._schedule_save()
+
+    def _eq_toggled(self, on: bool) -> None:
+        if isinstance(self.engine, EqEngine):
+            self.engine.set_eq_enabled(on)
+        for slider in self.sliders:
+            slider.setEnabled(on)
+        self._share_eq()
+
+    # -- the playlist folds --------------------------------------------------------------
+
+    def set_playlist_open(self, open_: bool) -> None:
+        """Show the playlist and its buttons or fold them away: the panel is
+        then the controls and the visualizer, which gets the room. Keys and
+        drops onto the panel keep working."""
+        open_ = bool(open_)
+        focus = self.focusWidget()
+        self._playlist_open = open_
+        self.playlist.setVisible(open_)
+        self.playlist_buttons.setVisible(open_)
+        if self.playlist_toggle.isChecked() != open_:
+            self.playlist_toggle.blockSignals(True)
+            self.playlist_toggle.setChecked(open_)
+            self.playlist_toggle.blockSignals(False)
+        self.playlist_toggle.setArrowType(Qt.ArrowType.DownArrow if open_
+                                          else Qt.ArrowType.RightArrow)
+        layout = self.layout()
+        layout.setStretchFactor(self.visual_box, 0 if open_ else 1)
+        if not open_ and focus is not None and (
+                focus is self.playlist or self.playlist.isAncestorOf(focus)
+                or self.playlist_buttons.isAncestorOf(focus)):
+            self.setFocus()  # the keys stay with the player
+        self._schedule_save()
+
+    # -- drops onto the panel --------------------------------------------------------------
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt
+        if PlaylistWidget.accepts(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt
+        mime = event.mimeData()
+        if not PlaylistWidget.accepts(mime):
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        self._on_drop(mime)
+
+    # -- the visualizer: its menu, its window, fullscreen ------------------------------------
+
+    @property
+    def is_fullscreen(self) -> bool:
+        return self.visual_window is not None and self._fullscreen
+
+    @property
+    def is_detached(self) -> bool:
+        return self.visual_window is not None
+
+    def _visualizer_menu(self, menu) -> None:
+        """The panel's entries in the visualizer's right-click menu."""
+        menu.addSeparator()
+        fullscreen = menu.addAction(tr("Fullscreen") + "\tF11")
+        fullscreen.setCheckable(True)
+        fullscreen.setChecked(self.is_fullscreen)
+        fullscreen.setData(("window", "fullscreen"))
+        fullscreen.setEnabled(self.is_fullscreen or (self.isVisible() and not self._shut_down))
+        fullscreen.triggered.connect(lambda checked: self.set_fullscreen(checked))
+        if self.is_detached and not self.is_fullscreen:
+            attach = menu.addAction(tr("Attach to the Panel"))
+            attach.setData(("window", "attach"))
+            attach.triggered.connect(lambda _checked=False: self.attach_visualizer())
+        elif not self.is_detached:
+            detach = menu.addAction(tr("Detach into a Window"))
+            detach.setData(("window", "detach"))
+            detach.triggered.connect(lambda _checked=False: self.detach_visualizer())
+        playlist = menu.addAction(tr("Show Playlist"))
+        playlist.setCheckable(True)
+        playlist.setChecked(self._playlist_open)
+        playlist.setData(("playlist", "open"))
+        playlist.triggered.connect(lambda checked: self.set_playlist_open(checked))
+        menu.addSeparator()
+        settings = menu.addAction(tr("Visualizer Settings…"))
+        settings.setData(("settings", "open"))
+        settings.triggered.connect(lambda _checked=False: self.open_visual_settings())
+
+    def open_visual_settings(self) -> None:
+        """The visualizer settings dialog (one; raised when it is open)."""
+        if self._gone():
+            return
+        dialog = self.visual_settings
+        if dialog is None or sip.isdeleted(dialog):
+            dialog = VisualizerSettingsDialog(self.visualizer, self)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.finished.connect(lambda _result: setattr(self, "visual_settings", None))
+            self.visual_settings = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _take_visualizer_out(self) -> VisualizerWindow:
+        window = VisualizerWindow(self)
+        window.closed.connect(self.attach_visualizer)
+        window.installEventFilter(self)  # the player's keys work there too
+        self.visual_box.layout().removeWidget(self.visualizer)
+        window.layout().addWidget(self.visualizer)
+        self.visualizer.show()
+        self.visual_placeholder.setVisible(True)
+        self.visual_window = window
+        return window
+
+    def detach_visualizer(self) -> None:
+        """The visualizer into a resizable window of its own: the same
+        widget moves (nothing renders twice) and keeps playing."""
+        if self._gone():
+            return
+        window = self.visual_window
+        if window is None:
+            window = self._take_visualizer_out()
+            window.resize(max(480, self.visualizer.width()), max(270, self.visualizer.height()))
+        elif self._fullscreen:
+            self._fullscreen = self._fullscreen_from_panel = False
+            self.visualizer.fullscreen = False
+            self.visualizer.set_cursor_autohide(False)
+            window.showNormal()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def attach_visualizer(self) -> None:
+        """The visualizer back into the panel; its window goes."""
+        window = self.visual_window
+        if window is None:
+            return
+        self.visual_window = None
+        self._fullscreen = self._fullscreen_from_panel = False
+        vis = self.visualizer
+        vis.fullscreen = False
+        vis.set_cursor_autohide(False)
+        if not sip.isdeleted(window):
+            window.layout().removeWidget(vis)
+        self.visual_box.layout().insertWidget(0, vis, 1)
+        vis.show()
+        self.visual_placeholder.setVisible(False)
+        if not sip.isdeleted(window):
+            window.removeEventFilter(self)
+            window.closing_quietly = True
+            window.close()
+            window.deleteLater()
+
+    def set_fullscreen(self, on: bool) -> bool:
+        """The visualizer alone on the panel's screen (*on*) or back where
+        it was - the panel, or its own window. Refused (False) while the
+        panel is hidden or switched off: nothing may take the screen then."""
+        if not on:
+            if self._fullscreen:
+                vis = self.visualizer
+                vis.fullscreen = False
+                vis.set_cursor_autohide(False)
+                self._fullscreen = False
+                if self._fullscreen_from_panel or self.visual_window is None:
+                    self.attach_visualizer()
+                else:
+                    self.visual_window.showNormal()
+                    vis.setFocus()
+            return True
+        if self._gone() or not self.isVisible():
+            return False
+        if self._fullscreen:
+            return True
+        from_panel = self.visual_window is None
+        window = self.visual_window or self._take_visualizer_out()
+        screen = self.screen()
+        if screen is not None:
+            window.move(screen.geometry().topLeft())  # fullscreen on the panel's screen
+        self._fullscreen = True
+        self._fullscreen_from_panel = from_panel
+        vis = self.visualizer
+        vis.fullscreen = True
+        window.showFullScreen()
+        window.raise_()
+        window.activateWindow()
+        vis.setFocus()
+        vis.set_cursor_autohide(True)
+        return True
+
+    def toggle_fullscreen(self) -> bool:
+        return self.set_fullscreen(not self.is_fullscreen)
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt
+        super().hideEvent(event)
+        if self._fullscreen:
+            # Closed (not just moved to another workspace, which shows it
+            # again at once): the screen is given back.
+            QTimer.singleShot(0, self._hidden_while_fullscreen)
+
+    def _hidden_while_fullscreen(self) -> None:
+        if not sip.isdeleted(self) and self._fullscreen and not self.isVisible():
+            self.set_fullscreen(False)
+
+    # -- now playing -----------------------------------------------------------------------
+
+    def _read_tags(self, path: str) -> None:
+        """Title, artist, album, length and cover from Qt's metadata reader
+        (a QMediaPlayer: not before the engine is there - _attach_engine
+        reads them then)."""
+        self.now_playing.setText(default_title(path))
+        self.cover.clear()
+        if not self.engine_ready or is_stream(path):
+            return  # a stream is not opened a second time just for its tags
+        try:
+            from PyQt6.QtMultimedia import QMediaMetaData, QMediaPlayer
+        except ImportError:  # pragma: no cover
+            return
+        reader = QMediaPlayer(self)
+        prime_notify_lookups(reader)
+
+        def loaded(status, r=reader) -> None:
+            if status not in (QMediaPlayer.MediaStatus.LoadedMedia,
+                              QMediaPlayer.MediaStatus.InvalidMedia):
+                return
+            r.mediaStatusChanged.disconnect()
+            if self.engine.path != path:
+                r.deleteLater()
+                return  # the track changed meanwhile
+            meta = r.metaData()
+            title = meta.stringValue(QMediaMetaData.Key.Title) or default_title(path)
+            artist = meta.stringValue(QMediaMetaData.Key.ContributingArtist) or meta.stringValue(
+                QMediaMetaData.Key.AlbumArtist)
+            album = meta.stringValue(QMediaMetaData.Key.AlbumTitle)
+            self._track_ms = max(0, int(r.duration()))
+            if self._track_ms and self._row_of(self._current) >= 0 \
+                    and self._current.data(_PATH_ROLE) == path:
+                self._current.setData(_DURATION_ROLE, self._track_ms // 1000)
+            text = " — ".join(t for t in (title, artist, album) if t)
+            if not self.engine.error:
+                self.now_playing.setText(text)
+            if self._current is not None and self._row_of(self._current) >= 0 \
+                    and self._current.data(_PATH_ROLE) == path:
+                self._set_title(text)
+            for key in (QMediaMetaData.Key.CoverArtImage, QMediaMetaData.Key.ThumbnailImage):
+                image = meta.value(key)
+                if image is not None and hasattr(image, "isNull") and not image.isNull():
+                    self.cover.setPixmap(QPixmap.fromImage(image).scaled(
+                        72, 72, Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation))
+                    break
+            r.deleteLater()
+
+        reader.mediaStatusChanged.connect(loaded)
+        reader.setSource(QUrl.fromLocalFile(path))
+
+    def _refresh(self) -> None:
+        self._set_control(self.play_button, "pause" if self.engine.state == "playing" else "play")
+        if self.engine.state != getattr(self, "_shown_state", None):
+            self._shown_state = self.engine.state
+            if self.engine.state != "playing":
+                self._schedule_save()  # paused or stopped: keep the position
+        if self.engine.error:
+            self.now_playing.setText(tr("Cannot play: {reason}").format(reason=self.engine.error))
+
+    def _refresh_time(self) -> None:
+        duration = self._duration()
+        slider = self.seek_slider
+        slider.setEnabled(bool(self.engine.loaded) and duration > 0)
+        if slider.maximum() != duration:
+            slider.blockSignals(True)
+            slider.setRange(0, duration)
+            slider.blockSignals(False)
+        if slider.isSliderDown():
+            shown = slider.sliderPosition()  # where the drag would go
+        else:
+            shown = self.engine.position_ms() if self.engine.loaded else 0
+            slider.blockSignals(True)
+            slider.setValue(min(shown, duration))
+            slider.blockSignals(False)
+            if shown > 0 and self.engine.state == "playing":
+                self._fail_streak = 0
+        self.time_label.setText(f"{format_time(shown)} / {format_time(duration)}")
+        if self._state_path and self.engine.state == "playing" \
+                and time.monotonic() - self._last_save > _SAVE_EVERY_SECONDS:
+            self.save_state()
+
+    # -- the saved state ------------------------------------------------------------------
+
+    def _schedule_save(self, *_args) -> None:
+        if self._state_path:
+            self._save_timer.start()
+
+    def _state(self) -> dict:
+        # While the restore still checks its tracks (one on a hung mount
+        # never answers), they are saved as the file had them, ahead of
+        # what was added since: before, nothing was saved for the session.
+        pending = self._restore_pending if self._restoring else None
+        tracks: list[dict] = list(pending["tracks"]) if pending else []
+        current = -1
+        for item in self._items():
+            path = item.data(_PATH_ROLE)
+            if _is_temp_copy(path) or len(tracks) >= MAX_PLAYLIST_ENTRIES:
+                continue  # a remote track's copy goes with the extension
+            if item is self._current:
+                current = len(tracks)
+            title = item.text() if item.text() != default_title(path) else ""
+            tracks.append({"path": path, "title": title,
+                           "duration": int(item.data(_DURATION_ROLE) or 0)})
+        position = 0
+        if current >= 0 and self.engine.loaded \
+                and self.engine.path == self._current.data(_PATH_ROLE):
+            position = int(self.engine.position_ms())
+        elif current < 0 and pending and pending["current"] >= 0:
+            current, position = pending["current"], pending["position_ms"]
+        return {"version": STATE_VERSION, "volume": self.volume.value(), "muted": self.muted,
+                "shuffle": self.shuffle, "repeat": self.repeat, "tracks": tracks,
+                "current": current, "position_ms": position,
+                "visualizer": self.visualizer.mode, "equalizer_open": self._eq_open,
+                "visual_scheme": self.visualizer.scheme,
+                "visual_custom": dict(self.visualizer.custom_colours),
+                "visual_options": {**self.visualizer.options,
+                                   "hide_cursor": self.visualizer.hide_cursor},
+                "playlist_open": self._playlist_open}
+
+    def save_state(self) -> None:
+        """Write the playlist, the current track and position, volume, mute,
+        shuffle, repeat, the visualization with its colours and options, and
+        whether the equalizer and the playlist are open to the private
+        state file."""
+        self._save_timer.stop()
+        if not self._state_path:
+            return
+        self._last_save = time.monotonic()
+        try:
+            write_state(self._state_path, self._state(), keep_old=self._state_unreadable)
+            self._state_unreadable = False
+        except (OSError, ValueError) as exc:
+            # A timer slot: nothing may escape (PyQt6 aborts on it).
+            self.note.setText(tr("Cannot save the player state: {error}").format(error=exc))
+
+    def restore_state(self) -> None:
+        """The last playlist, track (loaded at its position, not playing),
+        volume, mute, shuffle, repeat, visualization and the equalizer open
+        or folded; tracks that are gone are left out,
+        nonsense values are ignored. Whether the tracks still exist is
+        checked off the GUI thread (a stale network mount must not hang the
+        start); until then nothing is saved over the file."""
+        state, usable = read_state(self._state_path)
+        self._state_unreadable = not usable
+        if not state:
+            return
+        self._restoring = True
+        volume = state.get("volume")
+        if isinstance(volume, int) and not isinstance(volume, bool):
+            self.volume.setValue(max(0, min(100, volume)))
+        self.set_muted(state.get("muted") is True)
+        self.set_shuffle(state.get("shuffle") is True)
+        repeat = state.get("repeat")
+        self.set_repeat(repeat if repeat in REPEAT_MODES else "off")
+        visual = state.get("visualizer")
+        if isinstance(visual, str) and visual in Visualizer.MODES:
+            self.visualizer.set_mode(visual, announce=False)
+        self.set_equalizer_open(state.get("equalizer_open") is not False)
+        self._restore_visual_settings(state)
+        self.set_playlist_open(state.get("playlist_open") is not False)
+        tracks = state.get("tracks")
+        wanted = []
+        kept = []  # as the file has them: saved so while the check runs
+        for index, track in enumerate(tracks[:MAX_PLAYLIST_ENTRIES]
+                                      if isinstance(tracks, list) else []):
+            path = track.get("path") if isinstance(track, dict) else None
+            if not isinstance(path, str) or not path.isprintable():
+                continue
+            title = track.get("title")
+            duration = track.get("duration")
+            wanted.append((index, path, _clean_text(title) if isinstance(title, str) else "",
+                           duration if isinstance(duration, int) and duration > 0 else 0))
+            kept.append({key: track[key] for key in ("path", "title", "duration")
+                         if key in track})
+        current = state.get("current")
+        position = state.get("position_ms")
+        self._restore_pending = {
+            "tracks": kept,
+            "current": next((n for n, entry in enumerate(wanted) if entry[0] == current), -1),
+            "position_ms": position if isinstance(position, int) and position > 0 else 0,
+        }
+
+        def work():
+            return [entry for entry in wanted if is_stream(entry[1]) or _is_track(entry[1])]
+
+        def done(found) -> None:
+            try:
+                items = {index: self._append(path, title, duration)
+                         for index, path, title, duration in found}
+                item = items.get(current) if isinstance(current, int) else None
+                if item is not None and self._current is None:
+                    self._set_current(item)
+                    self._history = [item]
+                    self._round = {id(item)}
+                    path = item.data(_PATH_ROLE)
+                    self.engine.load(path)
+                    if isinstance(position, int) and position > 0:
+                        self.engine.seek(position)
+                    self._read_tags(path)
+            finally:
+                self._restoring = False
+
+        def failed(_exc) -> None:
+            self._restoring = False
+
+        self._background(work, done, failed)
+
+    def _restore_visual_settings(self, state: dict) -> None:
+        """The colour scheme, custom colours and options; a broken value
+        leaves its default, a number out of range is clamped."""
+        vis = self.visualizer
+        vis.set_custom_colours(state.get("visual_custom"))
+        scheme = state.get("visual_scheme")
+        if isinstance(scheme, str) and scheme in SCHEME_NAMES:
+            vis.set_scheme(scheme)
+        options = state.get("visual_options")
+        if isinstance(options, dict):
+            for name in VISUAL_OPTIONS:
+                if name in options:
+                    vis.set_option(name, options[name])
+            if isinstance(options.get("hide_cursor"), bool):
+                vis.set_hide_cursor(options["hide_cursor"])
+
+    def shutdown(self) -> None:
+        """The extension unloads (or the window closes): save, then stop."""
+        self._flush_shared_eq()  # before _shut_down: _save_shared_eq saves nothing after it
+        self._shut_down = True  # a probe answering later builds no engine
+        self.attach_visualizer()  # its window and the screen go with the extension
+        self._close_visual_settings()
+        try:
+            self.save_state()
+        finally:
+            # A failed save must not leave the music playing.
+            self._state_path = None  # nothing after this writes
+            self._clock.stop()
+            self.engine.stop()
+            self._release_doomed()
+            close = getattr(self.engine, "close", None)
+            if callable(close):
+                close()  # the equalizer engine frees its decoder and sound card
+            self.visualizer.timer.stop()
+
+    # -- control icons ----------------------------------------------------------------------
+
+    def _control_colour(self) -> str:
+        return self.palette().color(QPalette.ColorRole.ButtonText).name()
+
+    def _set_control(self, button, name: str) -> None:
+        """Show control icon *name* on *button* in the theme's button text
+        colour; nothing is redrawn when icon and colour are unchanged."""
+        colour = self._control_colour()
+        if button.property("control") == name and button.property("control-colour") == colour:
+            return
+        button.setIcon(control_icon(name, colour))
+        button.setIconSize(QSize(CONTROL_ICON_SIZE, CONTROL_ICON_SIZE))
+        button.setProperty("control", name)
+        button.setProperty("control-colour", colour)
+
+    def _update_control_icons(self) -> None:
+        self._set_control(self.prev_button, "previous")
+        self._set_control(self.play_button,
+                          "pause" if getattr(self.engine, "state", "") == "playing" else "play")
+        self._set_control(self.stop_button, "stop")
+        self._set_control(self.next_button, "next")
+        self._set_control(self.back15_button, "back15")
+        self._set_control(self.forward15_button, "forward15")
+        self._set_control(self.shuffle_button, "shuffle")
+        self._set_control(self.repeat_button,
+                          "repeat-one" if self.repeat == "one" else "repeat")
+        self._set_control(self.mute_button, "volume-x" if self.muted else "volume")
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange) \
+                and hasattr(self, "mute_button"):
+            self._update_control_icons()
+
+    def _close_visual_settings(self) -> None:
+        dialog = self.visual_settings
+        self.visual_settings = None
+        if dialog is not None and not sip.isdeleted(dialog):
+            dialog.close()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt
+        self.attach_visualizer()
+        self._close_visual_settings()
+        self._flush_shared_eq()
+        if self._state_path:
+            self.save_state()
+        self.engine.stop()
+        self.visualizer.timer.stop()
+        super().closeEvent(event)
+
+
+#: The panels activate() made, for deactivate().
+_PANELS: list = []
+
+
+def deactivate(api):
+    while _PANELS:
+        panel = _PANELS.pop()
+        try:
+            panel.shutdown()  # saves the playlist and position
+        except RuntimeError:  # pragma: no cover - the widget is gone already
+            pass
+    while _TEMP_FOLDERS:
+        shutil.rmtree(_TEMP_FOLDERS.pop(), ignore_errors=True)
+    # The audio, decoder and equalizer threads belong to this copy of the
+    # module: switched off or reloaded, they kept running (three more per
+    # cycle), with an exit hook each. A thread that does not end keeps its
+    # hooks: they hold this copy (and the running QThread) until the exit.
+    if end_media_threads():
+        _unregister_exit_handlers()
+
+
+def _mixer_opener(window):
+    """Opens the Audio Mixer extension's panel (offering to switch it on)."""
+    toggle = getattr(window, "_toggle_extension_tool", None)
+    if not callable(toggle):
+        return None
+    return lambda: toggle("bundled:audio_mixer", "Audio Mixer")
+
+
+def activate(api):
+    # Copies of remote tracks an earlier axross left when it ended without
+    # unloading the extension (a crash, a kill): off the GUI thread, the
+    # temporary folder may be large.
+    api.run_in_background(sweep_stale_temp_folders, on_done=lambda _removed: None,
+                          on_error=lambda exc: log.debug("temporary folder sweep: %s", exc))
+    window = getattr(api, "window", None)
+    open_settings = getattr(window, "open_settings", None)
+    panel = PlayerPanel(state_path=str(state_file()),
+                        run_in_background=lambda work, done, error: api.run_in_background(
+                            work, on_done=done, on_error=error),
+                        open_audio_settings=(lambda: open_settings("audio"))
+                        if callable(open_settings) else None,
+                        open_mixer=_mixer_opener(window))
+    panel.drop_resolver = getattr(api, "drop_context", None)
+    panel.engine_failed.connect(api.notify)
+    if panel.audio_error:  # a host that answered at once
+        api.notify(panel.audio_error)
+    _PANELS.append(panel)
+    dock = api.add_dock(tr("Media Player"), panel, icon="media-player")
+    bar = dock.titleBarWidget() if dock is not None else None
+
+    def show_track(title: str) -> None:
+        if bar is None:
+            return
+        if hasattr(bar, "set_title"):
+            bar.set_title(f"{tr('Media Player')} — {title}" if title else tr("Media Player"))
+        bar.setToolTip(plain_tooltip(title))
+
+    panel.track_changed.connect(show_track)
+    add_menu_action = getattr(api, "add_menu_action", None)
+    if callable(add_menu_action):
+        add_menu_action("Media Player Visualizer…", panel.open_visual_settings, icon="audio-settings")
+
+    def play(ctx) -> None:
+        """Add the selection and play the first of it: local files at once,
+        remote ones copied one by one to a bounded temporary folder off the
+        GUI thread - the first plays once it is copied (add_remote)."""
+        paths = list(ctx.paths)
+        if ctx.is_local:
+            first = panel.add_collected(*collect_local(paths))
+            if first is not None:
+                panel.play_item(first)
+            return
+        panel.add_remote(ctx.backend, paths, play_first=True,
+                         failed=lambda exc: api.notify(f"Cannot play: {exc}"))
+
+    api.add_context_action("Play in Media Player", play, applies_to="files", extensions=AUDIO_SUFFIXES,
+                           icon="media-player")

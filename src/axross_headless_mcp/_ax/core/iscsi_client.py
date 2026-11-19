@@ -1,0 +1,1320 @@
+"""iSCSI connect+mount wrapper backend implementing the FileBackend protocol.
+
+Uses the iscsiadm CLI (open-iscsi) to discover, log in to, and optionally mount
+an iSCSI target.  Once the target filesystem is mounted, all file operations
+delegate to standard local-filesystem calls (os, shutil, open).
+
+No extra Python packages required -- only the system tools:
+  iscsiadm, mount, umount, blkid, lsblk
+"""
+
+from __future__ import annotations
+
+import errno
+import glob
+import logging
+import os
+import re
+import secrets
+import shutil
+import stat as stat_module
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import IO
+
+from core import posix_compat, removal_cancel
+from core.backend import SessionLifecycle
+from core.local_fs import (
+    LocalFS,
+    copy_file_onto,
+    entry_stat,
+    group_name,
+    owner_name,
+    unstattable_item,
+)
+from core.path_policy import (
+    confined_path,
+    refuse_folder_path,
+    refuse_root_removal,
+    refuse_slash_on_file,
+)
+from core.private_mount_dir import make_private_mount_point, remove_private_mount_point
+from core.subprocess_env import clean_child_env
+from models.file_item import FileItem
+from security.protocol_line_split import split_lf_only_stream
+
+log = logging.getLogger(__name__)
+
+_DEVICE_POLL_INTERVAL = 0.5  # seconds
+_DEVICE_POLL_TIMEOUT = 30.0  # seconds
+_PRIVILEGED_CMD_TIMEOUT = 30.0  # seconds
+#: The kernel's iSCSI sessions (open-iscsi): <session>/targetname, /state.
+_ISCSI_SESSIONS = "/sys/class/iscsi_session"
+_PROC_MOUNTS = "/proc/mounts"
+
+# Allowlist for the iqn/ip values that get interpolated into a shell
+# glob when resolving the node-config file path. iqn grammar per
+# RFC 3721 is a superset of what we accept here, but every character
+# in this set is safe inside a shell glob AND matches every iqn we've
+# ever encountered; anything outside this set falls through to the
+# argv-based CHAP flow so we never feed shell metacharacters to sudo.
+_IQN_SAFE = re.compile(r"^[a-zA-Z0-9.:_\-]+$")
+_IP_SAFE = re.compile(r"^[0-9a-fA-F.:]+$")
+
+#: RFC 3720: an iSCSI name is at most 223 bytes.
+_INITIATOR_NAME_MAX = 223
+
+
+def validate_initiator_name(name: str) -> str:
+    """The initiator name (IQN) a profile sends instead of the system's
+    ``/etc/iscsi/initiatorname.iscsi``. Freely chosen - ``iqn.``, ``eui.``,
+    ``naa.`` or anything else the target accepts - but one token of
+    printable ASCII: open-iscsi keeps it in a ``key = value`` record, where
+    a space, ``#`` or line break would end or comment out the value."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    if len(name.encode()) > _INITIATOR_NAME_MAX:
+        raise ValueError(f"iSCSI initiator name is longer than {_INITIATOR_NAME_MAX} bytes")
+    bad = sorted({c for c in name if not ("!" <= c <= "~") or c == "#"})
+    if bad:
+        raise ValueError(f"iSCSI initiator name {name!r} contains {''.join(bad)!r}: "
+                         "printable ASCII without spaces or '#' only")
+    return name
+
+
+def validate_interface(name: str) -> str:
+    """A network interface the iSCSI connection is bound to (Linux names:
+    1-15 bytes, no '/', no whitespace, not '.' or '..')."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    if (len(name.encode()) > 15 or name in (".", "..") or "/" in name or "#" in name
+            or any(not ("!" <= c <= "~") for c in name)):
+        raise ValueError(f"{name!r} is not a network interface name")
+    return name
+
+
+def _make_parent(parent: str, path: str) -> None:
+    """The folders above *path* (mapped to *parent*), made as needed. One
+    of them a file is NotADirectoryError, as open(2) says - makedirs
+    called it a FileExistsError."""
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except FileExistsError as exc:
+        raise NotADirectoryError(
+            errno.ENOTDIR, f"Cannot write {path}: a folder on its way is a file", path
+        ) from exc
+
+
+class IscsiSession(SessionLifecycle):
+    """iSCSI block-storage backend implementing the FileBackend protocol.
+
+    Workflow:
+        1. ``iscsiadm`` discovers and logs in to the remote target.
+        2. The kernel exposes a block device (``/dev/sdX``).
+        3. (optionally) the block device is mounted to a local directory.
+        4. All file operations go through the mounted path.
+    """
+
+    def __init__(
+        self,
+        target_ip: str,
+        target_iqn: str,
+        port: int = 3260,
+        username: str = "",
+        password: str = "",
+        mount_point: str = "",
+        auto_mount: bool = True,
+        proxy_type: str = "none",
+        proxy_host: str = "",
+        proxy_port: int = 0,
+        proxy_username: str = "",
+        proxy_password: str = "",
+        initiator_name: str = "",
+        initiator_interface: str = "",
+    ):
+        from core.proxy import LocalTunnel, proxy_config_from_kwargs
+
+        # What this initiator tells the target about itself: its name
+        # (the IQN of the login and of SendTargets discovery) and the
+        # network interface it sends from. Either one gets the session an
+        # open-iscsi interface record of its own (_create_iface).
+        self._initiator_name = validate_initiator_name(initiator_name)
+        self._initiator_interface = validate_interface(initiator_interface)
+        self._iface = (
+            f"axross-{secrets.token_hex(4)}"
+            if self._initiator_name or self._initiator_interface
+            else ""
+        )
+        self._iface_created = False
+        cfg = proxy_config_from_kwargs(
+            {
+                "proxy_type": proxy_type,
+                "proxy_host": proxy_host,
+                "proxy_port": proxy_port,
+                "proxy_username": proxy_username,
+                "proxy_password": proxy_password,
+            }
+        )
+        self._tunnel = None
+        self._proxied = cfg is not None
+        # The portal the initiator is told about: the real one, or, behind a
+        # proxy, the loopback end of a tunnel (iscsid's socket is root's).
+        self._portal_ip, self._portal_port = target_ip, port
+        if cfg is not None:
+            self._tunnel = LocalTunnel(cfg, target_ip, port, allow_root_peers=True).start()
+            self._portal_ip, self._portal_port = self._tunnel.host, self._tunnel.port
+        self._target_ip = target_ip
+        self._target_iqn = target_iqn
+        self._port = port
+        self._username = username
+        self._password = password
+        self._auto_mount = auto_mount
+        self._device_path: str = ""
+        self._mounted = False
+        self._logged_in = False
+        # True only when THIS session's login made the iSCSI session: one
+        # that existed before (iscsiadm exit 15, reused) belongs to the
+        # system or another program and is not logged out on disconnect.
+        self._own_login = False
+        self._tmp_dir_created = False
+
+        if mount_point:
+            self._mount_point = mount_point
+        else:
+            # Not straight in /tmp: once mounted, the file system's root
+            # mode would let every local user in (core.private_mount_dir).
+            self._mount_point = make_private_mount_point("axross-iscsi-")
+            self._tmp_dir_created = True
+        try:
+            self.connect()
+        except BaseException:
+            self._close_tunnel()
+            raise
+
+    # ------------------------------------------------------------------
+    # FileBackend protocol -- identity / state
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:  # noqa: D401
+        return f"{self._target_iqn} @ {self._target_ip} (iSCSI)"
+
+    @property
+    def connected(self) -> bool:
+        """Logged in (and mounted) - and still so in the kernel: a target
+        that dropped the session (sysfs state FAILED / FREE, or no session
+        any more) or a file system unmounted under it is not connected, so
+        a reconnect logs in again instead of reusing a dead session."""
+        if not (self._logged_in and (not self._auto_mount or self._mounted)):
+            return False
+        if self._auto_mount and not self._mount_listed():
+            return False
+        state = self._kernel_session_state()
+        return state is None or state == "LOGGED_IN"
+
+    def _kernel_session_state(self) -> str | None:
+        """The sysfs state of this target's session ("LOGGED_IN",
+        "FAILED", "FREE"; "" for none); None where there is no sysfs
+        (not Linux, a container without it) - the flags decide then."""
+        try:
+            names = os.listdir(_ISCSI_SESSIONS)
+        except OSError:
+            return None
+        states = []
+        for name in names:
+            base = os.path.join(_ISCSI_SESSIONS, name)
+            try:
+                with open(os.path.join(base, "targetname")) as fh:
+                    if fh.read().strip() != self._target_iqn:
+                        continue
+                with open(os.path.join(base, "state")) as fh:
+                    states.append(fh.read().strip())
+            except OSError:
+                continue
+        if "LOGGED_IN" in states:
+            return "LOGGED_IN"
+        return states[0] if states else ""
+
+    def _mount_listed(self) -> bool:
+        """The mount point is in /proc/mounts (True where it cannot be read)."""
+        try:
+            with open(_PROC_MOUNTS) as fh:
+                mounts = fh.read().splitlines()
+        except OSError:
+            return True
+        target = os.path.abspath(self._mount_point)
+        return any(len(parts) > 1 and parts[1] == target
+                   for parts in (line.split() for line in mounts))
+
+    # ------------------------------------------------------------------
+    # Connect / disconnect
+    # ------------------------------------------------------------------
+
+    def connect(self) -> None:
+        """Discover the target, log in, wait for the device, and mount."""
+        if self.connected:
+            return
+        self._create_iface()
+        self._discover()
+        self._set_chap_if_needed()
+        self._login()
+        self._wait_for_device()
+        if self._auto_mount:
+            self._mount()
+        log.info("iSCSI session ready: %s", self.name)
+
+    def close(self) -> None:
+        """Alias for :meth:`disconnect`."""
+        self.disconnect()
+
+    def disconnect(self) -> None:
+        """Unmount, log out of the target, and clean up.
+
+        Logs out only a session this one's login made, and only once the
+        file system is off it: with the umount failed (busy), logging out
+        would pull the block device out from under a mounted file system.
+        """
+        if self._mounted and not self._unmount():
+            # The session (and a proxy tunnel it runs through) stays up
+            # for the mounted file system; disconnect() again retries.
+            log.warning(
+                "iSCSI: staying logged in to %s: %s is still mounted (the umount "
+                "failed), and logging out would remove the device under it",
+                self._target_iqn,
+                self._mount_point,
+            )
+            return
+        if self._logged_in:
+            if getattr(self, "_own_login", False):
+                self._logout()
+            else:
+                log.info(
+                    "iSCSI: not logging out of %s: its session existed before axross "
+                    "connected (reused), so it is left as it was",
+                    self._target_iqn,
+                )
+                self._logged_in = False
+        self._delete_iface()
+        if self._tmp_dir_created and os.path.isdir(self._mount_point) and not self._mounted:
+            remove_private_mount_point(self._mount_point)
+            log.info("Removed temp mount dir: %s", self._mount_point)
+            self._tmp_dir_created = False
+        self._close_tunnel()
+
+    def _close_tunnel(self) -> None:
+        tunnel = getattr(self, "_tunnel", None)
+        if tunnel is not None:
+            tunnel.close()
+            self._tunnel = None
+
+    # ------------------------------------------------------------------
+    # File operations (delegate to mounted local filesystem)
+    # ------------------------------------------------------------------
+
+    def list_dir(self, path: str) -> list[FileItem]:
+        real = self._real(path)
+        items: list[FileItem] = []
+        try:
+            with os.scandir(real) as it:
+                for entry in it:
+                    try:
+                        items.append(self._entry_to_item(entry))
+                    except FileNotFoundError:
+                        pass  # gone while listed: no ghost row (as LocalFS)
+                    except OSError as exc:
+                        log.warning("Cannot stat %s: %s", entry.path, exc)
+                        items.append(unstattable_item(entry, exc))  # as LocalFS
+        except OSError as exc:
+            # Typed as the kernel said it (FileNotFoundError,
+            # NotADirectoryError ...): a bare OSError told "not there" and
+            # "a file" apart from nothing.
+            if exc.errno is None:
+                raise OSError(f"Cannot list {path}: {exc}") from exc
+            raise OSError(exc.errno, f"Cannot list {path}: {exc.strerror or exc}") from exc
+        return items
+
+    def stat(self, path: str) -> FileItem:
+        real = self._real(path, follow=False)
+        st = os.lstat(real)
+        name = os.path.basename(real) or path
+        return self._stat_to_item(name, st, full_path=real)
+
+    def is_dir(self, path: str) -> bool:
+        """False only when nothing is there or the path leaves the
+        mount; a failed lstat (EIO from the LUN, EACCES) is an OSError."""
+        try:
+            real = self._real(path, follow=False)
+        except (PermissionError, NotADirectoryError):
+            return False  # a path out of the mount is no folder of it
+        st = entry_stat(real)
+        return st is not None and stat_module.S_ISDIR(st.st_mode)
+
+    def exists(self, path: str) -> bool:
+        """False only when nothing is there; any other failure is an
+        OSError - server_side_copy(overwrite=False) takes False as its
+        go-ahead to write."""
+        try:
+            real = self._real(path, follow=False)
+        except NotADirectoryError:
+            return False  # "file/" names nothing (lstat(2): ENOTDIR)
+        return entry_stat(real) is not None
+
+    def _is_file(self, path: str) -> bool:
+        """True for an entry that is not a folder (False when nothing is there)."""
+        st = entry_stat(self._real(path, follow=False))
+        return st is not None and not stat_module.S_ISDIR(st.st_mode)
+
+    def mkdir(self, path: str) -> None:
+        os.makedirs(self._real(path), exist_ok=True)
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        real = self._real(path, follow=False)
+        refuse_root_removal(real == os.path.abspath(self._mount_point), path, "iSCSI")
+        st = os.lstat(real)
+        if stat_module.S_ISLNK(st.st_mode):
+            os.remove(real)
+        elif stat_module.S_ISDIR(st.st_mode):
+            if recursive:
+                removal_cancel.rmtree(real)
+            else:
+                os.rmdir(real)
+        else:
+            os.remove(real)
+
+    def rename(self, src: str, dst: str) -> None:
+        # The mount path join drops the slash: a file renamed to "x/" became "x".
+        refuse_folder_path(dst, "rename to", source_is_file=lambda: self._is_file(src))
+        os.rename(self._real(src, follow=False), self._real(dst, follow=False))
+
+    def open_read(self, path: str) -> IO[bytes]:
+        # LocalFS's open: non-blocking, refused unless a regular file. A
+        # plain open() of a FIFO without a writer blocked forever.
+        return LocalFS().open_read(self._real(path))
+
+    def open_write(self, path: str, append: bool = False) -> IO[bytes]:
+        # The mount path join drops the slash: "x/" was written as a FILE "x".
+        real = self._real(refuse_folder_path(path))
+        _make_parent(os.path.dirname(real), path)
+        return open(real, "ab" if append else "wb")
+
+    def normalize(self, path: str) -> str:
+        return os.path.normpath(path) if path else "/"
+
+    def separator(self) -> str:
+        return "/"
+
+    def join(self, *parts: str) -> str:
+        return os.path.join(*parts)
+
+    def parent(self, path: str) -> str:
+        return str(Path(path).parent)
+
+    def home(self) -> str:
+        return "/"
+
+    def chmod(self, path: str, mode: int) -> None:
+        os.chmod(self._real(path), mode)
+
+    def readlink(self, path: str) -> str:
+        return os.readlink(self._real(path, follow=False))
+
+    def list_versions(self, path: str) -> list:
+        return []
+
+    def open_version_read(self, path: str, version_id: str):
+        raise OSError(f"{type(self).__name__} does not expose file version history")
+
+    def copy(self, src: str, dst: str) -> None:
+        """Server-side copy on the mounted block device."""
+        copy_file_onto(self._real(src), self._real(dst))
+
+    # ------------------------------------------------------------------
+    # iSCSI-specific verbs (API_GAPS round 2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def targets_discover(
+        portal_ip: str,
+        *,
+        portal_port: int = 3260,
+        timeout: float = 10.0,
+        initiator_name: str = "",
+        initiator_interface: str = "",
+    ) -> list[dict]:
+        """Discover iSCSI targets advertised at ``portal_ip:portal_port``
+        via ``iscsiadm -m discovery -t sendtargets``. Static method so
+        a script can browse before logging in to a specific target.
+
+        Returns list of dicts ``{portal, iqn}`` — one entry per
+        target endpoint (a single IQN can advertise multiple
+        portals).
+
+        ``initiator_name`` / ``initiator_interface``: what the discovery
+        login sends as the initiator's name and the network interface it
+        leaves through (a temporary open-iscsi interface record, removed
+        afterwards); empty = the system's.
+
+        Requires ``iscsiadm`` (open-iscsi) on PATH and root/sudo
+        privileges (the SCSI mid-layer + initiator config require
+        them on Linux). Raises ``OSError`` when missing.
+        """
+        initiator_name = validate_initiator_name(initiator_name)
+        initiator_interface = validate_interface(initiator_interface)
+        if "\r" in portal_ip or "\n" in portal_ip or " " in portal_ip:
+            raise ValueError("targets_discover portal_ip must not contain CR/LF/space")
+        binary = shutil.which("iscsiadm")
+        if not binary:
+            raise OSError(
+                "targets_discover requires the system 'iscsiadm' binary (install open-iscsi)"
+            )
+        cmd = [
+            binary,
+            "-m",
+            "discovery",
+            "-t",
+            "sendtargets",
+            "-p",
+            f"{portal_ip}:{int(portal_port)}",
+        ]
+        iface = ""
+        if initiator_name or initiator_interface:
+            iface = f"axross-{secrets.token_hex(4)}"
+            settings = [("iface.transport_name", "tcp")]
+            if initiator_name:
+                settings.append(("iface.initiatorname", initiator_name))
+            if initiator_interface:
+                settings.append(("iface.net_ifacename", initiator_interface))
+            steps = [[binary, "-m", "iface", "-I", iface, "-o", "new"]] + [
+                [binary, "-m", "iface", "-I", iface, "-o", "update", "-n", k, "-v", v]
+                for k, v in settings
+            ]
+            cmd += ["-I", iface]
+        try:
+            if iface:
+                for step in steps:
+                    made = subprocess.run(step, capture_output=True, text=True,
+                                          timeout=float(timeout), env=clean_child_env())
+                    if made.returncode != 0:
+                        raise OSError(f"iscsiadm iface rc={made.returncode}: "
+                                      f"{(made.stderr or made.stdout).strip()[:300]}")
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=float(timeout),
+                env=clean_child_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError(f"iscsiadm discovery timed out: {exc}") from exc
+        finally:
+            if iface:
+                # the node records discovery bound to it, then the record
+                for cleanup in ([binary, "-m", "node", "-I", iface, "-o", "delete"],
+                                [binary, "-m", "iface", "-I", iface, "-o", "delete"]):
+                    try:
+                        subprocess.run(cleanup, capture_output=True, text=True,
+                                       timeout=float(timeout), env=clean_child_env())
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        log.warning("iSCSI cleanup of %s: %s", iface, exc)
+        if proc.returncode != 0:
+            raise OSError(
+                f"iscsiadm discovery rc={proc.returncode}: "
+                f"{(proc.stderr or proc.stdout).strip()[:300]}"
+            )
+        # Output lines: ``10.0.0.5:3260,1 iqn.2026-04.lab.axross:disk1``
+        out: list[dict] = []
+        for line in split_lf_only_stream(proc.stdout):
+            line = line.strip()
+            if not line or " " not in line:
+                continue
+            portal_part, iqn_part = line.split(" ", 1)
+            # ``portal,group``  — drop the group id.
+            portal_only = portal_part.split(",", 1)[0]
+            out.append({"portal": portal_only, "iqn": iqn_part.strip()})
+        return out
+
+    def portal_login(self) -> None:
+        """Explicit login to the configured target (already done by
+        ``connect()`` for normal flows). Returns None on success;
+        raises OSError with iscsiadm's stderr on failure.
+
+        Useful when a script wants to re-login after an iSCSI
+        connection drop without tearing down + rebuilding the
+        session."""
+        binary = shutil.which("iscsiadm")
+        if not binary:
+            raise OSError("portal_login requires iscsiadm (open-iscsi)")
+        cmd = [
+            binary,
+            "-m",
+            "node",
+            "-T",
+            self._target_iqn,
+            "-p",
+            f"{self._portal_ip}:{self._portal_port}",
+            *self._iface_args(),
+            "--login",
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30.0, env=clean_child_env()
+        )
+        if proc.returncode != 0:
+            raise OSError(
+                f"iscsiadm login rc={proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]}"
+            )
+
+    def lun_list(self) -> list[dict]:
+        """List the SCSI LUNs the kernel currently sees from this
+        session. Returns dicts ``{device, size_bytes, scsi_id}``.
+
+        Walks ``lsblk -J`` to find block devices whose model / vendor
+        matches a typical iSCSI initiator pattern. Heuristic — the
+        kernel doesn't expose a clean "which devices belong to which
+        iSCSI session?" interface without parsing
+        ``/sys/class/iscsi_session/<id>/device/target*/...``.
+        """
+        binary = shutil.which("lsblk")
+        if not binary:
+            raise OSError("lun_list requires lsblk (util-linux)")
+        # -b: sizes as byte counts; without it lsblk prints "280G".
+        proc = subprocess.run(
+            [binary, "-J", "-O", "-b"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            env=clean_child_env(),
+        )
+        if proc.returncode != 0:
+            raise OSError(f"lsblk rc={proc.returncode}: {proc.stderr.strip()[:300]}")
+        import json as _json
+
+        try:
+            data = _json.loads(proc.stdout)
+        except _json.JSONDecodeError as exc:
+            raise OSError(f"lsblk JSON parse: {exc}") from exc
+        out: list[dict] = []
+        for d in data.get("blockdevices", []):
+            transport = (d.get("tran") or "").lower()
+            if transport != "iscsi":
+                continue
+            out.append(
+                {
+                    "device": "/dev/" + d.get("name", ""),
+                    "size_bytes": int(d.get("size") or 0),
+                    "scsi_id": d.get("wwn") or "",
+                }
+            )
+        return out
+
+    def checksum(self, path: str, algorithm: str = "sha256") -> str:
+        """Stream-hash via the mounted block device. Kernel-cached
+        so cheap compared to re-fetching over iSCSI."""
+        import hashlib
+
+        try:
+            h = hashlib.new(algorithm)
+        except ValueError as exc:
+            raise OSError(f"Unsupported algorithm: {algorithm}") from exc
+        with self.open_read(path) as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return f"{algorithm}:{h.hexdigest()}"
+
+    def disk_usage(self, path: str) -> tuple[int, int, int]:
+        usage = shutil.disk_usage(self._mount_point)
+        return (usage.total, usage.used, usage.free)
+
+    # ------------------------------------------------------------------
+    # Internal helpers -- path mapping
+    # ------------------------------------------------------------------
+
+    def local_path(self, path: str) -> str:
+        """The mounted path on this machine (see core.storage_identity)."""
+        return self._real(path)
+
+    def _real(self, path: str, *, follow: bool = True) -> str:
+        """Map a virtual path (``/``, ``/foo/bar``) to the mounted filesystem,
+        confined to it even through symlinks on the LUN (confined_path).
+        "file/" is NotADirectoryError, as stat(2) says: the join drops the
+        slash."""
+        return refuse_slash_on_file(path, confined_path(self._mount_point, path, follow=follow))
+
+    @staticmethod
+    def _masked_command(cmd: list[str]) -> list[str]:
+        masked: list[str] = []
+        for index, part in enumerate(cmd):
+            if (
+                index >= 1
+                and cmd[index - 1] == "-v"
+                and index >= 2
+                and "password" in cmd[index - 2].lower()
+            ):
+                masked.append("******")
+            else:
+                masked.append(part)
+        return masked
+
+    @classmethod
+    def _redact_command(cls, cmd: list[str]) -> str:
+        return " ".join(cls._masked_command(cmd))
+
+    # ------------------------------------------------------------------
+    # Internal helpers -- subprocess
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_root() -> bool:
+        return posix_compat.effective_uid() == 0
+
+    def _run_privileged(
+        self,
+        cmd: list[str],
+        *,
+        check: bool = True,
+        capture: bool = True,
+        timeout: float = _PRIVILEGED_CMD_TIMEOUT,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run *cmd*, prepending ``sudo`` when not running as root."""
+        if not self._is_root():
+            cmd = ["sudo", "-n"] + cmd
+        log.debug("Running: %s", self._redact_command(cmd))
+        try:
+            return subprocess.run(
+                cmd,
+                check=check,
+                capture_output=capture,
+                text=True,
+                timeout=timeout,
+                env=clean_child_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError(
+                f"privileged command timed out after {timeout:.0f}s: {self._redact_command(cmd)}"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            # Its message quotes exc.cmd, which may hold the CHAP secret
+            # (the argv fallback in _set_chap_if_needed). Callers branch on
+            # the type and returncode, so only the command is masked.
+            exc.cmd = self._masked_command(list(cmd))
+            raise
+
+    # ------------------------------------------------------------------
+    # Internal helpers -- iSCSI lifecycle
+    # ------------------------------------------------------------------
+
+    def _iface_args(self) -> list[str]:
+        iface = getattr(self, "_iface", "")
+        return ["-I", iface] if iface else []
+
+    def _iface_settings(self) -> list[tuple[str, str]]:
+        settings = [("iface.transport_name", "tcp")]
+        if self._initiator_name:
+            settings.append(("iface.initiatorname", self._initiator_name))
+        if self._initiator_interface:
+            settings.append(("iface.net_ifacename", self._initiator_interface))
+        return settings
+
+    def _create_iface(self) -> None:
+        """The session's own open-iscsi interface record, so the login and
+        the discovery send this profile's initiator name and leave through
+        its interface - the system's initiatorname.iscsi and every other
+        session stay as they are. Removed again by _delete_iface."""
+        if not getattr(self, "_iface", "") or self._iface_created:
+            return
+        self._run_privileged(["iscsiadm", "-m", "iface", "-I", self._iface, "-o", "new"])
+        self._iface_created = True
+        try:
+            for key, value in self._iface_settings():
+                self._run_privileged(
+                    ["iscsiadm", "-m", "iface", "-I", self._iface, "-o", "update",
+                     "-n", key, "-v", value]
+                )
+        except BaseException:
+            self._delete_iface()
+            raise
+        log.info(
+            "iSCSI interface record %s: initiator %s, network interface %s",
+            self._iface,
+            self._initiator_name or "(system default)",
+            self._initiator_interface or "(any)",
+        )
+
+    def _delete_iface(self) -> None:
+        """The node records bound to the session's interface record, then
+        the record itself. Best effort: a failure is logged, never raised
+        (disconnect must go on)."""
+        if not getattr(self, "_iface_created", False):
+            return
+        portal = f"{self._portal_ip}:{self._portal_port}"
+        for cmd in (
+            ["iscsiadm", "-m", "node", "-T", self._target_iqn, "-p", portal,
+             "-I", self._iface, "-o", "delete"],
+            ["iscsiadm", "-m", "iface", "-I", self._iface, "-o", "delete"],
+        ):
+            try:
+                result = self._run_privileged(cmd, check=False)
+                if result.returncode != 0:
+                    log.warning("iSCSI cleanup %s: rc=%s %s", " ".join(cmd[1:4]),
+                                result.returncode, (result.stderr or "").strip()[:200])
+            except OSError as exc:
+                log.warning("iSCSI cleanup %s: %s", " ".join(cmd[1:4]), exc)
+        self._iface_created = False
+
+    def _discover(self) -> None:
+        """Discover iSCSI targets on the portal."""
+        portal = f"{self._portal_ip}:{self._portal_port}"
+        if self._proxied:
+            # SendTargets answers with the target's own portal addresses, and
+            # iscsid would then dial those directly -- around the proxy. So
+            # the node record is created by hand for the tunnel portal only.
+            log.info("Registering iSCSI node %s for tunnel portal %s", self._target_iqn, portal)
+            self._run_privileged(
+                [
+                    "iscsiadm",
+                    "-m",
+                    "node",
+                    "-T",
+                    self._target_iqn,
+                    "-p",
+                    portal,
+                    *self._iface_args(),
+                    "-o",
+                    "new",
+                ],
+            )
+            return
+        log.info("Discovering iSCSI targets on %s", portal)
+        result = self._run_privileged(
+            ["iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal, *self._iface_args()],
+        )
+        log.debug("Discovery output:\n%s", result.stdout)
+
+        if self._target_iqn not in result.stdout:
+            raise OSError(
+                f"Target {self._target_iqn} not found on portal {portal}. "
+                f"Discovered:\n{result.stdout}"
+            )
+        log.info("Target %s found on %s", self._target_iqn, portal)
+
+    def _set_chap_if_needed(self) -> None:
+        """Configure CHAP authentication on the node record if
+        credentials are set.
+
+        Two-phase write so secrets never land on argv:
+
+        1. ``authmethod=CHAP`` goes via the usual ``iscsiadm --op=update``
+           CLI (non-secret).
+        2. Username + password are patched directly into the
+           open-iscsi node config file (``/etc/iscsi/nodes/<iqn>/
+           <ip>,<port>,<tpgt>/default``) via a ``sudo cat`` / ``sudo
+           tee`` pair where the secret text traverses stdin/stdout
+           only — never appearing in ``/proc/<pid>/cmdline``.
+
+        Fallback: when the node config path cannot be resolved (the
+        record doesn't exist yet, the iqn/ip contain characters we
+        refuse to pass to a shell glob, or sudo is unavailable) we
+        log a warning and fall back to the argv-based
+        ``iscsiadm --op=update -v <password>`` flow. That retains
+        the original behaviour on restricted systems while opting
+        into the safer path everywhere else.
+        """
+        if not self._username:
+            return
+
+        portal = f"{self._portal_ip}:{self._portal_port}"
+        base = [
+            "iscsiadm",
+            "-m",
+            "node",
+            "-T",
+            self._target_iqn,
+            "-p",
+            portal,
+            *self._iface_args(),
+            "--op=update",
+        ]
+        # Step 1: non-secret authmethod update via iscsiadm.
+        self._run_privileged(
+            base
+            + [
+                "-n",
+                "node.session.auth.authmethod",
+                "-v",
+                "CHAP",
+            ]
+        )
+        # Step 2: attempt secret-via-stdin write to the node config.
+        if self._write_chap_secrets_to_node_file():
+            log.info(
+                "CHAP credentials configured for %s via node-file (secrets via stdin, not argv)",
+                self._target_iqn,
+            )
+            return
+        # Step 2 fallback: argv-based update. Secrets brief-appear in
+        # /proc/<pid>/cmdline; same-user exposure only, but a known
+        # downgrade from the file-based path.
+        log.warning(
+            "Falling back to argv-based CHAP update for %s — "
+            "secrets will be briefly visible in /proc/<pid>/cmdline "
+            "during the iscsiadm call. Run this host with sudo access "
+            "to /etc/iscsi/nodes to switch to the file-based path.",
+            self._target_iqn,
+        )
+        for flags in [
+            ("-n", "node.session.auth.username", "-v", self._username),
+            ("-n", "node.session.auth.password", "-v", self._password),
+        ]:
+            self._run_privileged(base + list(flags))
+
+    def _node_config_paths(self) -> list[str]:
+        """Resolve the open-iscsi node-config files that correspond to
+        this target. Returns an empty list when sudo isn't available
+        or the iqn/ip values would otherwise need escaping before
+        going into a shell glob."""
+        if not _IQN_SAFE.fullmatch(self._target_iqn or ""):
+            log.debug(
+                "IQN %r contains characters we refuse to glob",
+                self._target_iqn,
+            )
+            return []
+        if not _IP_SAFE.fullmatch(self._portal_ip or ""):
+            log.debug(
+                "IP %r contains characters we refuse to glob",
+                self._portal_ip,
+            )
+            return []
+        if not isinstance(self._portal_port, int):
+            return []
+        pattern = (
+            f"/etc/iscsi/nodes/{self._target_iqn}/{self._portal_ip},{self._portal_port},*/"
+            f"{getattr(self, '_iface', '') or 'default'}"
+        )
+        # Try non-privileged glob first. If the on-disk perms let us
+        # read the node directory we get the paths without sudo.
+        local = sorted(glob.glob(pattern))
+        if local:
+            return local
+        # Fall back to running the glob via sudo -n. ``printf '%s\n'``
+        # writes each expanded name on its own line and stays silent
+        # on non-matches.
+        cmd = ["sh", "-c", f"printf '%s\\n' {pattern}"]
+        if not self._is_root():
+            cmd = ["sudo", "-n"] + cmd
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=clean_child_env(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("sudo glob of node config failed: %s", exc)
+            return []
+        if result.returncode != 0:
+            return []
+        out_paths: list[str] = []
+        for line in split_lf_only_stream(result.stdout):
+            line = line.strip()
+            # ``printf '%s\n' <pattern>`` echoes the pattern literally
+            # when no matches are found — filter that out explicitly.
+            if not line or "*" in line:
+                continue
+            out_paths.append(line)
+        return sorted(out_paths)
+
+    def _write_chap_secrets_to_node_file(self) -> bool:
+        """Patch username + password lines of every node-config file
+        that applies to this target, keeping the secret values on
+        stdin/stdout only. Returns True on success, False when no
+        files resolved or any sudo call failed. Caller falls back to
+        argv-based iscsiadm updates on False."""
+        paths = self._node_config_paths()
+        if not paths:
+            return False
+        for path in paths:
+            try:
+                current = self._sudo_cat(path)
+            except OSError as exc:
+                log.debug("Cannot read %s under sudo: %s", path, exc)
+                return False
+            rewritten = self._rewrite_chap_lines(
+                current,
+                self._username,
+                self._password,
+            )
+            try:
+                self._sudo_tee(path, rewritten)
+            except OSError as exc:
+                log.debug("Cannot write %s under sudo: %s", path, exc)
+                return False
+        return True
+
+    def _sudo_cat(self, path: str) -> str:
+        """Read ``path`` via ``sudo -n cat``. Raises OSError on failure
+        so the caller falls back to the argv path."""
+        cmd = ["cat", "--", path]
+        if not self._is_root():
+            cmd = ["sudo", "-n"] + cmd
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=clean_child_env(),
+        )
+        if result.returncode != 0:
+            raise OSError(
+                f"sudo cat {path}: rc={result.returncode} stderr={result.stderr!r}",
+            )
+        return result.stdout
+
+    def _sudo_tee(self, path: str, content: str) -> None:
+        """Write ``content`` to ``path`` via ``sudo -n tee``. The
+        payload flows on stdin so the bytes never show up in any
+        process's argv. Raises OSError on failure."""
+        cmd = ["tee", "--", path]
+        if not self._is_root():
+            cmd = ["sudo", "-n"] + cmd
+        result = subprocess.run(
+            cmd,
+            input=content,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=clean_child_env(),
+        )
+        if result.returncode != 0:
+            raise OSError(
+                f"sudo tee {path}: rc={result.returncode} stderr={result.stderr!r}",
+            )
+
+    @staticmethod
+    def _rewrite_chap_lines(current: str, username: str, password: str) -> str:
+        """Replace (or append) the iscsiadm ``node.session.auth.username``
+        and ``.password`` lines inside a node-config file's content.
+
+        open-iscsi uses ``key = value`` lines (with whitespace-tolerant
+        ``=``). We preserve every other line verbatim so any future
+        iscsiadm-managed setting — CHAP-inbound secrets, recovery
+        timeouts, iser toggles — survives the rewrite.
+        """
+        targets = {
+            "node.session.auth.username": username,
+            "node.session.auth.password": password,
+        }
+        seen: set[str] = set()
+        out_lines: list[str] = []
+        for raw in split_lf_only_stream(current):
+            # Match ``key[whitespace]=[whitespace]value``. Tolerant
+            # of trailing whitespace + comments; open-iscsi itself
+            # writes ``<key> = <value>`` with single spaces.
+            match = re.match(r"^\s*([A-Za-z0-9_.]+)\s*=", raw)
+            if match and match.group(1) in targets:
+                key = match.group(1)
+                out_lines.append(f"{key} = {targets[key]}")
+                seen.add(key)
+            else:
+                out_lines.append(raw)
+        for key, value in targets.items():
+            if key not in seen:
+                out_lines.append(f"{key} = {value}")
+        # Preserve trailing newline behaviour: open-iscsi writes the
+        # file with a terminating newline; ensure we do too.
+        text = "\n".join(out_lines)
+        if not text.endswith("\n"):
+            text += "\n"
+        return text
+
+    def _login(self) -> None:
+        """Log in to the iSCSI target.
+
+        If a session already exists (exit 15 / ``ISCSI_ERR_SESSION_EXISTS``)
+        we reuse it instead of failing — typical when the previous run
+        left a kernel session behind (a crash, or a disconnect that could
+        not free the block device because it was still open).
+        """
+        portal = f"{self._portal_ip}:{self._portal_port}"
+        log.info("Logging in to %s via %s", self._target_iqn, portal)
+        try:
+            self._run_privileged(
+                ["iscsiadm", "-m", "node", "-T", self._target_iqn, "-p", portal,
+                 *self._iface_args(), "--login"],
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode == 15:
+                log.info(
+                    "iSCSI session already exists for %s; reusing (it is not logged "
+                    "out on disconnect)",
+                    self._target_iqn,
+                )
+                self._own_login = False
+            else:
+                raise
+        else:
+            self._own_login = True
+        self._logged_in = True
+        if self._proxied:
+            self._assert_session_via_tunnel(portal)
+        log.info("iSCSI login successful")
+
+    def _assert_session_via_tunnel(self, portal: str) -> None:
+        """Fail closed when the session did not stay on the tunnel portal.
+
+        A target may answer the login with a redirect to another address;
+        the initiator would follow it with a direct connection that no proxy
+        carries. The session is checked after login and torn down if its
+        current portal is not the tunnel's loopback address.
+        """
+        result = self._run_privileged(["iscsiadm", "-m", "session", "-P", "3"], check=False)
+        in_target = False
+        seen: list[str] = []
+        for line in split_lf_only_stream(result.stdout or ""):
+            stripped = line.strip()
+            if stripped.startswith("Target:"):
+                in_target = self._target_iqn in stripped
+            elif in_target and stripped.startswith(("Current Portal:", "Persistent Portal:")):
+                seen.append(stripped.split(":", 1)[1].strip().split(",")[0])
+        if seen and all(addr == portal for addr in seen):
+            return
+        if getattr(self, "_own_login", False):
+            self._logout()
+        else:
+            # A session that was there before is not this one's to end.
+            self._logged_in = False
+        raise OSError(
+            f"iSCSI session for {self._target_iqn} left the proxy tunnel "
+            f"(portals: {', '.join(seen) or 'unknown'}, expected {portal}); "
+            "the target redirected the login, which would bypass the proxy."
+        )
+
+    def _logout(self) -> None:
+        """Log out from the iSCSI target."""
+        portal = f"{self._portal_ip}:{self._portal_port}"
+        log.info("Logging out from %s", self._target_iqn)
+        try:
+            self._run_privileged(
+                ["iscsiadm", "-m", "node", "-T", self._target_iqn, "-p", portal,
+                 *self._iface_args(), "--logout"],
+            )
+        except subprocess.CalledProcessError as exc:
+            log.warning("iSCSI logout failed: %s", exc)
+        self._logged_in = False
+
+    def _wait_for_device(self) -> None:
+        """Poll until the iSCSI-attached block device appears.
+
+        Primary path: the udev-maintained symlink under
+        ``/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-*`` (present on
+        any standard desktop / server).
+
+        Fallback path: when udev is not running (minimal / container
+        environments), iscsiadm itself reports the kernel-assigned device
+        name. We parse ``iscsiadm -m session -P 3`` output for the
+        ``Attached scsi disk sdX`` line and promote it to ``/dev/sdX``.
+        """
+        portal = f"{self._portal_ip}:{self._portal_port}"
+        pattern = f"/dev/disk/by-path/ip-{portal}-iscsi-{self._target_iqn}-lun-*"
+        log.info("Waiting for block device matching %s", pattern)
+
+        deadline = time.monotonic() + _DEVICE_POLL_TIMEOUT
+        while time.monotonic() < deadline:
+            matches = glob.glob(pattern)
+            if matches:
+                # Resolve the symlink to get the real device (e.g. /dev/sdb)
+                self._device_path = os.path.realpath(matches[0])
+                log.info(
+                    "Block device found: %s -> %s",
+                    matches[0],
+                    self._device_path,
+                )
+                return
+            dev = self._query_device_via_iscsiadm()
+            if dev:
+                self._device_path = dev
+                log.info(
+                    "Block device resolved via iscsiadm session info: %s",
+                    dev,
+                )
+                return
+            time.sleep(_DEVICE_POLL_INTERVAL)
+
+        raise OSError(
+            f"Timed out waiting for iSCSI block device after "
+            f"{_DEVICE_POLL_TIMEOUT}s (pattern: {pattern})"
+        )
+
+    def _query_device_via_iscsiadm(self) -> str:
+        """Ask iscsiadm which scsi disk is attached to our session.
+
+        Returns an empty string when no device is visible yet.
+        """
+        try:
+            result = self._run_privileged(
+                ["iscsiadm", "-m", "session", "-P", "3"],
+                check=False,
+            )
+        except OSError:
+            return ""
+        if result.returncode != 0:
+            return ""
+        # Filter: only parse the block for OUR target IQN to avoid
+        # picking up a stale session from some other target.
+        output = result.stdout or ""
+        want = self._target_iqn
+        in_our_target = False
+        for line in split_lf_only_stream(output):
+            stripped = line.strip()
+            if stripped.startswith("Target:"):
+                in_our_target = want in stripped
+            elif in_our_target and "Attached scsi disk" in stripped:
+                # Example: "Attached scsi disk sdb\t\tState: running"
+                parts = stripped.split()
+                for i, tok in enumerate(parts):
+                    if tok == "disk" and i + 1 < len(parts):
+                        disk = parts[i + 1]
+                        candidate = f"/dev/{disk}"
+                        if os.path.exists(candidate):
+                            return candidate
+        return ""
+
+    def _detect_filesystem(self) -> str:
+        """Return the filesystem type on the block device (via ``blkid``)."""
+        result = self._run_privileged(
+            ["blkid", "-o", "value", "-s", "TYPE", self._device_path],
+            check=False,
+        )
+        fs_type = result.stdout.strip()
+        if result.returncode != 0 or not fs_type:
+            raise OSError(
+                f"Cannot detect filesystem on {self._device_path}. "
+                f"blkid returned: {result.stdout.strip()} (rc={result.returncode})"
+            )
+        log.info("Detected filesystem: %s on %s", fs_type, self._device_path)
+        return fs_type
+
+    def _mount(self) -> None:
+        """Mount the iSCSI block device to :attr:`_mount_point`.
+
+        If the device is already mounted elsewhere (stale session left a
+        mount behind after a crash, or the test harness reuses a kernel
+        session that still holds the mount), we bind-mount the existing
+        mount point onto the session's temp dir so callers get a
+        consistent view without double-mounting the fs.
+        """
+        fs_type = self._detect_filesystem()
+        os.makedirs(self._mount_point, exist_ok=True)
+
+        existing = self._existing_mountpoint_for_device()
+        if existing and os.path.abspath(existing) != os.path.abspath(self._mount_point):
+            log.info(
+                "%s is already mounted at %s; bind-mounting to %s",
+                self._device_path,
+                existing,
+                self._mount_point,
+            )
+            self._run_privileged(
+                ["mount", "--bind", "--", existing, self._mount_point],
+            )
+            self._mounted = True
+            return
+        if existing and os.path.abspath(existing) == os.path.abspath(self._mount_point):
+            log.info(
+                "%s already mounted at %s; nothing to do", self._device_path, self._mount_point
+            )
+            self._mounted = True
+            return
+
+        log.info("Mounting %s (%s) on %s", self._device_path, fs_type, self._mount_point)
+        # Mounted as root: a set-uid binary or device node on the LUN must
+        # not act on this machine.
+        self._run_privileged(
+            [
+                "mount",
+                "-t",
+                fs_type,
+                "-o",
+                "nosuid,nodev,noexec",
+                "--",
+                self._device_path,
+                self._mount_point,
+            ],
+        )
+        self._mounted = True
+        log.info("Mounted successfully at %s", self._mount_point)
+
+    def _existing_mountpoint_for_device(self) -> str:
+        """Return the first mountpoint where our block device is mounted,
+        or an empty string if none."""
+        try:
+            with open(_PROC_MOUNTS) as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    dev = parts[0]
+                    if dev == self._device_path:
+                        return parts[1]
+        except OSError:
+            pass
+        return ""
+
+    def _unmount(self) -> bool:
+        """Unmount the filesystem. False (and still marked mounted) when
+        umount fails: the file system is still on the device then."""
+        log.info("Unmounting %s", self._mount_point)
+        try:
+            self._run_privileged(["umount", self._mount_point])
+        except (subprocess.CalledProcessError, OSError) as exc:
+            log.warning("umount of %s failed: %s", self._mount_point, exc)
+            return False
+        self._mounted = False
+        return True
+
+    # ------------------------------------------------------------------
+    # Internal helpers -- stat / FileItem construction
+    # ------------------------------------------------------------------
+
+    def _entry_to_item(self, entry: os.DirEntry) -> FileItem:
+        st = entry.stat(follow_symlinks=False)
+        return self._stat_to_item(entry.name, st, full_path=entry.path)
+
+    @staticmethod
+    def _stat_to_item(
+        name: str,
+        st: os.stat_result,
+        full_path: str = "",
+    ) -> FileItem:
+        is_link = stat_module.S_ISLNK(st.st_mode)
+        is_dir = stat_module.S_ISDIR(st.st_mode)
+
+        link_target = ""
+        if is_link and full_path:
+            try:
+                link_target = os.readlink(full_path)
+            except OSError:
+                pass
+
+        owner = owner_name(st.st_uid) if hasattr(st, "st_uid") else ""
+        group = group_name(st.st_gid) if hasattr(st, "st_gid") else ""
+
+        accessed = datetime.fromtimestamp(st.st_atime) if getattr(st, "st_atime", 0) else None
+        birth = getattr(st, "st_birthtime", 0)
+        created = datetime.fromtimestamp(birth) if birth else None
+        return FileItem(
+            name=name,
+            size=st.st_size if not is_dir else 0,
+            modified=datetime.fromtimestamp(st.st_mtime),
+            permissions=st.st_mode & 0o7777,
+            is_dir=is_dir,
+            is_link=is_link,
+            link_target=link_target,
+            owner=owner,
+            group=group,
+            accessed=accessed,
+            created=created,
+        )

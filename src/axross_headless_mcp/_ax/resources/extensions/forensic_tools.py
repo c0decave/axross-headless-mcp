@@ -1,0 +1,844 @@
+"""Forensic tools on disk images: qemu-img, The Sleuth Kit, TestDisk/PhotoRec
+and hashing.
+
+Right-click a disk image (``.img .raw .dd .iso .qcow2 .vdi .vmdk .vhd(x) …``):
+
+* **Hash Image** - MD5, SHA-1 and SHA-256 in one pass, on any backend; for
+  the case notes.
+* **Image Info (qemu-img)** - format, virtual and actual size, backing file,
+  encryption, dirty flag (``qemu-img info --output=json``).
+* **Convert to Raw Image** - ``qemu-img convert -O raw`` next to the source
+  (never over an existing file); the raw image then opens with Disk Image…
+  and mounts.
+* **Browse File System (Sleuth Kit)…** - every file of a partition, deleted
+  ones included (``fls -r -p -o <sector>``), without mounting anything;
+  *Extract* writes the selected files' content (``icat``) into a folder.
+  On a container (qcow2, VMDK, dynamic VDI, VHD/VHDX, E01) it says how to
+  get at the partitions and offers Convert to Raw… where qemu-img can.
+* **TestDisk / PhotoRec** - start the interactive tools in a terminal pane
+  next to the image (partition recovery, file carving).
+
+The image is only read; the Sleuth Kit and qemu-img calls are argument
+lists. Tools that are missing are named with the package that has them.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+
+from core.subprocess_env import clean_child_env
+
+EXTENSION = {
+    "name": "Forensic Tools",
+    "version": "1.0",
+    "description": "Right-click a disk image: hashes, qemu-img info and convert to raw, "
+    "browse and extract files with The Sleuth Kit (deleted ones too), TestDisk and PhotoRec.",
+    "author": "axross",
+}
+
+CHUNK = 4 * 1024 * 1024
+TIMEOUT = 600
+MAX_FLS_LINES = 200_000
+#: The unit of fls / icat ``-o``: The Sleuth Kit's default sector size.
+TSK_SECTOR = 512
+PACKAGES = {
+    "qemu-img": "qemu-utils / qemu-img",
+    "fls": "sleuthkit",
+    "icat": "sleuthkit",
+    "testdisk": "testdisk",
+    "photorec": "testdisk",
+}
+#: core.disk_image container kinds qemu-img converts to raw (VHD is its "vpc").
+QEMU_CONVERTS = ("qcow2", "vdi", "vmdk", "vhd", "vhdx")
+_FLS = re.compile(r"^(?P<type>\S)/(?P<meta>\S)\s+(?P<deleted>\*\s+)?(?P<inode>[0-9][0-9-]*)"
+                  r"(?P<realloc>\(realloc\))?:\t(?P<path>.*)$")
+
+
+class ToolError(RuntimeError):
+    pass
+
+
+class ToolMissing(ToolError):
+    """A program the tool runs is not installed; *tool* names it."""
+
+    def __init__(self, tool: str, text: str):
+        super().__init__(text)
+        self.tool = tool
+
+
+def feature_key(tool: str) -> str | None:
+    """The Help > Features entry (core.features) that installs *tool*."""
+    from core import features as F
+
+    return next((f"tool:{t.key}" for t in F.TOOLS if tool in t.commands), None)
+
+
+class Cancelled(ToolError):
+    """The user pressed Cancel."""
+
+
+#: qemu-img convert -p prints "    (12.34/100%)\r" to stdout.
+_QEMU_PROGRESS = re.compile(rb"\((\d+(?:\.\d+)?)/100%\)")
+
+
+def suffixes() -> tuple[str, ...]:
+    from core.disk_image import IMAGE_SUFFIXES
+
+    return IMAGE_SUFFIXES
+
+
+def need(tool: str) -> str:
+    found = shutil.which(tool)
+    if found is None:
+        raise ToolMissing(tool, f"{tool} is not installed (package: {PACKAGES.get(tool, tool)}).")
+    return found
+
+
+def _run(argv: list[str], timeout: int = TIMEOUT) -> str:
+    # errors="replace": fls prints ext file names as the raw bytes they are;
+    # one that is not UTF-8 failed the whole listing (icat goes by inode).
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout,
+                              stdin=subprocess.DEVNULL, check=False, env=clean_child_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ToolError(str(exc)) from exc
+    if proc.returncode != 0:
+        lines = [ln for ln in proc.stderr.splitlines() if ln.strip()]
+        raise ToolError(lines[-1] if lines else f"{os.path.basename(argv[0])} failed "
+                                                 f"(exit {proc.returncode})")
+    return proc.stdout
+
+
+# -- hashing ------------------------------------------------------------------------------
+
+
+def hash_image(backend, path: str, cancel=lambda: False) -> dict[str, str]:
+    """MD5, SHA-1 and SHA-256 of *path* in one read."""
+    digests = {"MD5": hashlib.md5(usedforsecurity=False),
+               "SHA-1": hashlib.sha1(usedforsecurity=False), "SHA-256": hashlib.sha256()}
+    with backend.open_read(path) as fh:
+        while not cancel():
+            chunk = fh.read(CHUNK)
+            if not chunk:
+                break
+            for d in digests.values():
+                d.update(chunk)
+    return {name: d.hexdigest() for name, d in digests.items()}
+
+
+# -- qemu-img -----------------------------------------------------------------------------
+
+
+def _qemu_info(path: str) -> dict:
+    # info opens the image without its backing chain and reads no data.
+    data = json.loads(_run([need("qemu-img"), "info", "--output=json", path], 60))
+    if not isinstance(data, dict):
+        raise ToolError("qemu-img info returned no image description")
+    return data
+
+
+def outside_files(path: str, data: dict) -> list[str]:
+    """Files other than the image itself that converting *path* would read,
+    from its ``qemu-img info`` *data*: a backing file, a qcow2 external
+    data file, VMDK extents outside the image's folder. The image header
+    names them, and a hostile image names any readable file
+    (``~/.ssh/id_ed25519``); qemu-img convert copies it into the output."""
+    found = []
+    backing = data.get("full-backing-filename") or data.get("backing-filename")
+    if backing:
+        found.append(f"backing file {backing}")
+    specific = data.get("format-specific")
+    specific = specific.get("data") if isinstance(specific, dict) else None
+    if isinstance(specific, dict):
+        if specific.get("data-file"):
+            found.append(f"data file {specific['data-file']}")
+        folder = os.path.dirname(os.path.realpath(path))
+        for extent in specific.get("extents") or ():
+            name = extent.get("filename") if isinstance(extent, dict) else None
+            if not isinstance(name, str) or not name:
+                continue
+            real = os.path.realpath(os.path.join(folder, name))
+            if os.path.dirname(real) != folder:
+                found.append(f"extent {name} outside the image's folder")
+    return found
+
+
+def image_info(path: str) -> dict:
+    data = _qemu_info(path)
+    return {
+        "Format": data.get("format", "?"),
+        "Virtual size": data.get("virtual-size", 0),
+        "Actual size": data.get("actual-size", 0),
+        "Backing file": data.get("backing-filename") or data.get("full-backing-filename") or "",
+        "Encrypted": "yes" if data.get("encrypted") else "no",
+        "Dirty": "yes" if data.get("dirty-flag") else "no",
+    }
+
+
+def raw_target(path: str) -> str:
+    """Where Convert to Raw writes: ``<stem>.raw`` next to *path*, with a
+    number when that exists."""
+    folder, name = os.path.split(path)
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    target = os.path.join(folder, f"{stem}.raw")
+    n = 1
+    while os.path.exists(target):
+        target = os.path.join(folder, f"{stem}-{n}.raw")
+        n += 1
+    return target
+
+
+def _run_long(argv: list[str], progress=None, cancel=lambda: False) -> None:
+    """Run *argv* with no time limit - converting a 500 GB image takes
+    hours, and the fixed 10-minute timeout killed every such conversion -
+    feeding the percentages it prints (``qemu-img -p``) to *progress*, and
+    ending it when *cancel()* turns true (:class:`Cancelled`)."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=clean_child_env())
+    except OSError as exc:
+        raise ToolError(str(exc)) from exc
+    errors = bytearray()
+
+    def read_progress():
+        rest = b""
+        for chunk in iter(lambda: proc.stdout.read1(4096), b""):
+            *lines, rest = re.split(rb"[\r\n]", rest + chunk)
+            rest = rest[-256:]
+            for line in lines:
+                found = _QEMU_PROGRESS.search(line)
+                if found and progress is not None:
+                    progress(min(float(found.group(1)), 100.0))
+        found = _QEMU_PROGRESS.search(rest)
+        if found and progress is not None:
+            progress(min(float(found.group(1)), 100.0))
+
+    def read_errors():
+        for chunk in iter(lambda: proc.stderr.read1(4096), b""):
+            errors.extend(chunk)
+            del errors[:-65536]
+
+    readers = [threading.Thread(target=fn, daemon=True) for fn in (read_progress, read_errors)]
+    for reader in readers:
+        reader.start()
+    cancelled = False
+    while proc.poll() is None:
+        if cancel():
+            cancelled = True
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            break
+        time.sleep(0.1)
+    for reader in readers:
+        reader.join(5)
+    if cancelled:
+        raise Cancelled("cancelled")
+    if proc.returncode != 0:
+        lines = [ln for ln in errors.decode("utf-8", "replace").splitlines() if ln.strip()]
+        raise ToolError(lines[-1] if lines else f"{os.path.basename(argv[0])} failed "
+                                                 f"(exit {proc.returncode})")
+
+
+#: The progress and Cancel of the job dialog whose work runs on this thread
+#: (see :func:`job_hooks`).
+_JOB = threading.local()
+
+
+@contextlib.contextmanager
+def job_hooks(progress, cancel):
+    """``with job_hooks(progress, cancel): convert_to_raw(path, target)``:
+    the conversion on this thread reports to *progress* and stops at
+    *cancel* without the call naming them."""
+    _JOB.hooks = (progress, cancel)
+    try:
+        yield
+    finally:
+        _JOB.hooks = None
+
+
+def convert_to_raw(path: str, target: str | None = None, *, progress=None,
+                   cancel=None) -> str:
+    """``qemu-img convert`` *path* to a raw image *target*; *progress(percent)*
+    is called as it goes, *cancel()* stops it (the half-written target
+    is removed). Not given, they come from :class:`job_hooks`."""
+    hooks = getattr(_JOB, "hooks", None) or (None, None)
+    progress = progress or hooks[0]
+    cancel = cancel or hooks[1] or (lambda: False)
+    target = target or raw_target(path)
+    if os.path.exists(target):
+        raise ToolError(f"{target} exists - not overwritten")
+    data = _qemu_info(path)
+    outside = outside_files(path, data)
+    if outside:
+        raise ToolError("Not converted: the image would pull in other files - "
+                        + "; ".join(outside) + ".")
+    fmt = data.get("format")
+    if not isinstance(fmt, str) or not re.fullmatch(r"[a-z0-9_-]+", fmt):
+        raise ToolError(f"qemu-img info names no usable format for {path}")
+    try:
+        # -f: the format checked above; without it convert probes again.
+        _run_long([need("qemu-img"), "convert", "-f", fmt, "-O", "raw", "-p", path, target],
+                  progress, cancel)
+    except ToolError:
+        if os.path.exists(target):
+            os.unlink(target)  # a half-written image is no evidence
+        raise
+    return target
+
+
+# -- The Sleuth Kit -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Entry:
+    path: str
+    inode: str
+    kind: str
+    deleted: bool
+    reallocated: bool
+
+    @property
+    def is_dir(self) -> bool:
+        return self.kind == "d"
+
+
+def parse_fls(text: str) -> list[Entry]:
+    entries = []
+    for line in text.splitlines()[:MAX_FLS_LINES]:
+        match = _FLS.match(line)
+        if not match or match.group("path") in (".", ".."):
+            continue
+        entries.append(Entry(path=match.group("path"), inode=match.group("inode"),
+                             kind=match.group("type"), deleted=bool(match.group("deleted")),
+                             reallocated=bool(match.group("realloc"))))
+    return entries
+
+
+def list_files(image: str, sector_offset: int = 0) -> list[Entry]:
+    if not isinstance(sector_offset, int) or sector_offset < 0:
+        raise ValueError("the sector offset is a whole number >= 0")
+    return parse_fls(_run([need("fls"), "-r", "-p", "-o", str(sector_offset), image]))
+
+
+def safe_name(path: str) -> str:
+    """A file name for an extracted entry: its path, flattened."""
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.strip("/")).strip("._") or "unnamed"
+    return name[:200]
+
+
+def _with_inode(name: str, inode: str) -> str:
+    """*name* with the entry's inode before its extension: ``a-67.txt``."""
+    stem, ext = os.path.splitext(name)
+    return f"{stem}-{inode}{ext}"
+
+
+def extract(image: str, entries: list[Entry], folder: str, sector_offset: int = 0) -> list[str]:
+    """``icat`` each regular entry into *folder*; existing files are kept.
+    The paths written.
+
+    Entries whose flattened names meet (the deleted versions of one path,
+    one per inode) are all extracted: the first under the name, the others
+    with their inode added - the same names on every run, so extracting the
+    same selection again adds nothing."""
+    exe = need("icat")
+    written = []
+    taken: set[str] = set()  # names given out in this run
+    seen: set[tuple] = set()
+    for entry in entries:
+        if entry.is_dir or not re.fullmatch(r"[0-9][0-9-]*", entry.inode):
+            continue
+        if (entry.path, entry.inode, entry.deleted) in seen:
+            continue  # the same entry twice: one copy
+        seen.add((entry.path, entry.inode, entry.deleted))
+        name = ("deleted_" if entry.deleted else "") + safe_name(entry.path)
+        if name in taken:
+            name = _with_inode(name, entry.inode)
+        if name in taken:
+            continue  # same flattened name and inode (hard links): the same content
+        taken.add(name)
+        target = os.path.join(folder, name)
+        if os.path.exists(target):
+            continue
+        argv = [exe, "-o", str(sector_offset), image, entry.inode]
+        with open(target, "xb") as out:  # a file made meanwhile is not ours: no clean-up
+            try:
+                proc = subprocess.run(argv, stdout=out, stderr=subprocess.PIPE,
+                                      timeout=TIMEOUT, stdin=subprocess.DEVNULL, check=False,
+                                      env=clean_child_env())
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failure = exc
+            else:
+                failure = None
+        if failure is not None:
+            # A half-written file would be "kept" by the next Extract.
+            _remove(target)
+            raise ToolError(f"icat failed for {entry.path}: {failure}") from failure
+        if proc.returncode != 0:
+            _remove(target)
+            raise ToolError(proc.stderr.decode("utf-8", "replace").strip()
+                            or f"icat failed for {entry.path}")
+        written.append(target)
+    return written
+
+
+class _WatchedReads:
+    """*backend* for one long read: each ``read`` reports the bytes so far
+    to *progress* and raises :class:`Cancelled` once *cancel()* is true."""
+
+    def __init__(self, backend, cancel, progress) -> None:
+        self._backend, self._cancel, self._progress = backend, cancel, progress
+        self.done = 0
+
+    def open_read(self, path):
+        watched = self
+
+        class _File:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._fh.close()
+                return False
+
+            def read(self, size=-1):
+                if watched._cancel():
+                    raise Cancelled("cancelled")
+                chunk = self._fh.read(size)
+                watched.done += len(chunk)
+                watched._progress(watched.done)
+                return chunk
+
+        return _File(self._backend.open_read(path))
+
+
+def _remove(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+# -- interface ----------------------------------------------------------------------------
+
+
+def activate(api):
+    from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
+    from PyQt6.QtWidgets import (
+        QAbstractItemView,
+        QApplication,
+        QDialog,
+        QFileDialog,
+        QHBoxLayout,
+        QInputDialog,
+        QLabel,
+        QLineEdit,
+        QMessageBox,
+        QPushButton,
+        QTableView,
+        QVBoxLayout,
+    )
+
+    from core import disk_image as DI
+    from core.i18n import tr, tr_n
+    from resources.extensions._pane import refresh_pane
+    from ui.plain_text import plain_message
+
+    class JobDialog(QDialog):
+        """A long job's progress, with Cancel. Not modal: axross stays
+        usable meanwhile. The worker only stores numbers; a timer shows
+        them, so no Qt call leaves the GUI thread."""
+
+        def __init__(self, title, text, *, percent):
+            from PyQt6.QtCore import QTimer
+            from PyQt6.QtWidgets import QProgressBar
+
+            super().__init__(api.window)
+            from ui.icon_provider import set_window_icon
+
+            set_window_icon(self, "forensics")
+            self.setWindowTitle(title)
+            self.cancel_event = threading.Event()
+            self.value = None
+            layout = QVBoxLayout(self)
+            label = QLabel(text)
+            label.setTextFormat(Qt.TextFormat.PlainText)  # the path is not ours
+            layout.addWidget(label)
+            self.bar = QProgressBar()
+            self.bar.setRange(0, 100 if percent else 0)
+            layout.addWidget(self.bar)
+            self.detail = QLabel("")
+            self.detail.setTextFormat(Qt.TextFormat.PlainText)
+            layout.addWidget(self.detail)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            self.cancel_button = QPushButton(tr("Cancel"))
+            self.cancel_button.clicked.connect(self.cancel)
+            row.addWidget(self.cancel_button)
+            layout.addLayout(row)
+            self.percent = percent
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self._show_value)
+            self.timer.start(200)
+            from ui.close_corner import add_close_corner
+
+            add_close_corner(self)  # closing it means Cancel (closeEvent)
+            self.resize(460, self.sizeHint().height())
+
+        def report(self, value):  # any thread
+            self.value = value
+
+        def _show_value(self):
+            value = self.value
+            if value is None:
+                return
+            if self.percent:
+                self.bar.setValue(int(value))
+            else:
+                self.detail.setText(tr("{size} read").format(size=DI.human_size(value)))
+
+        def cancel(self):
+            self.cancel_event.set()
+            self.cancel_button.setEnabled(False)
+            self.detail.setText(tr("Cancelling…"))
+
+        def reject(self):  # Esc, the window's [x]
+            self.cancel()
+
+        def closeEvent(self, event):  # noqa: N802 - Qt
+            if self.timer.isActive():  # still running: closing means Cancel
+                self.cancel()
+                event.ignore()
+                return
+            super().closeEvent(event)
+
+        def finish(self):
+            """The job ended: the dialog goes; True when it was cancelled."""
+            self.timer.stop()
+            self.hide()
+            self.deleteLater()
+            return self.cancel_event.is_set()
+
+    def job(title, text, work, done, *, percent):
+        """Run *work(dialog)* in the background with a JobDialog."""
+        dialog = JobDialog(title, text, percent=percent)
+        dialog.show()
+
+        def finished(result):
+            if not dialog.finish():
+                done(result)
+            else:
+                api.notify(tr("{title}: cancelled").format(title=title))
+
+        def failed(exc):
+            if dialog.finish() or isinstance(exc, Cancelled):
+                api.notify(tr("{title}: cancelled").format(title=title))
+                return
+            warn(title)(exc)
+
+        api.run_in_background(lambda: work(dialog), on_done=finished, on_error=failed)
+
+    def local(ctx):
+        if not ctx.is_local:
+            api.notify(tr("this tool needs the image on this computer"))
+            return None
+        return ctx.paths[0]
+
+    def missing(exc) -> bool:
+        """A program that is not installed: say so with "Show in
+        Features…", which shows how to install it. True when it was that."""
+        key = feature_key(exc.tool) if isinstance(exc, ToolMissing) else None
+        if key is None:
+            return False
+        from ui.features_dialog import offer_features
+
+        offer_features(api.window, key, tr("{tool} is not installed (package: {package}).").format(
+            tool=exc.tool, package=PACKAGES.get(exc.tool, exc.tool)))
+        return True
+
+    def warn(title):
+        # An error names the image (or says what a tool printed about it):
+        # shown as plain text, never as markup.
+        return lambda exc: missing(exc) or plain_message(api.window, QMessageBox.Icon.Warning, title,
+                                                         str(exc)).exec()
+
+    def do_hash(ctx):
+        path = ctx.paths[0]
+        api.notify(tr("hashing {name}…").format(name=os.path.basename(path)))
+
+        def done(result):
+            text = "\n".join(f"{k}: {v}" for k, v in result.items())
+            # The path is the first line: as AutoText a name such as
+            # "evidence<br><br>MD5: 0123…<!--.dd" rendered as markup, showing
+            # forged hashes and hiding the real ones below a comment.
+            box = plain_message(api.window, QMessageBox.Icon.Information, tr("Hash Image"),
+                                f"{path}\n\n{text}", QMessageBox.StandardButton.NoButton)
+            copy = box.addButton(tr("Copy"), QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Close)
+            box.exec()
+            if box.clickedButton() is copy:
+                QApplication.clipboard().setText(f"{path}\n{text}\n")
+
+        def work(dialog):
+            reads = _WatchedReads(ctx.backend, dialog.cancel_event.is_set, dialog.report)
+            return hash_image(reads, path)
+
+        job(tr("Hash Image"), tr("Hashing\n{path}").format(path=path), work, done, percent=False)
+
+    def do_info(ctx):
+        path = local(ctx)
+        if path is None:
+            return
+
+        def done(info):
+            def shown(v):
+                if isinstance(v, int):
+                    return DI.human_size(v)
+                return tr(v) if v in ("yes", "no") else v
+
+            lines = [f"{tr(k)}: {shown(v)}" for k, v in info.items()]
+            plain_message(api.window, QMessageBox.Icon.Information, tr("Image Info"),
+                          f"{path}\n\n" + "\n".join(lines)).exec()
+
+        api.run_in_background(lambda: image_info(path), on_done=done,
+                              on_error=warn(tr("Image Info")))
+
+    def do_convert(ctx):
+        path = local(ctx)
+        if path is None:
+            return
+        target = raw_target(path)
+        if plain_message(api.window, QMessageBox.Icon.Question, tr("Convert to Raw Image"),
+                         tr("Write a raw copy of\n{path}\nto\n{target}?").format(path=path, target=target),
+                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No).exec() \
+                != QMessageBox.StandardButton.Yes:
+            return
+        api.notify(tr("converting to {name}…").format(name=os.path.basename(target)))
+
+        def done(written):
+            api.notify(tr("wrote {path}").format(path=written))
+            refresh_pane(ctx.pane)  # not blocking; skipped for a pane closed meanwhile
+
+        def work(dialog):
+            with job_hooks(dialog.report, dialog.cancel_event.is_set):
+                return convert_to_raw(path, target)
+
+        job(tr("Convert to Raw Image"),
+            tr("Converting\n{path}\nto\n{target}").format(path=path, target=target),
+            work, done, percent=True)
+
+    class EntryModel(QAbstractTableModel):
+        """The fls entries as a table model: 200 000 of them as table items
+        took 16 s on the GUI thread, a model answers only what is shown."""
+
+        HEADERS = ("Path", "Inode", "Type", "Deleted")
+
+        def __init__(self, entries, parent=None):
+            super().__init__(parent)
+            self.entries = entries
+
+        def rowCount(self, parent=QModelIndex()):  # noqa: N802 - Qt
+            return 0 if parent.isValid() else len(self.entries)
+
+        def columnCount(self, parent=QModelIndex()):  # noqa: N802 - Qt
+            return 0 if parent.isValid() else len(self.HEADERS)
+
+        def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: N802
+            if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+                return tr(self.HEADERS[section])
+            return None
+
+        def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+            if role != Qt.ItemDataRole.DisplayRole or not index.isValid():
+                return None
+            e = self.entries[index.row()]
+            column = index.column()
+            if column == 0:
+                return e.path
+            if column == 1:
+                return e.inode
+            if column == 2:
+                return {"d": tr("folder"), "r": tr("file"), "l": tr("link")}.get(e.kind, e.kind)
+            return (tr("yes (reallocated)") if e.reallocated else tr("yes")) if e.deleted else ""
+
+    class BrowseDialog(QDialog):
+        def __init__(self, image, sector, entries):
+            super().__init__(api.window)
+            from ui.icon_provider import set_window_icon
+
+            set_window_icon(self, "forensics")
+            self.image, self.sector, self.entries = image, sector, entries
+            self.setWindowTitle("Sleuth Kit - " + os.path.basename(image))
+            self.resize(820, 520)
+            layout = QVBoxLayout(self)
+            deleted = sum(e.deleted for e in entries)
+            layout.addWidget(QLabel(tr("{n} entries, {deleted} deleted (partition at sector {sector})").format(
+                n=len(entries), deleted=deleted, sector=sector)))
+            self.filter = QLineEdit()
+            self.filter.setPlaceholderText(tr("Filter paths…"))
+            self.filter.textChanged.connect(self.apply_filter)
+            layout.addWidget(self.filter)
+            self.model = EntryModel(entries, self)
+            # One pass over the paths per filter text; hiding table rows one
+            # by one took 97 s for 200 000 entries.
+            self.proxy = QSortFilterProxyModel(self)
+            self.proxy.setSourceModel(self.model)
+            self.proxy.setFilterKeyColumn(0)
+            self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            self.table = QTableView()
+            self.table.setModel(self.proxy)
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.verticalHeader().hide()
+            self.table.resizeColumnsToContents()
+            layout.addWidget(self.table, 1)
+            buttons = QHBoxLayout()
+            extract_button = QPushButton(tr("Extract…"))
+            extract_button.clicked.connect(self.extract_selected)
+            close = QPushButton(tr("Close"))
+            close.clicked.connect(self.close)
+            buttons.addStretch(1)
+            buttons.addWidget(extract_button)
+            buttons.addWidget(close)
+            layout.addLayout(buttons)
+            from ui.close_corner import add_close_corner
+
+            add_close_corner(self)
+
+        def apply_filter(self, text):
+            self.proxy.setFilterFixedString(text)
+
+        def visible_entries(self):
+            return [self.entries[self.proxy.mapToSource(self.proxy.index(r, 0)).row()]
+                    for r in range(self.proxy.rowCount())]
+
+        def selected(self):
+            rows = sorted({self.proxy.mapToSource(i).row()
+                           for i in self.table.selectionModel().selectedRows()})
+            return [self.entries[r] for r in rows]
+
+        def extract_selected(self):
+            picked = [e for e in self.selected() if not e.is_dir]
+            if not picked:
+                return
+            folder = QFileDialog.getExistingDirectory(self, tr("Extract into"))
+            if not folder:
+                return
+            image, sector = self.image, self.sector
+            api.run_in_background(
+                lambda: extract(image, picked, folder, sector),
+                on_done=lambda written: api.notify(tr_n(len(written), "extracted {n} file to {folder}",
+                                                        "extracted {n} files to {folder}", folder=folder)),
+                on_error=warn(tr("Extract")))
+
+    def do_browse(ctx):
+        path = local(ctx)
+        if path is None:
+            return
+
+        def got_layout(info):
+            parts = [p for p in info.partitions if p.filesystem not in ("swap", "")
+                     or p.number == 0] or info.partitions
+            if not parts and info.note:
+                container_hint(info)
+                return
+            if not parts:
+                QMessageBox.information(api.window, tr("Browse File System"),
+                                        tr("No partition or file system found in this image."))
+                return
+            part = parts[0]
+            if len(parts) > 1:
+                labels = [f"{p.number}: {p.filesystem or p.type_name} {p.label} "
+                          f"({DI.human_size(p.size)})" for p in parts]
+                choice, ok = QInputDialog.getItem(api.window, tr("Browse File System"), tr("Partition:"),
+                                                  labels, editable=False)
+                if not ok:
+                    return
+                part = parts[labels.index(choice)]
+            # fls / icat count -o in 512-byte sectors whatever the disk's own
+            # sector size (TSK reads a raw image with 512 unless -b names
+            # another): a 4Kn disk's LBAs would land an eighth of the way in.
+            if part.start % TSK_SECTOR:
+                QMessageBox.warning(api.window, tr("Browse File System"),
+                                    tr("Partition {n} does not start on a 512-byte boundary; "
+                                       "The Sleuth Kit cannot be pointed at it.").format(n=part.number))
+                return
+            sector = part.start // TSK_SECTOR
+            api.run_in_background(
+                lambda: list_files(path, sector),
+                on_done=lambda entries: _show(path, sector, entries),
+                on_error=warn(tr("Browse File System")))
+
+        def container_hint(info):
+            # A qcow2, VMDK, dynamic VDI, VHD(X) or E01 keeps its partitions
+            # inside a container The Sleuth Kit cannot read: say how to get
+            # at them (core.disk_image's note) instead of "nothing found".
+            box = plain_message(api.window, QMessageBox.Icon.Information, tr("Browse File System"),
+                                f"{os.path.basename(path)}: {info.description}.\n\nThe Sleuth "
+                                "Kit cannot read the partitions inside this container. "
+                                f"{info.note}", QMessageBox.StandardButton.NoButton)
+            convert = None
+            if info.kind in QEMU_CONVERTS:
+                convert = box.addButton(tr("Convert to Raw…"), QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Close)
+            box.exec()
+            if convert is not None and box.clickedButton() is convert:
+                do_convert(ctx)
+
+        def _show(path, sector, entries):
+            dialog = BrowseDialog(path, sector, entries)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.show()
+            api.window._forensic_browse_dialog = dialog
+
+        api.run_in_background(lambda: DI.inspect_path(path), on_done=got_layout,
+                              on_error=warn(tr("Browse File System")))
+
+    def terminal(tool):
+        def start(ctx):
+            path = local(ctx)
+            if path is None:
+                return
+            try:
+                exe = need(tool)
+            except ToolError as exc:
+                if not missing(exc):
+                    plain_message(api.window, QMessageBox.Icon.Warning, tool, str(exc)).exec()
+                return
+            opener = getattr(api.window, "open_terminal_command", None)
+            if opener is None:
+                api.notify(tr("this axross cannot start a terminal command"))
+                return
+            opener([exe, path], cwd=os.path.dirname(path), label=f"{tool}: {os.path.basename(path)}")
+        return start
+
+    exts = suffixes()
+    api.add_context_action("Hash Image (MD5, SHA-1, SHA-256)", do_hash, applies_to="single_file",
+                           extensions=exts, icon="forensics")
+    api.add_context_action("Image Info (qemu-img)", do_info, applies_to="single_file",
+                           extensions=exts, icon="forensics")
+    api.add_context_action("Convert to Raw Image (qemu-img)…", do_convert,
+                           applies_to="single_file", extensions=exts, icon="forensics")
+    api.add_context_action("Browse File System (Sleuth Kit)…", do_browse,
+                           applies_to="single_file", extensions=exts, icon="forensics")
+    api.add_context_action("Recover Partitions (TestDisk)", terminal("testdisk"),
+                           applies_to="single_file", extensions=exts, icon="forensics")
+    api.add_context_action("Carve Files (PhotoRec)", terminal("photorec"),
+                           applies_to="single_file", extensions=exts, icon="forensics")

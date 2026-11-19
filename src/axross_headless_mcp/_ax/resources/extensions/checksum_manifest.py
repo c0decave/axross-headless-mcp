@@ -1,0 +1,317 @@
+"""Create and verify SHA256SUMS manifests, on any backend."""
+
+from __future__ import annotations
+
+import hashlib
+import posixpath
+import secrets
+
+from core.i18n import tr
+from resources.extensions._pane import refresh_pane
+
+EXTENSION = {
+    "name": "Checksum Manifest",
+    "version": "1.0",
+    "description": "Right-click: write a SHA256SUMS file for the selected files (or the "
+    "folder), and verify one - in sha256sum format, on local and remote folders.",
+    "author": "axross",
+}
+
+MANIFEST_NAME = "SHA256SUMS"
+CHUNK = 1024 * 1024
+#: A manifest line longer than this is ignored as garbage.
+MAX_LINE = 4096
+#: What verify() puts in "errors" for a manifest that lists no file at all:
+#: an empty SHA256SUMS (one left by a write that failed) checked nothing and
+#: must not read as a clean folder.
+NO_ENTRIES = "no entries"
+
+
+def sha256_of(backend, path: str) -> str:
+    digest = hashlib.sha256()
+    with backend.open_read(path) as fh:
+        while True:
+            chunk = fh.read(CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+#: What sha256sum escapes in a name (and then starts the line with a backslash).
+_ESCAPES = {"\\": "\\\\", "\n": "\\n", "\r": "\\r"}
+_UNESCAPES = {"\\": "\\", "n": "\n", "r": "\r"}
+_HEX = frozenset("0123456789abcdef")
+
+
+def manifest_line(digest: str, name: str) -> str:
+    """One line as GNU sha256sum writes it: ``<sha256>  <name>``, and for a
+    name with a backslash, newline or carriage return those escaped
+    (``\\\\``, ``\\n``, ``\\r``) and a backslash in front of the line."""
+    if any(c in name for c in _ESCAPES):
+        return "\\" + digest + "  " + "".join(_ESCAPES.get(c, c) for c in name)
+    return f"{digest}  {name}"
+
+
+def manifest_text(backend, folder: str, names: list[str]) -> str:
+    """``<sha256>  <name>`` lines for *names* in *folder*, sorted."""
+    lines = []
+    for name in sorted(names):
+        lines.append(manifest_line(sha256_of(backend, backend.join(folder, name)), name))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def merged_manifest(old_text: str, new_text: str) -> str:
+    """*old_text* with the lines of *new_text* added or put in place of
+    the old line for the same name; sorted by name. Lines of the old
+    manifest that do not parse are dropped."""
+    entries = dict((name, digest) for digest, name in parse_manifest(old_text))
+    entries.update((name, digest) for digest, name in parse_manifest(new_text))
+    lines = [manifest_line(entries[name], name) for name in sorted(entries)]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _unescape(name: str) -> str | None:
+    out = []
+    chars = iter(name)
+    for c in chars:
+        if c != "\\":
+            out.append(c)
+            continue
+        plain = _UNESCAPES.get(next(chars, ""))
+        if plain is None:  # a lone or unknown escape: sha256sum refuses the line too
+            return None
+        out.append(plain)
+    return "".join(out)
+
+
+def parse_line(line: str) -> tuple[str, str] | None:
+    """``(sha256, name)`` of one manifest line, None when it does not parse
+    or its name leaves the folder (``../x``, ``/etc/x``). The name is taken
+    exactly as written: sha256sum's ``<hash>  <name>`` (text) or
+    ``<hash> *<name>`` (binary), its escaped form (``\\<hash>  a\\\\b``),
+    trailing spaces, a leading ``*`` and backslashes in a plain name kept."""
+    if line.endswith("\r"):
+        line = line[:-1]  # a manifest saved with CRLF line ends
+    if len(line) > MAX_LINE:
+        return None
+    line = line.lstrip(" \t")
+    escaped = line.startswith("\\")
+    if escaped:
+        line = line[1:]
+    digest, sep, name = line[:64].lower(), line[64:66], line[66:]
+    if len(digest) != 64 or not _HEX.issuperset(digest) or sep not in ("  ", " *"):
+        return None
+    if escaped:
+        name = _unescape(name)
+        if name is None:
+            return None
+    if not name or "\0" in name:
+        return None
+    norm = posixpath.normpath(name)
+    if norm.startswith(("../", "/")) or norm in ("..", ".", ""):
+        return None
+    return digest, norm
+
+
+def read_manifest(text: str) -> tuple[list[tuple[str, str]], list[int]]:
+    """``(sha256, name)`` pairs and the numbers of the lines that did not
+    parse (empty lines are no error)."""
+    pairs, bad = [], []
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        pair = parse_line(line)
+        if pair is None:
+            bad.append(number)
+        else:
+            pairs.append(pair)
+    return pairs, bad
+
+
+def parse_manifest(text: str) -> list[tuple[str, str]]:
+    """``(sha256, name)`` pairs; malformed lines and names that leave the
+    folder (``../x``, ``/etc/x``) are left out (:func:`read_manifest`
+    tells which)."""
+    return read_manifest(text)[0]
+
+
+def verify(backend, folder: str, text: str) -> dict[str, list[str]]:
+    """``{"ok": [...], "failed": [...], "missing": [...], "errors": [...]}``
+    by name; "errors" names the lines that do not parse ("line 3") - they
+    were dropped silently, so a broken manifest looked verified."""
+    pairs, bad = read_manifest(text)
+    result: dict[str, list[str]] = {"ok": [], "failed": [], "missing": [],
+                                    "errors": [f"line {n}" for n in bad]}
+    if not pairs and not bad:
+        result["errors"].append(NO_ENTRIES)
+    for digest, name in pairs:
+        path = backend.join(folder, *name.split("/"))
+        try:
+            actual = sha256_of(backend, path)
+        except OSError:
+            result["missing"].append(name)
+            continue
+        result["ok" if actual == digest else "failed"].append(name)
+    return result
+
+
+def _write(backend, path: str, text: str) -> None:
+    """Write *text* to *path*, all or nothing.
+
+    A name that is no UTF-8 (``caf\\xe9.txt``, held as a surrogate escape)
+    is written as its own bytes, the way sha256sum writes it. The text is
+    encoded before anything is opened and goes to a temporary file that is
+    renamed into place: before, the encoding failed after *path* had been
+    truncated, and the empty SHA256SUMS left behind later "verified"."""
+    data = text.encode("utf-8", "surrogateescape")
+    temp = backend.join(backend.parent(path), f".{MANIFEST_NAME}.{secrets.token_hex(4)}.part")
+    try:
+        with backend.open_write(temp) as fh:
+            fh.write(data)
+        backend.rename(temp, path)
+    except BaseException:
+        try:
+            backend.remove(temp)
+        except Exception:  # noqa: BLE001 - never written, or already gone
+            pass
+        raise
+
+
+def ask_existing(parent, folder: str, count: int) -> str | None:
+    """A manifest is there already: "update" (the lines of the *count*
+    files hashed now added or renewed, the others kept), "replace" or None
+    (Cancel). Before, an existing manifest was never written."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    from ui.plain_text import plain_message
+
+    box = plain_message(
+        parent, QMessageBox.Icon.Question, tr("Create SHA256SUMS"),
+        tr("{name} already exists in {folder}.\n\nUpdate: add or renew the lines of the "
+           "{n} file(s) hashed now and keep the others.\nReplace: write a new {name} "
+           "with only them.").format(name=MANIFEST_NAME, folder=_shown(folder), n=count),
+        QMessageBox.StandardButton.NoButton)
+    update = box.addButton(tr("Update"), QMessageBox.ButtonRole.AcceptRole)
+    replace = box.addButton(tr("Replace"), QMessageBox.ButtonRole.DestructiveRole)
+    box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(update)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is update:
+        return "update"
+    if clicked is replace:
+        return "replace"
+    return None
+
+
+def _shown(name: str) -> str:
+    """*name* as it can be shown: a byte that is no UTF-8 (held as a
+    surrogate escape) as U+FFFD."""
+    return name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def activate(api):
+    def create(ctx):
+        # Everything that asks the backend runs in the background: the
+        # folder listing, the check for an existing manifest, the hashing
+        # and the write (on a remote folder each was a round trip that
+        # held the window), and the pane is shown again without blocking.
+        backend, folder = ctx.backend, ctx.folder
+        # The manifest never lists itself: with every file selected (Ctrl+A)
+        # it did, and Verify then reported "FAILED: SHA256SUMS".
+        chosen = [i.name for i in ctx.items
+                  if not i.is_dir and i.name not in ("..", ".", MANIFEST_NAME)]
+        folders = [i.name for i in ctx.items if i.is_dir and i.name not in ("..", ".")]
+        whole_folder = not ctx.items  # nothing selected: every file of the folder
+        if not chosen and len(folders) == 1:
+            # One folder selected: its files, the manifest in it (before:
+            # "no files to checksum").
+            folder, whole_folder = backend.join(folder, folders[0]), True
+        target = backend.join(folder, MANIFEST_NAME)
+
+        def work(mode="new"):
+            files = chosen
+            if whole_folder:
+                files = [
+                    i.name
+                    for i in backend.list_dir(folder)
+                    if not i.is_dir and i.name not in ("..", ".", MANIFEST_NAME)
+                ]
+            if not files:
+                return ("none", 0)
+            if mode == "new" and backend.exists(target):
+                return ("exists", len(files))
+            text = manifest_text(backend, folder, files)
+            if mode == "update":
+                with backend.open_read(target) as fh:
+                    old = fh.read(16 * 1024 * 1024).decode("utf-8", "surrogateescape")
+                text = merged_manifest(old, text)
+            _write(backend, target, text)
+            return ("written", len(files))
+
+        def done(result):
+            kind, count = result
+            if kind == "none":
+                api.notify(tr("no files to checksum"))
+                return
+            if kind == "exists":
+                mode = ask_existing(api.window, folder, count)
+                if mode is None:
+                    api.notify(tr("{name} already exists here – not overwritten").format(
+                        name=MANIFEST_NAME))
+                    return
+                api.run_in_background(lambda: work(mode), on_done=done)
+                return
+            api.notify(tr("wrote {name} for {n} file(s)").format(name=MANIFEST_NAME, n=count))
+            refresh_pane(ctx.pane)
+
+        api.notify(tr("hashing {n} file(s)…").format(n=len(chosen)) if chosen
+                   else tr("hashing the folder…"))
+        api.run_in_background(work, on_done=done)
+
+    def check(ctx):
+        item = next(i for i in ctx.items if not i.is_dir)
+        path = ctx.backend.join(ctx.folder, item.name)
+
+        def work():
+            with ctx.backend.open_read(path) as fh:
+                # surrogateescape: a name that is no UTF-8 is looked up as
+                # its own bytes (as _write writes it), not as U+FFFD.
+                text = fh.read(16 * 1024 * 1024).decode("utf-8", "surrogateescape")
+            return verify(ctx.backend, ctx.folder, text)
+
+        def done(result):
+            from PyQt6.QtWidgets import QMessageBox
+
+            from ui.plain_text import plain_message
+
+            if not (result["ok"] or result["failed"] or result["missing"]) \
+                    and result["errors"] == [NO_ENTRIES]:
+                # An empty manifest checked nothing: never "all is well".
+                plain_message(api.window, QMessageBox.Icon.Warning, tr("Verify SHA256SUMS"),
+                              tr("{name} lists no files: nothing was verified.").format(
+                                  name=_shown(item.name))).exec()
+                return
+            summary = (
+                f"OK: {len(result['ok'])}\nFAILED: {len(result['failed'])}\n"
+                f"Missing: {len(result['missing'])}\n"
+                f"Unreadable lines: {len(result['errors'])}"
+            )
+            bad = result["failed"] + result["missing"] + result["errors"]
+            if bad:
+                summary += "\n\n" + "\n".join(_shown(name) for name in bad[:30])
+            # The names are the manifest's, not ours: plain text.
+            icon = QMessageBox.Icon.Warning if bad else QMessageBox.Icon.Information
+            plain_message(api.window, icon, tr("Verify SHA256SUMS"), summary).exec()
+
+        api.run_in_background(work, on_done=done)
+
+    api.add_context_action("Create SHA256SUMS", create, applies_to="any", icon="shield")
+    api.add_context_action(
+        "Verify SHA256SUMS", check, applies_to="single_file", extensions=("sha256sums", ".sha256"),
+        icon="shield",
+    )

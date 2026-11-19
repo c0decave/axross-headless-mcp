@@ -1,0 +1,2233 @@
+"""Telnet backend implementing the FileBackend protocol.
+
+Uses raw shell commands over a custom telnet transport to provide
+filesystem operations.  No external dependencies — pure stdlib sockets.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import codecs
+import errno
+import io
+import logging
+import posixpath
+import re
+import shlex
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import IO, TYPE_CHECKING
+
+from core import transfer_hooks
+from core.posix_compat import wait_io
+from core.read_spool import new_spool
+from core.backend import SessionLifecycle
+from core.exec_util import shell_path
+from core.path_policy import refuse_control_chars
+from models.file_item import FileItem
+from security.protocol_line_split import split_lf_only_stream
+
+if TYPE_CHECKING:  # pragma: no cover — type-hint only, no runtime cost
+    from core.proxy import ProxyConfig
+    from models.exec_result import ExecResult
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Telnet protocol constants (RFC 854 / 855)
+# ---------------------------------------------------------------------------
+IAC = 0xFF  # Interpret As Command
+DONT = 0xFE
+DO = 0xFD
+WONT = 0xFC
+WILL = 0xFB
+SB = 0xFA  # Sub-negotiation Begin
+SE = 0xF0  # Sub-negotiation End
+NOP = 0xF1
+GA = 0xF9  # Go Ahead
+
+# Common option codes
+OPT_ECHO = 1
+OPT_SGA = 3  # Suppress Go-Ahead
+OPT_TTYPE = 24  # Terminal Type
+OPT_NAWS = 31  # Negotiate About Window Size
+OPT_LINEMODE = 34
+
+_PROMPT_MARKER = "__AXX_PROMPT__"
+
+#: Environment of every remote shell command. C.UTF-8 formats dates and
+#: numbers like C, so ls -la stays parseable, but lets ls print names
+#: outside ASCII: under LANG=C BusyBox ls printed "?" for each such byte
+#: and GNU ls on a terminal quoted them in shell-escape style.
+#: QUOTING_STYLE=literal turns GNU ls's quoting off; BusyBox ignores it.
+SHELL_ENV = "LANG=C.UTF-8 LC_ALL=C.UTF-8 QUOTING_STYLE=literal"
+_CMD_START_PREFIX = "__AXX_CMD_START_"
+_CMD_EXIT_PREFIX = "__AXX_CMD_EXIT_"
+
+# Login prompt patterns (case-insensitive)
+_LOGIN_RE = re.compile(r"(login|username)\s*:", re.IGNORECASE)
+_PASSWORD_RE = re.compile(r"password\s*:", re.IGNORECASE)
+_SHELL_PROMPT_RE = re.compile(r"[$#%>]\s*$")
+#: A login prompt the server shows AGAIN after the password: the login was
+#: refused ("Login incorrect", then "login:"). Anchored at the end: "Last
+#: login: Mon ..." in a welcome message is no prompt.
+_RELOGIN_RE = re.compile(r"(login|username|password)\s*:\s*$", re.IGNORECASE)
+_REFUSAL_WORDS = ("incorrect", "denied", "failed", "invalid", "bad")
+
+
+class LoginFailure(PermissionError):
+    """The server refused the user name or password (core.user_errors
+    knows the class by name and says so in a sentence)."""
+
+
+def _login_verdict(text: str) -> bool | None:
+    """True: logged in (a shell prompt ends the answer); False: refused (a
+    new login or password prompt ends it, or refusal words without any
+    prompt); None: not decided yet.
+
+    Only what the answer ENDS with decides: RHEL greets a good login with
+    "Last failed login: ... 3 failed login attempts", which the old word
+    search refused as invalid credentials."""
+    if _RELOGIN_RE.search(text):
+        return False
+    if _SHELL_PROMPT_RE.search(text):
+        return True
+    return None
+
+# Strip ANSI escape sequences (colors, cursor movements, etc.)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\([AB0-2]")
+
+# ls -la line parser
+_LS_LINE_RE = re.compile(
+    r"^([dlcbps-])"  # type char
+    r"([rwxsStT-]{9})[.+@]?\s+"  # permissions; GNU appends . (SELinux) / + (ACL), macOS @
+    r"(\d+)\s+"  # nlinks
+    r"(\S+)\s+"  # owner
+    r"(\S+)\s+"  # group
+    r"(\d+|\d+,\s*\d+)\s+"  # size, or "major, minor" for a device
+    r"(.{12}) "  # date (fixed width), then ONE space
+    r"(.+)$"  # name, exactly as printed: blanks at either end are part of it
+)
+
+CONNECT_TIMEOUT = 15.0
+CMD_TIMEOUT = 30.0
+TRANSFER_TIMEOUT = 300.0
+#: Server-side cp / mv / rm -rf: they take as long as the data takes. Under
+#: CMD_TIMEOUT a long copy was reported failed while it went on running.
+TREE_OP_TIMEOUT = 3600.0
+#: Encoded characters per upload heredoc; larger files take several.
+MAX_HEREDOC_CHARS = 64 * 1024
+_READ_SLICE = 0.1  # select() poll interval
+MAX_READ_UNTIL_CHARS = 64 * 1024 * 1024
+#: Bytes of a file one command of a download moves (``dd ... | base64``):
+#: each piece is one answer, reports progress and checks Cancel.
+TELNET_READ_CHUNK = 4 * 1024 * 1024
+# Longest IAC SB ... IAC SE the transport waits for. Real subnegotiations
+# (terminal type, window size, environment) are a few dozen bytes.
+MAX_SUBNEGOTIATION_BYTES = 64 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: Raw Telnet Transport
+# ---------------------------------------------------------------------------
+def _validate_telnet_host(host: str) -> None:
+    """Reject control characters and whitespace in telnet host strings."""
+    if not host:
+        raise OSError("Telnet host must not be empty")
+    if any(ch in host for ch in ("\r", "\n", "\x00")):
+        raise OSError("Telnet host contains invalid control characters")
+    if any(ch.isspace() for ch in host):
+        raise OSError("Telnet host must not contain whitespace")
+
+
+_FAMILIES = {"ipv4": socket.AF_INET, "ipv6": socket.AF_INET6}
+
+
+def _connect_direct(host: str, port: int, timeout: float, address_family: str) -> socket.socket:
+    """A TCP connection to *host*; with *address_family* "ipv4" / "ipv6"
+    (the profile's IP version) only to addresses of that family - the
+    dialog offered the choice and the connection ignored it."""
+    family = _FAMILIES.get(address_family or "auto")
+    if family is None:
+        return socket.create_connection((host, port), timeout=timeout)
+    last: OSError | None = None
+    for fam, kind, proto, _name, addr in socket.getaddrinfo(
+        host, port, family, socket.SOCK_STREAM
+    ):
+        sock = socket.socket(fam, kind, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(addr)
+            return sock
+        except OSError as exc:
+            last = exc
+            sock.close()
+    raise last or OSError(f"no {address_family} address for {host}")
+
+
+class _TelnetTransport:
+    """Raw TCP socket with telnet IAC negotiation (IPv4 + IPv6).
+
+    Accepts an optional :class:`core.proxy.ProxyConfig` — when set,
+    the underlying socket is created through the proxy instead of a
+    direct TCP connect. Telnet is plain-text TCP, so any
+    SOCKS4/SOCKS5/HTTP-CONNECT proxy can tunnel it.
+    """
+
+    #: Bytes the server sent while a send waited for room (_send_all):
+    #: read before the socket.
+    _early: bytes = b""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float = CONNECT_TIMEOUT,
+        proxy: "ProxyConfig | None" = None,
+        naws_width: int = 0,
+        naws_height: int = 0,
+        address_family: str = "auto",
+    ):
+        _validate_telnet_host(host)
+        if not 0 < int(port) < 65536:
+            raise OSError(f"Telnet port out of range: {port}")
+
+        self._host = host
+        self._port = port
+        # NAWS geometry: 0 means "use module default" — see
+        # core.client_identity.TELNET_NAWS_{WIDTH,HEIGHT}.
+        from core.client_identity import TELNET_NAWS_HEIGHT, TELNET_NAWS_WIDTH
+
+        self._naws_width = naws_width if naws_width > 0 else TELNET_NAWS_WIDTH
+        self._naws_height = naws_height if naws_height > 0 else TELNET_NAWS_HEIGHT
+        try:
+            if proxy is not None and proxy.enabled:
+                # SSRF guard + deny-listed-range check live inside
+                # create_proxy_socket.
+                from core.proxy import create_proxy_socket
+
+                self._sock = create_proxy_socket(
+                    proxy,
+                    host,
+                    int(port),
+                    timeout=timeout,
+                )
+                log.info(
+                    "Telnet via %s proxy %s:%d → %s:%d",
+                    proxy.proxy_type,
+                    proxy.host,
+                    proxy.port,
+                    host,
+                    port,
+                )
+            else:
+                # create_connection transparently handles IPv4/IPv6 via
+                # getaddrinfo and tries each resolved address until one
+                # succeeds.
+                self._sock = _connect_direct(host, int(port), timeout, address_family)
+        except (socket.gaierror, OSError, ConnectionError) as e:
+            log.warning("Telnet connect to %s:%d failed: %s", host, port, e)
+            raise OSError(f"Cannot connect to {host}:{port}: {e}") from e
+        self._sock.setblocking(False)
+        self._buffer = b""
+        # One decoder for the whole stream: a character whose bytes
+        # straddle two recv() calls must not decode as two U+FFFD.
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._closed = False
+        log.debug("Telnet transport connected to %s:%d", host, port)
+
+    def send(self, data: str) -> None:
+        """Send text data with proper telnet line endings (CR/LF).
+
+        All newlines are converted to CR/LF for the telnet protocol.
+        For large data (e.g. heredocs), the data is sent in chunks to
+        avoid overwhelming the remote line buffer.
+        """
+        if self._closed:
+            raise OSError("Transport closed")
+        # Normalize line endings: \r\n → \n → \r\n
+        raw = data.replace("\r\n", "\n").replace("\r", "\n")
+        lines = raw.split("\n")
+        # Reassemble with CR/LF and ensure trailing CR/LF
+        raw_bytes = b"\r\n".join(line.encode("utf-8") for line in lines)
+        if not raw_bytes.endswith(b"\r\n"):
+            raw_bytes += b"\r\n"
+        self._send_all(raw_bytes)
+
+    def send_raw(self, data: bytes) -> None:
+        """Send raw bytes without newline appending."""
+        if self._closed:
+            raise OSError("Transport closed")
+        self._send_all(data)
+
+    def _send_all(self, data: bytes, timeout: float = CMD_TIMEOUT) -> None:
+        """Send *data* on the non-blocking socket, waiting for room.
+
+        ``sendall`` on it failed ("Send failed: Resource temporarily
+        unavailable") as soon as the kernel's send buffer was full, and a
+        10 ms sleep per 4 KiB that kept it from filling held every upload
+        at ~0.3 MB/s. Now the send waits until the socket takes more (up to
+        *timeout* seconds without progress); what the server sends
+        meanwhile (an echoing terminal) is kept for the next read, so
+        neither end blocks on a full buffer."""
+        view = memoryview(data)
+        deadline = time.monotonic() + timeout
+        try:
+            while view:
+                try:
+                    sent = self._sock.send(view)
+                except BlockingIOError:
+                    sent = 0
+                if sent:
+                    view = view[sent:]
+                    deadline = time.monotonic() + timeout
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Telnet send: no progress for {timeout:.0f} s")
+                readable, _ = wait_io([self._sock], [self._sock], timeout=min(remaining, 1.0))
+                if readable:
+                    try:
+                        raw = self._sock.recv(65536)
+                    except BlockingIOError:
+                        continue
+                    if not raw:
+                        raise ConnectionResetError("the server closed the connection")
+                    self._early += raw
+                    if len(self._early) > MAX_READ_UNTIL_CHARS:
+                        raise OSError(
+                            f"Telnet response exceeds {MAX_READ_UNTIL_CHARS} character cap"
+                        )
+        except TimeoutError:
+            self._closed = True
+            raise
+        except OSError as e:
+            self._closed = True
+            raise OSError(f"Send failed: {e}") from e
+
+    def read_until(self, match: str, timeout: float = CMD_TIMEOUT) -> str:
+        """Read until *match* appears in the accumulated text.
+
+        Returns all text up to and including the match.
+        Raises TimeoutError if *timeout* seconds elapse.
+        """
+        deadline = time.monotonic() + timeout
+        text = ""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timeout waiting for {match!r} (got so far: {text[-200:]!r})")
+            chunk = self._read_chunk(min(remaining, _READ_SLICE))
+            if chunk:
+                text += chunk
+                if len(text) > MAX_READ_UNTIL_CHARS:
+                    raise OSError(f"Telnet response exceeds {MAX_READ_UNTIL_CHARS} character cap")
+                if match in text:
+                    return text
+            elif self._closed:
+                self._raise_closed(text)
+        # unreachable
+
+    def read_until_re(
+        self,
+        pattern: re.Pattern,
+        timeout: float = CMD_TIMEOUT,
+        *,
+        lookback: int | None = None,
+        idle: bool = False,
+    ) -> tuple[str, re.Match]:
+        """Read until regex *pattern* matches somewhere in the accumulated text.
+
+        *lookback*: the longest text a match can span. With it, each new
+        chunk is searched together with only that much of the text before
+        it, not the whole answer again (a multi-megabyte answer made the
+        search quadratic: 16 MiB took 20 s). *idle*: *timeout* counts the
+        seconds without any new text, not the whole wait (a long listing
+        over a slow line keeps arriving and must not time out)."""
+        deadline = time.monotonic() + timeout
+        text = ""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timeout waiting for pattern {pattern.pattern!r} (got so far: {text[-200:]!r})"
+                )
+            chunk = self._read_chunk(min(remaining, _READ_SLICE))
+            if chunk:
+                if idle:
+                    deadline = time.monotonic() + timeout
+                start = 0 if lookback is None else max(0, len(text) - lookback)
+                text += chunk
+                if len(text) > MAX_READ_UNTIL_CHARS:
+                    raise OSError(f"Telnet response exceeds {MAX_READ_UNTIL_CHARS} character cap")
+                m = pattern.search(text, start)
+                if m:
+                    return text, m
+            elif self._closed:
+                self._raise_closed(text)
+
+    def read_some(self, timeout: float = 1.0) -> str:
+        """Read whatever is available within timeout."""
+        text = ""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            chunk = self._read_chunk(min(remaining, _READ_SLICE))
+            if chunk:
+                text += chunk
+                if len(text) > MAX_READ_UNTIL_CHARS:
+                    raise OSError(f"Telnet response exceeds {MAX_READ_UNTIL_CHARS} character cap")
+            elif text or self._closed:
+                break  # Got some data, nothing more coming (or never will)
+        return text
+
+    def _raise_closed(self, text: str) -> None:
+        """The server closed the connection (or it broke) while an answer
+        was awaited: said at once - the wait went on to the time-out (30 s
+        for a command, an hour for a tree operation) before."""
+        raise ConnectionResetError(
+            f"Telnet: the connection to {getattr(self, '_host', '?')}:"
+            f"{getattr(self, '_port', '?')} was closed "
+            f"(last text: {text[-200:]!r})"
+        )
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            log.debug("Telnet transport closed")
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _read_chunk(self, timeout: float) -> str:
+        """Read available data from socket, process IAC sequences."""
+        if self._early:
+            raw, self._early = self._early, b""
+            return self._process(raw)
+        try:
+            ready, _ = wait_io([self._sock], timeout=max(timeout, 0))
+        except (ValueError, OSError):
+            self._closed = True
+            return ""
+        if not ready:
+            return ""
+        try:
+            raw = self._sock.recv(65536)
+        except BlockingIOError:
+            return ""
+        except OSError as e:
+            self._closed = True
+            raise OSError(f"Read failed: {e}") from e
+        return self._process(raw)
+
+    def _process(self, raw: bytes) -> str:
+        """*raw* bytes from the server as text, IAC sequences handled."""
+        if not raw:
+            self._closed = True
+            # Bytes of a character the stream ended inside of.
+            return self._decoder.decode(b"", final=True).replace("\r", "")
+        # Prepend any leftover bytes from previous incomplete IAC sequence
+        data = self._buffer + raw
+        self._buffer = b""
+        data, leftover = self._negotiate(data)
+        self._buffer = leftover
+        # Strip carriage returns
+        text = self._decoder.decode(data).replace("\r", "")
+        return text
+
+    def _negotiate(self, data: bytes) -> tuple[bytes, bytes]:
+        """Process IAC sequences, respond to option negotiations.
+
+        Returns (clean_data, leftover) where leftover contains any
+        incomplete IAC sequence at the end that needs more data.
+        """
+        clean = bytearray()
+        i = 0
+        while i < len(data):
+            if data[i] != IAC:
+                clean.append(data[i])
+                i += 1
+                continue
+            if i + 1 >= len(data):
+                # Incomplete IAC at end — save for next read
+                return bytes(clean), data[i:]
+            cmd = data[i + 1]
+            if cmd == IAC:
+                clean.append(IAC)  # Escaped 0xFF
+                i += 2
+                continue
+            if cmd in (DO, DONT, WILL, WONT):
+                if i + 2 >= len(data):
+                    return bytes(clean), data[i:]
+                opt = data[i + 2]
+                self._handle_option(cmd, opt)
+                i += 3
+                continue
+            if cmd == SB:
+                # Sub-negotiation: find SE
+                se_idx = data.find(bytes([IAC, SE]), i + 2)
+                if se_idx == -1:
+                    # Kept for the next read - but not without bound: a
+                    # server that never sends IAC SE would otherwise have
+                    # everything after IAC SB buffered (and re-scanned).
+                    if len(data) - i > MAX_SUBNEGOTIATION_BYTES:
+                        self._closed = True  # the stream is out of step for good
+                        raise OSError(
+                            f"Telnet subnegotiation exceeds {MAX_SUBNEGOTIATION_BYTES} "
+                            "bytes without IAC SE"
+                        )
+                    return bytes(clean), data[i:]
+                self._handle_subneg(data[i + 2 : se_idx])
+                i = se_idx + 2
+                continue
+            # Other commands (NOP, GA, etc.) — skip
+            i += 2
+        return bytes(clean), b""
+
+    def _handle_option(self, cmd: int, opt: int) -> None:
+        """Respond to DO/DONT/WILL/WONT option negotiations."""
+        if cmd == DO:
+            if opt == OPT_SGA:
+                self.send_raw(bytes([IAC, WILL, OPT_SGA]))
+            elif opt == OPT_TTYPE:
+                self.send_raw(bytes([IAC, WILL, OPT_TTYPE]))
+            elif opt == OPT_NAWS:
+                # Window size — default 80×24 (VT100), overridable per
+                # profile via ``telnet_naws_{width,height}``. Real
+                # terminals rarely change size mid-session, so a fixed
+                # plausible default blends better than randomisation.
+                w, h = int(self._naws_width), int(self._naws_height)
+                self.send_raw(bytes([IAC, WILL, OPT_NAWS]))
+                self.send_raw(
+                    bytes(
+                        [
+                            IAC,
+                            SB,
+                            OPT_NAWS,
+                            (w >> 8) & 0xFF,
+                            w & 0xFF,
+                            (h >> 8) & 0xFF,
+                            h & 0xFF,
+                            IAC,
+                            SE,
+                        ]
+                    )
+                )
+            else:
+                self.send_raw(bytes([IAC, WONT, opt]))
+        elif cmd == WILL:
+            if opt == OPT_SGA:
+                self.send_raw(bytes([IAC, DO, OPT_SGA]))
+            elif opt == OPT_ECHO:
+                self.send_raw(bytes([IAC, DO, OPT_ECHO]))
+            else:
+                self.send_raw(bytes([IAC, DONT, opt]))
+        elif cmd in (DONT, WONT):
+            pass  # Acknowledge silently
+
+    def _handle_subneg(self, data: bytes) -> None:
+        """Handle sub-negotiation requests."""
+        if not data:
+            return
+        opt = data[0]
+        if opt == OPT_TTYPE and len(data) >= 2 and data[1] == 1:
+            # SEND request for terminal type
+            ttype = b"xterm"
+            self.send_raw(bytes([IAC, SB, OPT_TTYPE, 0]) + ttype + bytes([IAC, SE]))
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Shell Session
+# ---------------------------------------------------------------------------
+class CommandFailed(OSError):
+    """The command ran and exited non-zero: the connection is fine."""
+
+
+class _ShellSession:
+    """Manages shell interaction over a telnet transport."""
+
+    def __init__(
+        self,
+        transport: _TelnetTransport,
+        username: str,
+        password: str,
+        timeout: float = CONNECT_TIMEOUT,
+    ):
+        self._transport = transport
+        self._username = username
+        self._password = password
+        self._prompt_ready = False
+        # Per-session unpredictable suffix so remote file content cannot
+        # forge our exit-code sentinel. 64-bit hex from secrets.token_hex
+        # (~16 chars) collapses the collision / forgery probability to
+        # something negligible even on long-running shells.
+        import secrets
+
+        self._marker_id = secrets.token_hex(8)
+        self._cmd_start = f"{_CMD_START_PREFIX}{self._marker_id}__"
+        # Every command's markers also carry its sequence number: a late
+        # answer to an earlier command is never taken for this one's.
+        self._seq = 0
+        # One command at a time on the shell (a liveness probe from the
+        # GUI thread must not interleave with a transfer).
+        self._lock = threading.RLock()
+        self._login(timeout)
+        self._setup_prompt()
+
+    def _login(self, timeout: float) -> None:
+        """Perform username/password authentication."""
+        deadline = time.monotonic() + timeout
+        text = ""
+
+        # Read until we see a login prompt or shell prompt (no-auth systems)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timeout waiting for login prompt (got: {text[-200:]!r})")
+            chunk = self._transport.read_some(min(remaining, 2.0))
+            text += chunk
+            if _LOGIN_RE.search(text):
+                break
+            if _PASSWORD_RE.search(text):
+                # Some systems skip username, go straight to password
+                self._transport.send(self._password)
+                self._await_login_verdict("password-only")
+                return
+            if _SHELL_PROMPT_RE.search(text):
+                log.info("Telnet: no-auth shell detected")
+                return
+
+        # Send username
+        self._transport.send(self._username)
+
+        # Wait for password prompt
+        try:
+            text2 = self._transport.read_until_re(_PASSWORD_RE, timeout=10.0)[0]
+        except TimeoutError:
+            # Maybe no password required
+            text2 = self._transport.read_some(timeout=2.0)
+            if _SHELL_PROMPT_RE.search(text2):
+                log.info("Telnet login successful (no password)")
+                return
+            raise LoginFailure(
+                "Telnet login failed: no password prompt after the user name "
+                f"{self._username!r}"
+            )
+
+        # Send password
+        self._transport.send(self._password)
+        self._await_login_verdict("")
+
+    def _await_login_verdict(self, how: str) -> None:
+        """Read the answer to the password until it ends in a shell prompt
+        (logged in) or a new login prompt (refused); LoginFailure for a
+        refusal or an answer that never ends in a prompt."""
+        result = ""
+        deadline = time.monotonic() + 15.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # A welcome message may arrive in parts: wait for the end.
+            result += self._transport.read_some(timeout=min(remaining, 5.0))
+            verdict = _login_verdict(result)
+            if verdict is True:
+                log.info("Telnet login successful%s", f" ({how})" if how else "")
+                return
+            if verdict is False:
+                raise LoginFailure(f"Telnet login refused by the server: {result[-200:]!r}")
+            if self._transport.closed:
+                break
+        if any(word in result.lower() for word in _REFUSAL_WORDS):
+            raise LoginFailure(f"Telnet login refused by the server: {result[-200:]!r}")
+        raise LoginFailure(f"Telnet login failed: unexpected response: {result[-200:]!r}")
+
+    _SHELL_PROBE_MARKER = "__AXROSS_SHELL_PROBE__"
+
+    def _detect_remote_shell(self) -> str:
+        """Detect the remote shell so we can send the right
+        history-suppression syntax. Returns one of:
+        ``"bash"``, ``"zsh"``, ``"ksh"``, ``"fish"``, ``"csh"``,
+        ``"posix"`` (catch-all for sh/dash/ash/busybox), or
+        ``"unknown"``.
+
+        Strategy: emit a single probe line that mostly only does
+        something useful when the shell understands it. Read the
+        echoed response; pick the first matching signature. The
+        probe line is constructed so even fish/csh can output
+        SOMETHING (an error message we can recognise) without
+        breaking subsequent commands.
+        """
+        marker = self._SHELL_PROBE_MARKER
+        # POSIX-shell variables: $BASH_VERSION, $ZSH_VERSION,
+        # $KSH_VERSION are the canonical signatures. Fish exports
+        # FISH_VERSION and supports `printf` (it's a builtin in
+        # fish 3.x). csh/tcsh have $tcsh / $shell / $version.
+        #
+        # We send the probe in POSIX form. Fish parses
+        # ``${variable}`` differently — it does substitute the
+        # var if present, but the literal string ``${BASH_VERSION}``
+        # in fish becomes empty when BASH_VERSION isn't set. Same
+        # for csh which expands `$BASH_VERSION` to nothing or to
+        # an error if undefined. The output ALWAYS contains the
+        # marker, plus version strings of the shells that recognise
+        # the variable names — that's enough to disambiguate.
+        probe = (
+            f'echo "{marker}/${{BASH_VERSION:-_}}/${{ZSH_VERSION:-_}}/'
+            f'${{KSH_VERSION:-_}}/${{FISH_VERSION:-_}}/${{shell:-_}}"'
+        )
+        try:
+            self._transport.send(probe)
+            response = self._transport.read_until(marker, timeout=3.0)
+            # The marker line might have already been read; consume
+            # what's left of the line for parsing.
+            line_tail = self._transport.read_some(timeout=0.5)
+            full = response + line_tail
+        except (TimeoutError, OSError):
+            return "unknown"
+
+        # Look for the marker plus the trailing fields.
+        idx = full.rfind(marker)
+        if idx < 0:
+            return "unknown"
+        rest = full[idx + len(marker) :].split("\n", 1)[0]
+        parts = rest.lstrip("/").split("/")
+        # parts[0] = BASH_VERSION, [1] = ZSH_VERSION, [2] = KSH_VERSION,
+        # [3] = FISH_VERSION, [4] = shell (csh/tcsh).
+        if len(parts) >= 4 and parts[0] != "_" and parts[0]:
+            return "bash"
+        if len(parts) >= 4 and parts[1] != "_" and parts[1]:
+            return "zsh"
+        if len(parts) >= 4 and parts[2] != "_" and parts[2]:
+            return "ksh"
+        if len(parts) >= 4 and parts[3] != "_" and parts[3]:
+            return "fish"
+        if len(parts) >= 5 and parts[4] != "_" and parts[4] and "csh" in parts[4]:
+            return "csh"
+        return "posix"
+
+    def _history_suppression_for(self, shell_kind: str) -> list[str]:
+        """Return the list of commands that disable shell history for
+        the detected shell. POSIX-style shells (bash/zsh/ksh/sh/dash/ash)
+        share one block; fish and csh get their own."""
+        if shell_kind == "fish":
+            # Fish stores history in a SQLite-ish file controlled by
+            # the ``fish_history`` universal variable; setting it to
+            # the literal string ``default`` would point to default,
+            # so we erase it (set -e) for the session. The session-
+            # local ``fish_history`` is also reset.
+            return [
+                "set -e fish_history",
+                "set -gx fish_history '/dev/null'",
+                # Disable fish's command-not-found handler so the
+                # subsequent POSIX history commands don't error.
+                "function fish_command_not_found; end",
+            ]
+        if shell_kind == "csh":
+            return [
+                "set history=0",
+                "set savehist=0",
+                "unset history",
+                "unset savehist",
+            ]
+        # POSIX family — bash, zsh, ksh, sh/dash/ash, busybox.
+        return [
+            "unset HISTFILE",
+            "export HISTFILE=/dev/null",
+            "export HISTSIZE=0 HISTFILESIZE=0 SAVEHIST=0",
+            "export LESSHISTFILE=/dev/null",
+            "export FCEDIT=/dev/null",
+            "set +o history 2>/dev/null; true",  # bash/ksh
+            "setopt HIST_IGNORE_SPACE 2>/dev/null; true",  # zsh
+            "unsetopt SHARE_HISTORY INC_APPEND_HISTORY APPEND_HISTORY 2>/dev/null; true",
+        ]
+
+    def _setup_prompt(self) -> None:
+        """Set a unique, parseable prompt and configure shell for automation."""
+        # Probe the shell first so we send the right history-off
+        # syntax. fish/csh can't handle POSIX-style commands and
+        # would otherwise litter the terminal with errors. Probe
+        # is best-effort — any failure falls back to "posix" which
+        # works for the 99 % case (bash/zsh/ksh/sh/dash/ash).
+        shell_kind = self._detect_remote_shell()
+        log.debug("Telnet remote shell detected: %s", shell_kind)
+
+        # Use printf to emit a real newline in PS1 (works in sh/dash/ash/bash)
+        commands = [
+            # --- history suppression FIRST, shell-aware ---
+            *self._history_suppression_for(shell_kind),
+            # --- prompt + locale + alias hardening ---
+            f"PS1=$(printf '{_PROMPT_MARKER}\\n'); export PS1",
+            "export PS2=''",
+            f"export {SHELL_ENV} TERM=dumb",
+            "unalias ls 2>/dev/null; true",
+            "stty -echo 2>/dev/null; true",
+            f"echo '{_PROMPT_MARKER}'",
+        ]
+        for cmd in commands:
+            self._transport.send(cmd)
+            time.sleep(0.05)
+
+        # Synchronize: read until we see the prompt marker
+        try:
+            self._transport.read_until(_PROMPT_MARKER, timeout=10.0)
+            # Consume any trailing prompt markers from the setup
+            self._transport.read_some(timeout=0.5)
+            self._prompt_ready = True
+            log.debug("Shell prompt configured")
+        except TimeoutError:
+            log.warning("Could not set custom prompt, continuing anyway")
+            self._prompt_ready = True
+
+    def execute(
+        self, cmd: str, timeout: float = CMD_TIMEOUT, *, idle: bool = True
+    ) -> tuple[str, int]:
+        """Execute a shell command and return (stdout, exit_code).
+
+        *timeout*: the seconds the command may stay silent (*idle*, the
+        default: a listing of a large folder over a slow line went past
+        the 30 s while it was still arriving, and was then run again after
+        a reconnect), or its whole run time (``idle=False``, exec()).
+
+        Uses per-session randomized markers to reliably delimit command output.
+        For multi-line commands (heredocs), the exit marker is placed on its
+        own line after the command to avoid breaking heredoc delimiters.
+        """
+        with self._lock:
+            self._seq += 1
+            tag = f"{self._marker_id}_{self._seq}"
+            start = f"{_CMD_START_PREFIX}{tag}__"
+            exit_re = re.compile(rf"{re.escape(_CMD_EXIT_PREFIX)}{tag}_(\d+)__")
+            exit_marker_echo = f'"{_CMD_EXIT_PREFIX}{tag}_$?__"'
+            if "\n" in cmd:
+                # Multi-line command (heredoc): exit echo must be on its own line
+                wrapped = f"echo '{start}'\n{cmd}\necho {exit_marker_echo}"
+            else:
+                wrapped = f"echo '{start}'; {cmd} 2>&1; echo {exit_marker_echo}"
+            self._transport.send(wrapped)
+
+            # Read until this command's exit marker; answers to earlier
+            # commands that arrive late are skipped over.
+            try:
+                text, m = self._transport.read_until_re(
+                    exit_re, timeout=timeout, lookback=256, idle=idle
+                )
+            except TimeoutError:
+                raise TimeoutError(f"Command timed out: {cmd[:80]!r}")
+
+        exit_code = int(m.group(1))
+
+        # Extract output between this command's start marker and exit marker
+        start_idx = text.rfind(start, 0, m.start())
+        if start_idx != -1:
+            output = text[start_idx + len(start) : m.start()]
+        else:
+            output = text[: m.start()]
+
+        # Clean up: remove prompt markers and the line breaks around the
+        # answer. Not blanks: they belong to the answer (the last name of a
+        # listing, "report ", came back as "report").
+        output = output.replace(_PROMPT_MARKER, "").strip("\n")
+
+        return output, exit_code
+
+    def execute_checked(self, cmd: str, timeout: float = CMD_TIMEOUT) -> str:
+        """Execute and raise OSError if exit code is non-zero."""
+        output, code = self.execute(cmd, timeout=timeout)
+        if code != 0:
+            raise CommandFailed(f"Command failed (exit {code}): {cmd[:80]}\n{output[:500]}")
+        return output
+
+    def execute_streaming(self, cmd: str, timeout: float = TRANSFER_TIMEOUT) -> tuple[str, int]:
+        """Execute a command that may produce large output (e.g. base64 dump).
+
+        Same as execute() but with a longer default timeout.
+        """
+        return self.execute(cmd, timeout=timeout)
+
+    @property
+    def transport(self) -> _TelnetTransport:
+        return self._transport
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Capability Probe
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class _Capabilities:
+    """Available shell tools detected after login."""
+
+    has_base64: bool = False
+    has_uuencode: bool = False
+    has_xxd: bool = False
+    has_stat_gnu: bool = False
+    has_stat_bsd: bool = False
+    has_md5sum: bool = False
+    has_dd: bool = False
+    has_tar: bool = False
+    has_chmod: bool = False
+    has_readlink: bool = False
+    has_df: bool = False
+    has_wc: bool = False
+    has_test: bool = True  # Assume shell built-in
+    #: ``ls -b`` (GNU, toybox, BSD): names come escaped. On a terminal ls
+    #: otherwise prints "?" for every control character, and the "?" then
+    #: named another file.
+    has_ls_escape: bool = False
+    shell_type: str = "sh"
+    os_name: str = "unknown"
+    transfer_method: str = "raw"  # "base64", "uuencode", "xxd", "raw"
+
+
+def _probe_capabilities(shell: _ShellSession) -> _Capabilities:
+    """Detect available commands and determine best transfer method."""
+    tools: dict[str, bool] = {}
+    probes = [
+        "base64",
+        "uuencode",
+        "xxd",
+        "stat",
+        "md5sum",
+        "dd",
+        "tar",
+        "chmod",
+        "readlink",
+        "df",
+        "wc",
+        "mkdir",
+        "rm",
+        "mv",
+        "cat",
+        "test",
+        "ls",
+    ]
+
+    # Batch check: command -v for each tool
+    # Some shells don't have command -v, fallback to which
+    check_cmd = "command -v"
+    _, code = shell.execute(f"{check_cmd} ls", timeout=5.0)
+    if code != 0:
+        check_cmd = "which"
+
+    for tool in probes:
+        _, code = shell.execute(f"{check_cmd} {tool}", timeout=5.0)
+        tools[tool] = code == 0
+
+    # Detect GNU stat vs BSD stat
+    has_stat_gnu = False
+    has_stat_bsd = False
+    if tools.get("stat"):
+        _, code = shell.execute("stat --format='%s' / 2>/dev/null", timeout=5.0)
+        if code == 0:
+            has_stat_gnu = True
+        else:
+            _, code = shell.execute("stat -f '%z' / 2>/dev/null", timeout=5.0)
+            if code == 0:
+                has_stat_bsd = True
+
+    has_ls_escape = False
+    if tools.get("ls"):
+        _, code = shell.execute("ls -lab / >/dev/null 2>&1", timeout=5.0)
+        has_ls_escape = code == 0
+
+    # Detect OS
+    os_output, _ = shell.execute("uname -s 2>/dev/null", timeout=5.0)
+    os_name = os_output.strip() or "unknown"
+
+    # Detect shell
+    shell_output, _ = shell.execute("echo $0 2>/dev/null || echo $SHELL", timeout=5.0)
+    shell_type = posixpath.basename(shell_output.strip().lstrip("-")) or "sh"
+
+    # Determine best transfer method
+    if tools.get("base64"):
+        transfer_method = "base64"
+    elif tools.get("uuencode"):
+        transfer_method = "uuencode"
+    elif tools.get("xxd"):
+        transfer_method = "xxd"
+    else:
+        transfer_method = "raw"
+
+    caps = _Capabilities(
+        has_base64=tools.get("base64", False),
+        has_uuencode=tools.get("uuencode", False),
+        has_xxd=tools.get("xxd", False),
+        has_stat_gnu=has_stat_gnu,
+        has_stat_bsd=has_stat_bsd,
+        has_md5sum=tools.get("md5sum", False),
+        has_dd=tools.get("dd", False),
+        has_tar=tools.get("tar", False),
+        has_chmod=tools.get("chmod", False),
+        has_readlink=tools.get("readlink", False),
+        has_df=tools.get("df", False),
+        has_wc=tools.get("wc", False),
+        has_ls_escape=has_ls_escape,
+        shell_type=shell_type,
+        os_name=os_name,
+        transfer_method=transfer_method,
+    )
+    log.info(
+        "Telnet capabilities: transfer=%s, stat_gnu=%s, stat_bsd=%s, os=%s, shell=%s",
+        caps.transfer_method,
+        caps.has_stat_gnu,
+        caps.has_stat_bsd,
+        caps.os_name,
+        caps.shell_type,
+    )
+    return caps
+
+
+def rename_command(src: str, dst: str) -> str:
+    """Shell command that renames ``src`` to ``dst`` like rename(2).
+
+    Plain ``mv`` moves ``src`` INTO ``dst`` when ``dst`` is a directory
+    (or a symlink to one), replacing a same-named entry in there.
+    ``mv -T`` refuses that but is GNU only, so the directory is tested
+    first and the rename fails instead. An existing non-directory
+    ``dst`` is replaced, as rename(2) does.
+    """
+    qsrc, qdst = shlex.quote(src), shlex.quote(dst)
+    return (
+        f"if test -d {qdst}; then echo {shlex.quote(f'mv: {dst}: is a directory')} >&2; false; "
+        f"else mv -- {qsrc} {qdst}; fi"
+    )
+
+
+def remove_command(path: str, *, recursive: bool, quote=shlex.quote) -> str:
+    """Shell command that removes ``path`` like the backends' remove().
+
+    Not recursive: a folder goes with ``rmdir`` (refused when it is not
+    empty), anything else - a symlink to a folder too - with ``rm -f``.
+    ``test -d`` follows a link: ``rmdir`` on a link to a folder failed
+    ("Not a directory"), and ``rm -f`` alone refuses an empty folder.
+    Recursive: ``rm -rf``, which removes a link itself, never the folder it
+    points to. *quote* quotes the path for the remote shell; ``--`` ends
+    the options, so a name that starts with ``-`` is never one.
+
+    ``-f`` (no prompt on a terminal for a write-protected file) also says
+    nothing about a path that is not there: the delete of a missing file
+    "worked". ``ls -d`` asks first and, under LC_ALL=C, prints why it
+    cannot (``No such file or directory``, ``Permission denied``), which
+    :func:`core.exec_util.ls_error` types; the command then fails."""
+    q = quote(path)
+    there = f"LC_ALL=C ls -d -- {q} >/dev/null"
+    if recursive:
+        return f"if {there}; then rm -rf -- {q}; else false; fi"
+    return (
+        f"if test -d {q} && ! test -L {q}; then rmdir -- {q}; "
+        f"elif {there}; then rm -f -- {q}; else false; fi"
+    )
+
+
+def copy_command(src: str, dst: str, *, preserve: bool = False) -> str:
+    """Shell command that copies the file ``src`` to the path ``dst``.
+
+    Plain ``cp`` copies ``src`` INTO ``dst`` when ``dst`` is a directory
+    and reports success; ``cp -T`` refuses that but is GNU only. As in
+    :func:`rename_command`, the directory is tested first and the copy
+    fails instead. *preserve* adds ``-p`` (mode and times)."""
+    qsrc, qdst = shlex.quote(src), shlex.quote(dst)
+    flags = "-p -- " if preserve else "-- "
+    return (
+        f"if test -d {qdst}; then echo {shlex.quote(f'cp: {dst}: is a directory')} >&2; false; "
+        f"else cp {flags}{qsrc} {qdst}; fi"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: Output Parsers
+# ---------------------------------------------------------------------------
+def _uu_encode(data: bytes) -> str:
+    """uuencode ``data`` as ``begin 644 -`` ... ``end`` (what uudecode reads).
+
+    Replaces the ``uu`` module, which Python 3.13 removed."""
+    lines = ["begin 644 -\n"]
+    for start in range(0, len(data), 45):
+        lines.append(binascii.b2a_uu(data[start : start + 45], backtick=True).decode("ascii"))
+    lines.append("`\nend\n")
+    return "".join(lines)
+
+
+def _uu_decode(text: str) -> bytes:
+    """Decode uuencode output (``begin <mode> <name>`` ... ``end``)."""
+    out = bytearray()
+    started = False
+    for raw in split_lf_only_stream(text):
+        line = raw.rstrip("\r")
+        if not started:
+            started = line.startswith("begin ")
+            continue
+        if line.strip() == "end":
+            return bytes(out)
+        if not line:
+            continue
+        try:
+            out += binascii.a2b_uu(line)
+        except binascii.Error as exc:
+            raise ValueError(f"bad uuencoded line {line[:20]!r}: {exc}") from exc
+    raise ValueError("uuencoded data has no begin/end frame")
+
+
+def ls_records(output: str, is_entry) -> list[tuple[str, str]]:
+    """The entries of an ``ls -l`` answer as ``(first line, rest)``.
+
+    ls prints a name (or a link target) with a line break as it is, so a
+    line that is no entry of its own (*is_entry* says) continues the entry
+    before it; *rest* is that continuation, each line after a ``"\\n"``.
+    The entry keeps its whole name: cut to the first line it named
+    ANOTHER file, which a delete then removed. Such a name is listed, not
+    dropped (a recursive copy or delete would miss it without a word), and
+    refused where it is used (:func:`core.path_policy.refuse_control_chars`).
+    A ``total`` line, an ``ls:`` message and lines before the first entry
+    are records of their own, with no entry to continue.
+    """
+    lines = split_lf_only_stream(output)
+    if lines and lines[-1] == "":
+        lines.pop()  # the final line feed ends the last line, it is no name
+    if lines and all(line.endswith("\r") for line in lines):
+        lines = [line[:-1] for line in lines]  # a CRLF answer (Windows SSH servers)
+    records: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines:
+        if is_entry(line):
+            current = [line, ""]
+            records.append(current)
+        elif current is not None and not line.startswith(("total ", "ls: ")):
+            current[1] += "\n" + line
+        else:
+            current = None
+            records.append([line, ""])
+    for first, rest in records:
+        if rest:
+            log.warning(
+                "ls listed a name with a line break: %r; it cannot be used through "
+                "a remote shell", (first + rest)[-200:],
+            )
+    return [(first, rest) for first, rest in records]
+
+
+_LS_ESCAPES = {"n": 10, "t": 9, "r": 13, "a": 7, "b": 8, "f": 12, "v": 11, "e": 27}
+
+
+def ls_unescape(text: str) -> str:
+    """A name as ``ls -b`` (``--quoting-style=escape``) prints it, back to
+    the name: ``\\ `` is a blank, ``\\n`` a line feed, ``\\NNN`` an octal
+    byte (one of a name's UTF-8 bytes)."""
+    if "\\" not in text:
+        return text
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch != "\\" or i + 1 >= len(text):
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        nxt = text[i + 1]
+        octal = re.match(r"[0-7]{1,3}", text[i + 1 : i + 4])
+        if octal:
+            out.append(int(octal.group(0), 8) & 0xFF)
+            i += 1 + len(octal.group(0))
+        elif nxt in _LS_ESCAPES:
+            out.append(_LS_ESCAPES[nxt])
+            i += 2
+        else:  # \\ \  \" \' ...: the character itself
+            out += nxt.encode("utf-8")
+            i += 2
+    return out.decode("utf-8", "replace")
+
+
+def _parse_ls_la(output: str, *, escaped: bool = False, utc: bool = False) -> list[FileItem]:
+    """Parse `ls -la` output into FileItem list.
+
+    The name is exactly what follows the single space after the date:
+    blanks at its start or end belong to it (``"report "`` is not
+    ``"report"``), and a name with a line break keeps its other lines
+    (:func:`ls_records`). *escaped*: the listing came from ``ls -b``
+    (names and link targets escaped, see :func:`ls_unescape`). *utc*: ls
+    ran under ``TZ=UTC0``, so its dates are UTC and come back aware.
+    """
+    # Strip ANSI escape sequences that some shells/aliases inject
+    output = _ANSI_RE.sub("", output)
+    items: list[FileItem] = []
+    for line, rest in ls_records(output, _LS_LINE_RE.match):
+        m = _LS_LINE_RE.match(line)
+        if not m:
+            continue
+        type_char = m.group(1)
+        perm_str = m.group(2)
+        owner = m.group(4)
+        group = m.group(5)
+        size = 0 if "," in m.group(6) else int(m.group(6))
+        date_str = m.group(7).strip()
+        name_field = m.group(8) + rest
+
+        is_dir = type_char == "d"
+        is_link = type_char == "l"
+        link_target = ""
+        name = name_field
+
+        if is_link and " -> " in name_field:
+            name, link_target = name_field.split(" -> ", 1)
+        if escaped:
+            name, link_target = ls_unescape(name), ls_unescape(link_target)
+
+        # Skip . and ..
+        if name in (".", ".."):
+            continue
+
+        permissions = _parse_permissions(perm_str)
+        modified = _parse_ls_date(date_str, utc=utc)
+
+        items.append(
+            FileItem(
+                name=name,
+                size=size,
+                modified=modified,
+                permissions=permissions,
+                is_dir=is_dir,
+                is_link=is_link,
+                link_target=link_target,
+                owner=owner,
+                group=group,
+            )
+        )
+    return items
+
+
+def _parse_permissions(perm_str: str) -> int:
+    """Convert 'rwxrwxrwx' string to octal permission int."""
+    mode = 0
+    bits = [
+        0o400,
+        0o200,
+        0o100,  # owner rwx
+        0o040,
+        0o020,
+        0o010,  # group rwx
+        0o004,
+        0o002,
+        0o001,  # other rwx
+    ]
+    for i, char in enumerate(perm_str[:9]):
+        if char == "-":
+            continue
+        # Handle setuid/setgid/sticky at execute positions
+        if i == 2 and char in ("s", "S"):
+            mode |= 0o4000
+            if char == "s":  # setuid WITH execute
+                mode |= bits[i]
+            # 'S' = setuid WITHOUT execute — don't set execute bit
+            continue
+        if i == 5 and char in ("s", "S"):
+            mode |= 0o2000
+            if char == "s":
+                mode |= bits[i]
+            continue
+        if i == 8 and char in ("t", "T"):
+            mode |= 0o1000
+            if char == "t":  # sticky WITH execute
+                mode |= bits[i]
+            continue
+        # Normal rwx bits
+        if i < len(bits):
+            mode |= bits[i]
+    return mode
+
+
+_LS_MONTHS = {name: number for number, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+_LS_DATE = re.compile(r"([A-Za-z]{3})\s+(\d{1,2})\s+(?:(\d{1,2}):(\d{2})|(\d{4}))")
+
+
+def _parse_ls_date(date_str: str, *, utc: bool = False) -> datetime:
+    """Parse ls -la date field.
+
+    Formats: 'Mar 16 14:30' (recent) or 'Mar 16  2025' (old). The month
+    names are ls's English ones (the remote runs in the C locale), read
+    with a table, not strptime's %b: that follows the local LC_TIME, which
+    Qt sets from the user's locale. Feb 29 without a year is taken in the
+    latest leap year that does not lie in the future.
+
+    ls prints the wall clock of the SERVER's time zone. A naive datetime
+    means local time to FileItem, which was wrong for every server in
+    another zone; *utc* (ls ran under ``TZ=UTC0``) returns an aware UTC
+    time instead. Without it the result stays naive (the caller cannot
+    know the server's zone).
+    """
+    tz = timezone.utc if utc else None
+    match = _LS_DATE.fullmatch(date_str.strip())
+    month = _LS_MONTHS.get(match.group(1).lower()) if match else None
+    if match is None or month is None:
+        return datetime.fromtimestamp(0, tz)
+    day = int(match.group(2))
+    try:
+        if match.group(5):
+            return datetime(int(match.group(5)), month, day, tzinfo=tz)
+        hour, minute = int(match.group(3)), int(match.group(4))
+        now = datetime.now(tz)
+        # A date without a year lies within the last ~6 months: this
+        # year, or last year when it would be in the future.
+        for year in range(now.year, now.year - 9, -1):
+            try:
+                dt = datetime(year, month, day, hour, minute, tzinfo=tz)
+            except ValueError:   # Feb 29 outside a leap year
+                continue
+            if dt <= now or year < now.year:
+                return dt
+    except ValueError:
+        pass
+    return datetime.fromtimestamp(0, tz)
+
+
+def _parse_stat_gnu(output: str) -> FileItem:
+    """Parse GNU stat output with format '%n|%s|%Y|%f|%U|%G|%F'.
+
+    Split from the right: the name (``%n``, first) may hold a ``|`` -
+    ``a|b.txt`` came apart into a name ``a`` and a size ``b.txt``, an
+    unparseable answer - the six fields after it cannot."""
+    parts = output.strip("\r\n").rsplit("|", 6)
+    if len(parts) < 7:
+        raise OSError(f"Cannot parse stat output: {output[:200]!r}")
+    name = posixpath.basename(parts[0])
+    # The remote shell controls this text: a field that does not convert,
+    # or an mtime outside datetime's range, is an unusable answer (OSError,
+    # what callers of stat() handle), not a ValueError / OverflowError.
+    try:
+        size = int(parts[1])
+        mtime = datetime.fromtimestamp(int(parts[2]))
+        mode = int(parts[3], 16) & 0o7777
+    except (ValueError, OverflowError, OSError) as exc:
+        raise OSError(f"Cannot parse stat output {output[:200]!r}: {exc}") from exc
+    owner = parts[4]
+    group = parts[5]
+    ftype = parts[6].lower()
+    is_dir = "directory" in ftype
+    is_link = "link" in ftype
+
+    return FileItem(
+        name=name,
+        size=size,
+        modified=mtime,
+        permissions=mode,
+        is_dir=is_dir,
+        is_link=is_link,
+        owner=owner,
+        group=group,
+    )
+
+
+def _parse_df(output: str) -> tuple[int, int, int]:
+    """Parse `df -B1` or `df -k` output.
+
+    Returns (total, used, free) in bytes.
+    """
+    lines = split_lf_only_stream(output.strip())
+    if len(lines) < 2:
+        return (0, 0, 0)
+    # Header line, then data (may wrap to second line)
+    data_lines = lines[1:]
+    data = " ".join(data_lines)
+    parts = data.split()
+    # Typical: filesystem total used available use% mountpoint
+    # We need: parts[1]=total, parts[2]=used, parts[3]=available
+    try:
+        if len(parts) >= 4:
+            total = int(parts[1])
+            used = int(parts[2])
+            free = int(parts[3])
+            return (total, used, free)
+    except (ValueError, IndexError):
+        pass
+    return (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Layer 5: SpooledWriter
+# ---------------------------------------------------------------------------
+class _SpooledWriter:
+    """Buffer writes in memory, upload via shell on close()."""
+
+    def __init__(
+        self,
+        shell: _ShellSession,
+        remote_path: str,
+        caps: _Capabilities,
+        append: bool = False,
+    ):
+        self._shell = shell
+        self._remote_path = remote_path
+        self._caps = caps
+        self._append = append
+        # In the spool folder (core.read_spool), not /tmp: a tmpfs there
+        # ran out of room for a large upload.
+        self._buf = new_spool(max_size=8 * 1024 * 1024)
+        self._closed = False
+        # The running transfer's Cancel and progress (core.transfer_hooks):
+        # the upload happens in close(), after the copy loop.
+        self._hooks = transfer_hooks.current()
+        if self._hooks is not None:
+            self._hooks.expect_upload()
+
+    def write(self, data: bytes) -> int:
+        return self._buf.write(data)
+
+    def read(self, n: int = -1) -> bytes:
+        return self._buf.read(n)
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        return self._buf.seek(pos, whence)
+
+    def tell(self) -> int:
+        return self._buf.tell()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._buf.seek(0)
+            data = self._buf.read()
+        finally:
+            self._buf.close()
+        qpath = shell_path(self._remote_path)
+
+        if self._hooks is not None:
+            self._hooks.check()
+        if self._caps.transfer_method == "base64":
+            self._upload_base64(data, qpath)
+        elif self._caps.transfer_method == "uuencode":
+            self._upload_uuencode(data, qpath)
+        elif self._caps.transfer_method == "xxd":
+            self._upload_xxd(data, qpath)
+        else:
+            self._upload_raw(data, qpath)
+        if self._hooks is not None:
+            self._hooks.sent(len(data), len(data), check=False)
+
+    @staticmethod
+    def _safe_eof(payload: str) -> str:
+        """Return an EOF marker that does not appear in *payload*."""
+        eof = "__AXX_EOF__"
+        while eof in payload:
+            eof += "_"
+        return eof
+
+    def _upload_chunked(self, data: bytes, qpath: str, raw_per_heredoc: int, encode, decoder):
+        """Send *data* as heredocs of at most MAX_HEREDOC_CHARS encoded
+        characters in short lines: the first truncates (unless appending),
+        the rest append. One multi-megabyte line through the interactive
+        shell lost input now and then (see _upload_base64)."""
+        starts = range(0, len(data), raw_per_heredoc) if data else [0]
+        hooks = self._hooks
+        for index, start in enumerate(starts):
+            if hooks is not None and index:
+                # Between two heredocs: Cancel stops the upload here (the
+                # remote file holds the part sent - a plain InterruptedError,
+                # the engine rolls the destination back).
+                hooks.sent(start, len(data))
+            text = encode(data[start : start + raw_per_heredoc])
+            redirect = ">>" if (self._append or index) else ">"
+            eof = self._safe_eof(text)
+            cmd = f"{decoder} {redirect} {qpath} << '{eof}'\n{text}\n{eof}"
+            self._shell.execute_checked(cmd, timeout=TRANSFER_TIMEOUT)
+
+    def _upload_base64(self, data: bytes, qpath: str) -> None:
+        # 76-character lines (57 bytes each), never one line of the whole
+        # file: a 4 MB line through the shell's terminal lost input.
+        self._upload_chunked(
+            data,
+            qpath,
+            57 * (MAX_HEREDOC_CHARS // 77),
+            lambda b: base64.encodebytes(b).decode("ascii").rstrip("\n"),
+            "base64 -d",
+        )
+
+    def _upload_uuencode(self, data: bytes, qpath: str) -> None:
+        # ``uudecode -o`` writes/overwrites the output file — there's
+        # no in-tool append flag. ``open_write(append=True)`` handles
+        # append at the backend layer by pre-concatenating the
+        # existing content and calling the writer with append=False,
+        # so in the normal flow ``self._append`` is always False
+        # here. A direct ``_SpooledWriter(append=True)`` caller that
+        # lands in this path would silently drop the append semantic,
+        # so refuse it explicitly rather than hide the bug behind a
+        # dead ``redirect`` variable.
+        if self._append:
+            raise OSError(
+                "Telnet uuencode upload path does not support append; "
+                "go through open_write(append=True) or use xxd/raw.",
+            )
+        uu_data = _uu_encode(data)
+        eof = self._safe_eof(uu_data)
+        cmd = f"uudecode -o {qpath} << '{eof}'\n{uu_data}\n{eof}"
+        self._shell.execute_checked(cmd, timeout=TRANSFER_TIMEOUT)
+
+    def _upload_xxd(self, data: bytes, qpath: str) -> None:
+        # xxd -r -p ignores line breaks: 76 hex digits (38 bytes) a line.
+        def encode(b: bytes) -> str:
+            h = b.hex()
+            return "\n".join(h[i : i + 76] for i in range(0, len(h), 76))
+
+        self._upload_chunked(data, qpath, 38 * (MAX_HEREDOC_CHARS // 77), encode, "xxd -r -p")
+
+    def _upload_raw(self, data: bytes, qpath: str) -> None:
+        """Text-only fallback via cat heredoc. Only works for text data."""
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise OSError(
+                "Cannot upload binary file: no base64/uuencode/xxd available "
+                "on remote system. Only text files are supported."
+            )
+        # The telnet stream turns every CR into a line feed and the shell
+        # drops NUL: such a file would arrive altered, so it is refused.
+        if "\r" in text or "\x00" in text:
+            raise OSError(
+                "Cannot upload this file with the raw (cat) transfer: it contains "
+                "carriage returns or NUL bytes, which the terminal would alter; "
+                "no base64/uuencode/xxd available on the remote system."
+            )
+        redirect = ">>" if self._append else ">"
+        eof = self._safe_eof(text)
+        if not text or not text.endswith("\n"):
+            # A heredoc body always ends in a newline. Command substitution
+            # strips trailing newlines - here exactly the one added.
+            cmd = f"printf '%s' \"$(cat << '{eof}'\n{text}\n{eof}\n)\" {redirect} {qpath}"
+        else:
+            cmd = f"cat {redirect} {qpath} << '{eof}'\n{text}{eof}"
+        self._shell.execute_checked(cmd, timeout=TRANSFER_TIMEOUT)
+
+    def discard(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._buf.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.discard()
+        else:
+            self.close()
+
+
+# ---------------------------------------------------------------------------
+# Main Backend: TelnetSession (FileBackend implementation)
+# ---------------------------------------------------------------------------
+class TelnetSession(SessionLifecycle):
+    """Telnet filesystem backend using shell commands.
+
+    Connects via raw telnet, authenticates, then uses standard Unix commands
+    (ls, stat, cat, base64, etc.) to implement the FileBackend interface.
+    """
+
+    #: Until _connect() probes the shell: nothing beyond POSIX assumed.
+    _caps: _Capabilities = _Capabilities()
+
+    def __init__(
+        self,
+        host: str,
+        port: int = 23,
+        username: str = "",
+        password: str = "",
+        proxy_type: str = "none",
+        proxy_host: str = "",
+        proxy_port: int = 0,
+        proxy_username: str = "",
+        proxy_password: str = "",
+        naws_width: int = 0,
+        naws_height: int = 0,
+        address_family: str = "auto",
+    ):
+        self._host = host
+        self._port = port
+        self._username = username
+        self._password = password
+        self._naws_width = naws_width
+        self._naws_height = naws_height
+        self._address_family = address_family
+        # Build an optional ProxyConfig from the kwargs. ProxyConfig's
+        # ``enabled`` property decides whether we go through a proxy
+        # or direct.
+        from core.proxy import ProxyConfig
+
+        self._proxy = ProxyConfig(
+            proxy_type=proxy_type or "none",
+            host=proxy_host,
+            port=int(proxy_port or 0),
+            username=proxy_username,
+            password=proxy_password,
+        )
+        self._transport: _TelnetTransport | None = None
+        self._shell: _ShellSession | None = None
+        self._caps: _Capabilities = _Capabilities()
+        self._home_dir: str = "/"
+        self._connected = False
+        # One login at a time: threads that find the connection dropped
+        # share one reconnect (each logged in on its own, leaking shells).
+        self._reconnect_lock = threading.Lock()
+        self._connect()
+
+    def _connect(self) -> None:
+        """Establish telnet connection, login, probe capabilities."""
+        self._transport = _TelnetTransport(
+            self._host,
+            self._port,
+            proxy=self._proxy,
+            naws_width=self._naws_width,
+            naws_height=self._naws_height,
+            address_family=getattr(self, "_address_family", "auto"),
+        )
+        self._shell = _ShellSession(self._transport, self._username, self._password)
+        self._caps = _probe_capabilities(self._shell)
+        # Determine home directory
+        output, code = self._shell.execute("echo $HOME", timeout=5.0)
+        self._home_dir = output.strip() or "/"
+        self._connected = True
+        log.info(
+            "Telnet session established: %s@%s:%d (home=%s, transfer=%s)",
+            self._username,
+            self._host,
+            self._port,
+            self._home_dir,
+            self._caps.transfer_method,
+        )
+
+    #: Set by close() / disconnect(): a later call through this object (a
+    #: queued or retried transfer, a scheduled job) raises instead of
+    #: logging in again by itself with the stored password.
+    _closed_by_user = False
+
+    def _refuse_if_closed(self) -> None:
+        if self._closed_by_user:
+            raise ConnectionError(errno.ENOTCONN,
+                                  f"Telnet {getattr(self, '_host', '')}: disconnected")
+
+    def _alive(self) -> bool:
+        return bool(
+            self._connected and self._shell and self._transport and not self._transport.closed
+        )
+
+    def _ensure_connected(self) -> _ShellSession:
+        """Reconnect if the connection has dropped."""
+        self._refuse_if_closed()
+        if self._alive():
+            return self._shell
+        with self._reconnect_lock:
+            self._refuse_if_closed()
+            if self._alive():  # another thread reconnected meanwhile
+                return self._shell
+            log.info("Telnet: reconnecting to %s:%d", self._host, self._port)
+            if self._transport and not self._transport.closed:
+                self._transport.close()
+            self._connect()
+            return self._shell
+
+    def _force_reconnect(self, failed: _ShellSession | None = None) -> _ShellSession:
+        """Force a full reconnect (close + reconnect). *failed*: the shell
+        the caller saw fail - when another thread has replaced it
+        meanwhile, that new shell is used, not replaced again."""
+        self._refuse_if_closed()
+        with self._reconnect_lock:
+            self._refuse_if_closed()
+            if failed is not None and self._shell is not failed and self._alive():
+                return self._shell
+            self._connected = False
+            if self._transport and not self._transport.closed:
+                self._transport.close()
+            self._connect()
+            return self._shell
+
+    def _exec(self, cmd: str, timeout: float = CMD_TIMEOUT) -> str:
+        """Execute command, auto-reconnect once on failure."""
+        shell = self._ensure_connected()
+        try:
+            return shell.execute_checked(cmd, timeout=timeout)
+        except CommandFailed:
+            # The shell answered; reconnecting would only run it again.
+            raise
+        except (OSError, TimeoutError):
+            # Force reconnect and retry once
+            log.debug("Telnet: command failed, reconnecting and retrying")
+            shell = self._force_reconnect(shell)
+            return shell.execute_checked(cmd, timeout=timeout)
+
+    def _exec_raw(self, cmd: str, timeout: float = CMD_TIMEOUT) -> tuple[str, int]:
+        """Execute command returning (output, exit_code) without checking."""
+        shell = self._ensure_connected()
+        try:
+            return shell.execute(cmd, timeout=timeout)
+        except (OSError, TimeoutError):
+            shell = self._force_reconnect(shell)
+            return shell.execute(cmd, timeout=timeout)
+
+    # --- FileBackend interface ---
+
+    def exec(
+        self,
+        cmd: str,
+        *,
+        timeout: float | None = 30.0,
+        stdin: bytes | None = None,
+        stdout_cap: int = 1024 * 1024,
+        stderr_cap: int = 64 * 1024,
+        env: dict[str, str] | None = None,
+    ) -> "ExecResult":
+        """Run *cmd* in the login shell - same shape as ``SSHSession.exec``.
+
+        A terminal mixes the two streams: everything arrives in
+        ``stdout``, ``stderr`` stays empty. Telnet has no stdin channel
+        for one command, so *stdin* goes to a temporary file the command
+        reads (removed afterwards). The exit status is ``returncode``.
+        """
+        from core.exec_util import capped, sh_env_prefix
+
+        if self._shell is None:
+            raise OSError("Telnet exec: not connected")
+        prefix = sh_env_prefix(env, "Telnet exec")
+        # A subshell on lines of its own: 'exit' ends the command, not
+        # the session's login shell, exports stay in it, and a trailing
+        # comment cannot swallow the closing parenthesis.
+        line = f"(\n{prefix}{cmd}\n)"
+        tmp = None
+        if stdin is not None:
+            import secrets
+
+            tmp = f"/tmp/.axross-stdin-{secrets.token_hex(6)}"
+            with self.open_write(tmp) as fh:
+                fh.write(stdin)
+            line = f"{line} < {shlex.quote(tmp)}"
+        try:
+            out, code = self._shell.execute(line, timeout=timeout or CMD_TIMEOUT, idle=False)
+        finally:
+            if tmp is not None:
+                try:
+                    self.remove(tmp)
+                except OSError as exc:
+                    log.warning("Telnet exec: could not remove %s: %s", tmp, exc)
+        return capped(code, out.encode("utf-8", "surrogateescape"), b"", stdout_cap, stderr_cap)
+
+    @property
+    def name(self) -> str:
+        return f"{self._username}@{self._host} (Telnet)"
+
+    @property
+    def connected(self) -> bool:
+        shell = self._shell
+        if not self._connected or not shell:
+            return False
+        # A shell running a command (a transfer, a tree operation of up to
+        # an hour) is alive: asking it "echo ok" waited for its lock.
+        try:
+            idle = shell._lock.acquire(blocking=False)
+        except Exception as exc:  # noqa: BLE001 - a dead shell object
+            log.debug("Telnet liveness check failed: %s", exc)
+            return False
+        if not idle:
+            transport = self._transport
+            return transport is not None and not transport.closed
+        try:
+            _, code = shell.execute("echo ok", timeout=5.0)
+            return code == 0
+        except Exception as exc:  # noqa: BLE001 - any failure means not connected
+            log.debug("Telnet liveness check failed: %s", exc)
+            return False
+        finally:
+            shell._lock.release()
+
+    def _path(self, path: str) -> str:
+        """*path* normalized for a command line; OSError when it holds a
+        control character. The command goes through the server's terminal,
+        whose line editing acts on ^U / ^W / ^V before the shell sees any
+        quoting: the rest of such a name ran as a command of its own."""
+        return refuse_control_chars(self.normalize(path), "Telnet")
+
+    def _ls(self, flags: str) -> str:
+        """The ``ls`` command a listing runs: under ``TZ=UTC0``, so its
+        dates are UTC (the parser returns them aware), and with ``-b``
+        where ls has it."""
+        return f"TZ=UTC0 ls {flags}{'b' if self._caps.has_ls_escape else ''}"
+
+    def list_dir(self, path: str) -> list[FileItem]:
+        path = self._path(path)
+        try:
+            from core.exec_util import ls_dir_operand
+
+            output = self._exec(f"{self._ls('-la')} {shell_path(ls_dir_operand(path))}")
+            return _parse_ls_la(output, escaped=self._caps.has_ls_escape, utc=True)
+        except OSError as exc:
+            # Stripped IoT / busybox / restricted-shell fallback:
+            # if `ls` isn't on PATH (or is refused by a restricted
+            # shell), use shell-glob `echo *` to at least retrieve
+            # the basename list. The output is just names — no
+            # size/perms/mtime — but it lets the user navigate.
+            if "command not found" not in str(exc).lower() and "not found" not in str(exc).lower():
+                if isinstance(exc, CommandFailed):
+                    from core.exec_util import refused_as
+
+                    # A missing path is FileNotFoundError, a file
+                    # NotADirectoryError (by what the path is).
+                    raise refused_as(f"Telnet list_dir({path})", path, str(exc)[:600],
+                                     lambda: self._path_kind(path), wanted="dir") from exc
+                raise
+            return self._list_dir_via_glob(path)
+
+    def _list_dir_via_glob(self, path: str) -> list[FileItem]:
+        """Last-resort directory listing via shell glob expansion.
+
+        Only used when ``ls`` is unavailable (stripped busybox / IoT
+        firmware). Produces FileItem entries with name only — no
+        stat fields. Hidden files (.foo) are NOT returned by ``echo *``
+        per shell-glob default, so we do a second probe with
+        ``echo .* *`` and de-duplicate.
+        """
+        qpath = shell_path(path)
+        output = self._exec(
+            f"cd {qpath} && (echo *; echo .*); cd - >/dev/null",
+            timeout=CMD_TIMEOUT,
+        )
+        names: set[str] = set()
+        for token in output.split():
+            if token in ("*", ".*", ".", "..", ""):
+                continue
+            names.add(token)
+        out: list[FileItem] = []
+        for n in sorted(names):
+            out.append(
+                FileItem(
+                    name=n,
+                    size=0,
+                    modified=datetime.fromtimestamp(0),
+                    permissions=0,
+                    is_dir=False,  # we genuinely don't know; UI can stat on click
+                    is_link=False,
+                )
+            )
+        return out
+
+    def stat(self, path: str) -> FileItem:
+        """A refusal is typed by its wording (core.exec_util.ls_error, as
+        SCP): a missing path was a CommandFailed, which the callers that
+        need "not there" could not tell from "cannot tell"."""
+        item = self._stat(path)
+        # _path() drops the slash: "g/" answered with the file g.
+        if path.endswith("/") and path.strip("/") and not (item.is_dir or item.is_link):
+            raise NotADirectoryError(errno.ENOTDIR, f"Telnet stat({path}): not a folder", path)
+        return item
+
+    def _stat(self, path: str) -> FileItem:
+        from core.exec_util import ls_error
+
+        path = self._path(path)
+        qpath = shell_path(path)
+        if self._caps.has_stat_gnu:
+            output, code = self._exec_raw(f"stat --format='%n|%s|%Y|%f|%U|%G|%F' {qpath}")
+            if code != 0:
+                raise ls_error(f"Telnet stat({path})", output.strip()[:500] or f"exit {code}")
+            return _parse_stat_gnu(output)
+        # Fallback: ls -ld
+        output, code = self._exec_raw(f"{self._ls('-ld')} {qpath}")
+        if code != 0:
+            raise ls_error(f"Telnet stat({path})", output.strip()[:500] or f"exit {code}")
+        items = _parse_ls_la(output, escaped=self._caps.has_ls_escape, utc=True)
+        if not items:
+            raise OSError(f"Cannot stat {path}: no output from ls -ld")
+        item = items[0]
+        # ls -la gives us the directory's own name, but we want the basename
+        return FileItem(
+            name=posixpath.basename(path.rstrip("/")) or path,
+            size=item.size,
+            modified=item.modified,
+            permissions=item.permissions,
+            is_dir=item.is_dir,
+            is_link=item.is_link,
+            link_target=item.link_target,
+            owner=item.owner,
+            group=item.group,
+        )
+
+    def _path_kind(self, path: str) -> str | None:
+        """"dir", "other" or None (not there). ``test -e`` read every
+        non-zero exit as "no", a folder it may not search included;
+        server_side_copy(overwrite=False) and the transfer worker take
+        False from exists() as the go-ahead to write."""
+        from core.exec_util import path_kind, path_kind_command
+
+        path = self._path(path)
+        out, code = self._exec_raw(path_kind_command(path))
+        return path_kind(f"Telnet {path}", out, code)
+
+    def is_dir(self, path: str) -> bool:
+        return self._path_kind(path) == "dir"
+
+    def exists(self, path: str) -> bool:
+        return self._path_kind(path) is not None
+
+    def mkdir(self, path: str) -> None:
+        from core.exec_util import refused_as
+
+        path = self._path(path)
+        output, code = self._exec_raw(f"mkdir -p {shell_path(path)}")
+        if code != 0:
+            # mkdir -p over a FILE: FileExistsError, not a CommandFailed.
+            raise refused_as(f"Telnet mkdir({path})", path, output.strip()[:500] or f"exit {code}",
+                             lambda: self._path_kind(path), wanted="absent")
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        """FileNotFoundError for a path that is not there (``rm -f`` said
+        nothing), another OSError for any other refusal."""
+        from core.exec_util import ls_error
+
+        path = self._path(path)
+        output, code = self._exec_tree_op(remove_command(path, recursive=recursive))
+        if code != 0:
+            raise ls_error(f"Telnet remove({path})", output.strip()[:500] or f"exit {code}")
+
+    def rename(self, src: str, dst: str) -> None:
+        from core.path_policy import refuse_folder_path
+
+        # _path() drops the slash: a file renamed to "x/" became "x".
+        refuse_folder_path(dst, "rename to", source_is_file=lambda: self._path_kind(src) == "other")
+        cmd = rename_command(self._path(src), self._path(dst))
+        output, code = self._exec_tree_op(cmd)
+        if code != 0:
+            raise CommandFailed(f"Command failed (exit {code}): {cmd[:80]}\n{output[:500]}")
+
+    def _exec_tree_op(self, cmd: str) -> tuple[str, int]:
+        """Run a command that changes the tree (cp, mv, rm): under
+        TREE_OP_TIMEOUT, not CMD_TIMEOUT, and never sent a second time -
+        _exec_raw's reconnect-and-retry after a timeout ran a copy that was
+        still going again. A timeout says the command may still be running."""
+        shell = self._ensure_connected()
+        try:
+            return shell.execute(cmd, timeout=TREE_OP_TIMEOUT)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"Telnet: no answer within {TREE_OP_TIMEOUT:.0f} s; the command may still be "
+                f"running on the server: {cmd[:80]!r}"
+            ) from exc
+
+    def open_read(self, path: str) -> IO[bytes]:
+        path = self._path(path)
+        qpath = shell_path(path)
+        shell = self._ensure_connected()
+
+        if (
+            self._caps.transfer_method in ("base64", "xxd")
+            and self._caps.has_dd
+            and self._caps.has_wc
+        ):
+            return self._read_in_pieces(shell, path, qpath)
+        if self._caps.transfer_method == "base64":
+            output, code = shell.execute(f"base64 < {qpath}", timeout=TRANSFER_TIMEOUT)
+            if code != 0:
+                raise self._read_refused(path, f"base64 failed (exit {code})")
+            # Decode base64 — output may have whitespace/newlines
+            try:
+                data = base64.b64decode(output.replace("\n", "").replace(" ", ""))
+            except Exception as e:
+                raise OSError(f"Cannot decode {path}: {e}") from e
+        elif self._caps.transfer_method == "xxd":
+            output, code = shell.execute(f"xxd -p < {qpath}", timeout=TRANSFER_TIMEOUT)
+            if code != 0:
+                raise self._read_refused(path, f"xxd failed (exit {code})")
+            try:
+                data = bytes.fromhex(output.replace("\n", "").replace(" ", ""))
+            except Exception as e:
+                raise OSError(f"Cannot decode {path}: {e}") from e
+        elif self._caps.transfer_method == "uuencode":
+            output, code = shell.execute(f"uuencode - - < {qpath}", timeout=TRANSFER_TIMEOUT)
+            if code != 0:
+                raise self._read_refused(path, f"uuencode failed (exit {code})")
+            try:
+                data = _uu_decode(output)
+            except ValueError as e:
+                raise OSError(f"Cannot decode {path}: {e}") from e
+        else:
+            data = self._read_raw(shell, path, qpath)
+
+        buf = io.BytesIO(data)
+        buf.seek(0)
+        return buf
+
+    def _read_in_pieces(self, shell: _ShellSession, path: str, qpath: str) -> IO[bytes]:
+        """The file in pieces of TELNET_READ_CHUNK bytes (``dd | base64``
+        or ``dd | xxd -p``) into a spool: no answer outgrows the transport's
+        cap, every piece reports progress and checks Cancel. The pieces must
+        add up to the size the file had when the read began; a file that
+        shrank or could not be read further is an error, never a shorter
+        file (``dd``'s own failure is hidden behind the pipe's status)."""
+        size_text, code = shell.execute(f"wc -c < {qpath}", timeout=CMD_TIMEOUT)
+        if code != 0:
+            raise self._read_refused(path, size_text.strip()[:300] or f"wc failed (exit {code})")
+        try:
+            size = int(size_text.strip().split()[-1])
+        except (ValueError, IndexError) as exc:
+            raise OSError(f"Cannot read {path}: no size from wc: {size_text[:200]!r}") from exc
+        base64_mode = self._caps.transfer_method == "base64"
+        encoder = "base64" if base64_mode else "xxd -p"
+        piece_size = TELNET_READ_CHUNK
+        hooks = transfer_hooks.current()
+        spool = new_spool(size, max_size=8 * 1024 * 1024)
+        try:
+            done = 0
+            index = 0
+            while done < size:
+                if hooks is not None:
+                    hooks.received(done, size)
+                output, code = shell.execute(
+                    f"dd if={qpath} bs={piece_size} skip={index} count=1 2>/dev/null | {encoder}",
+                    timeout=TRANSFER_TIMEOUT,
+                )
+                if code != 0:
+                    raise OSError(f"Cannot read {path}: {encoder} failed (exit {code})")
+                text = output.replace("\n", "").replace(" ", "")
+                try:
+                    piece = base64.b64decode(text) if base64_mode else bytes.fromhex(text)
+                except (ValueError, binascii.Error) as exc:
+                    raise OSError(f"Cannot decode {path}: {exc}") from exc
+                wanted = min(piece_size, size - done)
+                if len(piece) < wanted:
+                    raise OSError(
+                        f"Cannot read {path}: {done + len(piece)} of {size} bytes arrived "
+                        "(the file changed or could not be read further)"
+                    )
+                # A file that grew meanwhile: the size it had at the start.
+                spool.write(piece[:wanted])
+                done += wanted
+                index += 1
+            if hooks is not None:
+                hooks.received(done, size)
+            spool.seek(0)
+            return spool
+        except BaseException:
+            spool.close()
+            raise
+
+    def _read_refused(self, path: str, message: str) -> OSError:
+        """A failed read typed by what *path* is: the redirect's wording
+        differs per shell, and the stream may hold nothing else."""
+        from core.exec_util import refused_as
+
+        return refused_as(f"Cannot read {path}", path, message,
+                          lambda: self._path_kind(path), wanted="file")
+
+    def _read_raw(self, shell: _ShellSession, path: str, qpath: str) -> bytes:
+        """Raw ``cat`` read - text only - framed by markers of its own.
+
+        The shell session strips each answer, which took leading and
+        trailing blank lines and spaces off the file; the content is cut
+        out between two markers instead. The telnet stream drops every
+        carriage return: where ``wc`` exists the size is checked, so a
+        CRLF (or non-UTF-8) file fails instead of arriving altered.
+        """
+        import secrets
+
+        tag = secrets.token_hex(8)
+        begin = f"__AXROSS_RAW_BEGIN_{tag}__"
+        end = f"__AXROSS_RAW_END_{tag}__"
+        output, code = shell.execute(
+            f"printf '%s' '{begin}' && cat -- {qpath} && printf '%s' '{end}'",
+            timeout=TRANSFER_TIMEOUT,
+        )
+        if code != 0:
+            raise OSError(f"Cannot read {path}: cat failed (exit {code})")
+        start = output.find(begin)
+        stop = output.rfind(end)
+        if start == -1 or stop < start + len(begin):
+            raise OSError(f"Cannot read {path}: the answer is not framed as sent")
+        data = output[start + len(begin) : stop].encode("utf-8")
+        if self._caps.has_wc:
+            size_text, code = shell.execute(f"wc -c < {qpath}", timeout=CMD_TIMEOUT)
+            try:
+                size = int(size_text.strip()) if code == 0 else -1
+            except ValueError:
+                size = -1
+            if size != len(data):
+                raise OSError(
+                    f"Cannot read {path} with the raw (cat) transfer: {len(data)} bytes "
+                    f"arrived, the file has {size} bytes (carriage returns or binary "
+                    "content do not survive the terminal)"
+                )
+        return data
+
+    def open_write(self, path: str, append: bool = False) -> IO[bytes]:
+        from core.path_policy import refuse_folder_path
+
+        # _path() drops the slash: "x/" was written as a FILE "x".
+        path = self._path(refuse_folder_path(path))
+        if append:
+            try:
+                with self.open_read(path) as f:
+                    existing = f.read()
+            except OSError as exc:
+                # Only a file that is not there may start empty; one that
+                # could not be read would be overwritten by the new bytes.
+                if self.exists(path):
+                    raise OSError(
+                        f"Telnet append: refusing to overwrite {path}; could not "
+                        f"read existing content ({exc})"
+                    ) from exc
+                existing = b""
+            writer = _SpooledWriter(self._ensure_connected(), path, self._caps, append=False)
+            writer.write(existing)
+            return writer
+        return _SpooledWriter(self._ensure_connected(), path, self._caps)
+
+    def normalize(self, path: str) -> str:
+        return posixpath.normpath(path) or "/"
+
+    def separator(self) -> str:
+        return "/"
+
+    def join(self, *parts: str) -> str:
+        return posixpath.join(*parts)
+
+    def parent(self, path: str) -> str:
+        return posixpath.dirname(path.rstrip("/")) or "/"
+
+    def home(self) -> str:
+        return self._home_dir
+
+    def chmod(self, path: str, mode: int) -> None:
+        if not self._caps.has_chmod:
+            raise OSError("chmod not available on remote system")
+        self._exec(f"chmod {oct(mode)[2:]} {shell_path(self._path(path))}")
+
+    def readlink(self, path: str) -> str:
+        if not self._caps.has_readlink:
+            raise OSError("readlink not available on remote system")
+        output = self._exec(f"readlink {shell_path(self._path(path))}")
+        result = output.strip()
+        if not result:
+            raise OSError(f"Not a symlink: {path}")
+        return result
+
+    def list_versions(self, path: str) -> list:
+        return []
+
+    def open_version_read(self, path: str, version_id: str):
+        raise OSError(f"{type(self).__name__} does not expose file version history")
+
+    def copy(self, src: str, dst: str) -> None:
+        """Shell ``cp -p`` on the remote — server-side."""
+        src = self._path(src)
+        dst = self._path(dst)
+        output, code = self._exec_tree_op(f"{copy_command(src, dst, preserve=True)} 2>&1")
+        if code != 0:
+            raise OSError(f"cp {src} -> {dst} failed: {output.strip()!r}")
+
+    def checksum(self, path: str, algorithm: str = "sha256") -> str:
+        """Run the remote ``sha256sum`` / ``md5sum`` over the shell."""
+        tool = {
+            "sha256": "sha256sum",
+            "sha1": "sha1sum",
+            "md5": "md5sum",
+        }.get(algorithm)
+        if not tool:
+            return ""
+        path = self._path(path)
+        # A hash of a large file on a slow box takes minutes: the long
+        # time-out of the tree operations, and never sent a second time
+        # (_exec_raw re-ran it after a reconnect).
+        output, code = self._exec_tree_op(f"{tool} {shell_path(path)} 2>/dev/null")
+        if code != 0 or not output:
+            return ""
+        from core.exec_util import digest_from_sum_output
+
+        first_line = split_lf_only_stream(output.strip())[0] if output.strip() else ""
+        digest = digest_from_sum_output(first_line, algorithm)
+        return f"{algorithm}:{digest}" if digest else ""
+
+    # ------------------------------------------------------------------
+    # Telnet-specific verbs (API_GAPS round 2)
+    # ------------------------------------------------------------------
+
+    def expect(
+        self, pattern: str, *, timeout: float = 10.0, read_size: int = 4096
+    ) -> tuple[str, bool]:
+        """Read from the live transport until ``pattern`` (a regex)
+        appears or ``timeout`` elapses. Returns ``(text, matched)``.
+
+        Useful for scripted Telnet sessions where the user wants to
+        wait for a specific prompt before sending the next command —
+        the FileBackend wrapper isn't enough for that. Pattern is
+        compiled with re.MULTILINE so ``^`` / ``$`` match line ends.
+
+        Doesn't consume past the match — the buffered text up to and
+        including the match is returned, the rest stays in the
+        transport's read buffer.
+        """
+        import re as _re
+
+        if not self._transport or self._transport.closed:
+            raise OSError("Telnet expect: transport not active")
+        rx = _re.compile(pattern, _re.MULTILINE)
+        text, m = self._transport.read_until_re(rx, timeout=float(timeout))
+        return text, bool(m)
+
+    def send_raw(self, data: bytes) -> None:
+        """Send raw bytes (no CRLF appending, no IAC framing). Useful
+        for protocols layered on top of a raw Telnet socket where the
+        upper layer manages its own framing.
+
+        ``data`` may include any byte except a literal IAC (0xFF) —
+        which we refuse, because it would otherwise be interpreted as
+        a start-of-Telnet-command and the receiver's behaviour would
+        diverge from the caller's intent. Pass IAC explicitly via the
+        proper option-negotiation API if that's really wanted.
+        """
+        if b"\xff" in data:
+            raise ValueError(
+                "Telnet send_raw: IAC byte (0xFF) is not allowed in raw data; "
+                "send option-negotiation through the dedicated API instead"
+            )
+        if not self._transport or self._transport.closed:
+            raise OSError("Telnet send_raw: transport not active")
+        self._transport.send_raw(data)
+
+    def disk_usage(self, path: str) -> tuple[int, int, int]:
+        if not self._caps.has_df:
+            return (0, 0, 0)
+        path = self._path(path)
+        # Try df -B1 (GNU) first
+        output, code = self._exec_raw(f"df -B1 {shell_path(path)} 2>/dev/null")
+        if code == 0:
+            result = _parse_df(output)
+            if result != (0, 0, 0):
+                return result
+        # Fallback: df -k (POSIX) → multiply by 1024
+        output, code = self._exec_raw(f"df -k {shell_path(path)}")
+        if code == 0:
+            total, used, free = _parse_df(output)
+            return (total * 1024, used * 1024, free * 1024)
+        return (0, 0, 0)
+
+    def close(self) -> None:
+        self._closed_by_user = True
+        self._connected = False
+        if self._transport and not self._transport.closed:
+            try:
+                self._transport.send("exit")
+            except OSError:
+                pass
+            self._transport.close()
+        self._shell = None
+        self._transport = None
+
+    def disconnect(self) -> None:
+        self.close()

@@ -1,0 +1,711 @@
+"""NNTP backend implementing the FileBackend protocol.
+
+Built on :mod:`core.nntp_lib` (our own Python-3.13-safe NNTP impl).
+Treats Usenet as a filesystem::
+
+    /                                — list of newsgroups (LIST ACTIVE)
+    /<group>/                        — directory; list_dir lazy-pages OVER N-M
+    /<group>/<msgno>_<subject>.eml   — one article (RFC 5322 / Usenet bytes)
+
+Write surface is **POST** (creating an article in a postable group).
+Symlinks, chmod, rename are refused. Recursive delete is refused
+(deleting articles is not a generic NNTP operation).
+
+Authentication:
+
+* ``use_tls=True`` + port 563 → implicit-TLS (RFC 4642)
+* ``use_tls=False`` + ``starttls=True`` → upgrade in-band on port 119
+* ``username`` + ``password`` → AUTHINFO USER/PASS (RFC 4643)
+"""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import io
+import logging
+import posixpath
+import re
+from datetime import datetime
+from typing import IO
+
+from core.backend import SessionLifecycle
+from core.session_lock import io_lock, serialized
+from models.file_item import FileItem
+
+log = logging.getLogger(__name__)
+
+
+# Cap how many articles list_dir paginates in one go. Big groups can
+# hold millions of messages; we expose the most-recent N by default
+# so the UI doesn't choke. Override via ``window`` ctor arg.
+DEFAULT_WINDOW = 200
+
+# Sanitise subjects for filenames.
+_FILENAME_BAD = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
+_MSG_PATH_RE = re.compile(r"^/(?P<group>[^/]+)/(?P<msgno>\d+)_[^/]*\.eml$")
+# RFC 3977: 423 no article with that number (or none in the range, for
+# OVER), 430 no article with that message-id.
+_NO_SUCH_ARTICLE = (423, 430)
+
+
+def _connection_lost(exc: BaseException) -> bool:
+    """*exc* says the connection went away (not: the server refused)."""
+    from core.nntp_lib import NntpResponseError
+
+    seen = 0
+    cur: BaseException | None = exc
+    while cur is not None and seen < 6:
+        if isinstance(cur, NntpResponseError):
+            return False
+        if isinstance(cur, (ConnectionError, EOFError, TimeoutError)) and not (
+            isinstance(cur, ConnectionError) and cur.errno == errno.ENOTCONN
+        ):
+            return True
+        if "connection closed" in str(cur):
+            return True
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    return False
+
+
+def _reconnecting(method):
+    """A read: under the session lock, and once more on a new connection
+    when the server had closed this one (an idle timeout shows only when
+    the next command meets the closed socket)."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with io_lock(self):
+            if self._closed_by_user:
+                raise ConnectionError(errno.ENOTCONN, f"NNTP {self._host}: disconnected")
+            try:
+                return method(self, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - re-raised unless the link is gone
+                nntp = self._nntp
+                if self._closed_by_user or not _connection_lost(exc) or (
+                        nntp is not None and not nntp.closed):
+                    raise
+                log.info("NNTP: the connection to %s was lost (%s); retrying", self._host, exc)
+                return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _sanitize(name: str, max_len: int = 80) -> str:
+    cleaned = _FILENAME_BAD.sub("_", name).strip(". ")
+    if not cleaned:
+        cleaned = "untitled"
+    return cleaned[:max_len]
+
+
+class NntpSession(SessionLifecycle):
+    """NNTP backend implementing the FileBackend protocol."""
+
+    supports_symlinks = False
+    supports_hardlinks = False
+    #: The connection (core.nntp_lib.NntpClient); ``_client`` opens a new
+    #: one when the server dropped this one.
+    _nntp = None
+    #: close() was called: no reconnect.
+    _closed_by_user = False
+
+    def __init__(
+        self,
+        host: str,
+        port: int = 0,
+        username: str = "",
+        password: str = "",
+        use_tls: bool = True,
+        starttls: bool = False,
+        group_prefix: str = "",
+        window: int = DEFAULT_WINDOW,
+        proxy_type: str = "none",
+        proxy_host: str = "",
+        proxy_port: int = 0,
+        proxy_username: str = "",
+        proxy_password: str = "",
+    ):
+        from core.nntp_lib import DEFAULT_PORT, DEFAULT_TLS_PORT
+        from core.proxy import ProxyConfig
+
+        self._host = host
+        if port:
+            self._port = int(port)
+        else:
+            self._port = DEFAULT_TLS_PORT if (use_tls and not starttls) else DEFAULT_PORT
+        self._use_tls = bool(use_tls or starttls)
+        self._implicit_tls = bool(use_tls)
+        self._starttls = bool(starttls)
+        self._username = username
+        # Kept for a reconnect: a Usenet server closes an idle connection
+        # after a few minutes.
+        self._password = password
+        self._group_prefix = group_prefix
+        self._window = max(1, int(window))
+        self._proxy = ProxyConfig(
+            proxy_type=proxy_type or "none",
+            host=proxy_host,
+            port=int(proxy_port or 0),
+            username=proxy_username,
+            password=proxy_password,
+        )
+
+        self._nntp = self._open_client()
+
+        # Per-group cache: group → (count, low, high)
+        self._group_info_cache: dict[str, tuple[int, int, int]] = {}
+        # Per-group OVER cache: group → list of records (most recent window)
+        self._group_over_cache: dict[str, list[dict]] = {}
+        log.info("NNTP session ready: %s@%s:%d", username or "(anon)", host, self._port)
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        scheme = "NNTPS" if self._use_tls else "NNTP"
+        who = self._username or "anon"
+        return f"{scheme}: {who}@{self._host}:{self._port}"
+
+    def _open_client(self):
+        """A new connection, in reader mode and logged in."""
+        from core.nntp_lib import NntpAuthRequired, NntpClient
+
+        try:
+            client = NntpClient(
+                host=self._host,
+                port=self._port,
+                use_tls=self._implicit_tls,
+                starttls=self._starttls,
+                proxy_config=self._proxy,
+            )
+        except Exception as exc:
+            raise OSError(f"Cannot connect to NNTP {self._host}:{self._port}: {exc}") from exc
+        try:
+            client.mode_reader()
+            if self._username:
+                client.authinfo(self._username, getattr(self, "_password", ""))
+        except NntpAuthRequired as exc:
+            client.quit()
+            raise OSError(f"NNTP requires auth: {exc}") from exc
+        except Exception:
+            client.quit()
+            raise
+        return client
+
+    @property
+    def _client(self):
+        """The connection - a new one when the server dropped the last
+        (an idle Usenet connection is closed after a few minutes: every
+        call after that failed with "connection is closed" until the user
+        reconnected by hand). ENOTCONN after close()."""
+        if self._closed_by_user:
+            raise ConnectionError(errno.ENOTCONN, f"NNTP {self._host}: disconnected")
+        client = self._nntp
+        if client is None or client.closed:
+            log.info("NNTP: the connection to %s was closed; reconnecting", self._host)
+            self._group_info_cache = {}
+            client = self._nntp = self._open_client()
+        return client
+
+    @_client.setter
+    def _client(self, client) -> None:
+        self._nntp = client
+
+    @property
+    def connected(self) -> bool:
+        # nntp_lib closes a connection whose response broke off (the stream
+        # is out of step); the client object outlives its socket.
+        client = self._nntp
+        return not self._closed_by_user and client is not None and not client.closed
+
+    @serialized
+    def close(self) -> None:
+        self._closed_by_user = True
+        if self._nntp is not None:
+            self._nntp.quit()
+            self._nntp = None
+
+    def disconnect(self) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    def home(self) -> str:
+        return "/"
+
+    def separator(self) -> str:
+        return "/"
+
+    def join(self, *parts: str) -> str:
+        cleaned = [s for s in (p.strip("/") for p in parts) if s]
+        if not cleaned:
+            return "/"
+        return "/" + "/".join(cleaned)
+
+    def parent(self, path: str) -> str:
+        return posixpath.dirname(path.rstrip("/")) or "/"
+
+    def normalize(self, path: str) -> str:
+        if not path:
+            return "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        return posixpath.normpath(path) or "/"
+
+    # ------------------------------------------------------------------
+    # FileBackend — read surface
+    # ------------------------------------------------------------------
+
+    @_reconnecting
+    def list_dir(self, path: str) -> list[FileItem]:
+        path = self.normalize(path)
+        if path == "/":
+            return self._list_groups()
+        # /<group> — list articles
+        parts = path.strip("/").split("/")
+        if len(parts) != 1:
+            raise OSError(f"NNTP list({path}): nesting beyond /<group> is not supported")
+        return self._list_articles(parts[0])
+
+    def _list_groups(self) -> list[FileItem]:
+        items: list[FileItem] = []
+        for group, high, low, status in self._client.list_groups(self._group_prefix):
+            items.append(
+                FileItem(
+                    name=group,
+                    is_dir=True,
+                    is_link=False,
+                    size=0,
+                    modified=datetime.fromtimestamp(0),
+                    permissions=0o555 if status == "y" else 0o550,
+                )
+            )
+        return items
+
+    def _ensure_group(self, group: str, *, fresh: bool = False) -> tuple[int, int, int]:
+        """Make ``group`` the server's current group. Article numbers are
+        per group, so the cached GROUP answer only spares the round trip
+        when the server still has this group selected - another listing
+        or a scripting verb may have switched it since. ``fresh`` sends
+        GROUP regardless: only its answer carries the current article
+        range (a listing / refresh needs it)."""
+        info = self._group_info_cache.get(group)
+        if not fresh and info is not None and self._client.current_group == group:
+            return info
+        info = self._client.select_group(group)
+        self._group_info_cache[group] = info
+        return info
+
+    def _select_or_missing(self, group: str, *, fresh: bool = False) -> tuple[int, int, int]:
+        """``_ensure_group``, with the server's "411 no such newsgroup" as
+        FileNotFoundError and any other failure as OSError."""
+        from core.nntp_lib import NntpResponseError
+
+        try:
+            return self._ensure_group(group, fresh=fresh)
+        except NntpResponseError as exc:
+            if exc.code == 411:
+                raise FileNotFoundError(errno.ENOENT, "No such newsgroup", "/" + group) from exc
+            raise OSError(f"NNTP GROUP {group}: {exc}") from exc
+        except OSError:
+            raise
+        except Exception as exc:
+            raise OSError(f"NNTP GROUP {group}: {exc}") from exc
+
+    def _list_articles(self, group: str) -> list[FileItem]:
+        # A listing is also the refresh: articles that arrived since the
+        # last GROUP answer are only in a new one.
+        count, low, high = self._select_or_missing(group, fresh=True)
+        # Most-recent window: [max(low, high - window + 1) .. high].
+        if high < low:
+            return []
+        win_low = max(low, high - self._window + 1)
+        records = list(self._client.over(win_low, high))
+        self._group_over_cache[group] = records
+        items: list[FileItem] = []
+        from core.nntp_lib import parse_overview_date
+
+        for rec in records:
+            subject_safe = _sanitize(rec.get("subject", ""))
+            name = f"{rec['msgno']}_{subject_safe}.eml"
+            items.append(
+                FileItem(
+                    name=name,
+                    is_dir=False,
+                    is_link=False,
+                    size=int(rec.get("bytes") or 0),
+                    modified=parse_overview_date(rec.get("date", "")),
+                    permissions=0o444,
+                )
+            )
+        return items
+
+    @_reconnecting
+    def stat(self, path: str) -> FileItem:
+        path = self.normalize(path)
+        if path == "/":
+            return FileItem(
+                name="/",
+                is_dir=True,
+                is_link=False,
+                size=0,
+                modified=datetime.fromtimestamp(0),
+                permissions=0o555,
+            )
+        parts = path.strip("/").split("/")
+        if len(parts) == 1:
+            # Group node: the server says whether it exists.
+            self._select_or_missing(parts[0])
+            return FileItem(
+                name=parts[0],
+                is_dir=True,
+                is_link=False,
+                size=0,
+                modified=datetime.fromtimestamp(0),
+                permissions=0o555,
+            )
+        m = _MSG_PATH_RE.fullmatch(path)
+        if not m:
+            # Articles are addressed by number only: nothing can be here.
+            raise FileNotFoundError(
+                errno.ENOENT, "NNTP: not a group or article path", path
+            )
+        group = m.group("group")
+        msgno = int(m.group("msgno"))
+        # Find in cached overview if possible.
+        for rec in self._group_over_cache.get(group, []):
+            if rec.get("msgno") == msgno:
+                from core.nntp_lib import parse_overview_date
+
+                return FileItem(
+                    name=posixpath.basename(path),
+                    is_dir=False,
+                    is_link=False,
+                    size=int(rec.get("bytes") or 0),
+                    modified=parse_overview_date(rec.get("date", "")),
+                    permissions=0o444,
+                )
+        # Not listed yet: the overview of this one article, as the listing
+        # would show it (HEAD only gave the headers' length). A server
+        # without an overview record for it: the article's own length.
+        from core.nntp_lib import NntpResponseError, parse_overview_date
+
+        self._select_or_missing(group)
+        try:
+            records = [r for r in self._client.over(msgno, msgno) if r.get("msgno") == msgno]
+            if records:
+                size = int(records[0].get("bytes") or 0)
+                modified = parse_overview_date(records[0].get("date", ""))
+            else:
+                size = len(self._client.article(msgno))
+                modified = datetime.fromtimestamp(0)
+        except NntpResponseError as exc:
+            if exc.code in _NO_SUCH_ARTICLE:
+                raise FileNotFoundError(errno.ENOENT, f"No such article: {exc}", path) from exc
+            raise OSError(f"NNTP stat {group}/{msgno}: {exc}") from exc
+        except Exception as exc:
+            raise OSError(f"NNTP stat {group}/{msgno}: {exc}") from exc
+        return FileItem(
+            name=posixpath.basename(path),
+            is_dir=False,
+            is_link=False,
+            size=size,
+            modified=modified,
+            permissions=0o444,
+        )
+
+    def is_dir(self, path: str) -> bool:
+        path = self.normalize(path)
+        if path == "/":
+            return True
+        return "/" not in path.strip("/") and self.exists(path)
+
+    def exists(self, path: str) -> bool:
+        """False only for "no such group / article" (411, 423, 430) or a
+        path that names neither. A refused, dropped or timed-out request,
+        or a connection nntp_lib closed, is an OSError: the transfer
+        worker takes False as the go-ahead to write."""
+        try:
+            self.stat(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    @_reconnecting
+    def open_read(self, path: str) -> IO[bytes]:
+        m = _MSG_PATH_RE.fullmatch(self.normalize(path))
+        if not m:
+            raise OSError(f"NNTP read({path}): not a group/article path")
+        group = m.group("group")
+        msgno = int(m.group("msgno"))
+        try:
+            self._ensure_group(group)
+            blob = self._client.article(msgno)
+        except Exception as exc:
+            raise OSError(f"NNTP ARTICLE {group}/{msgno}: {exc}") from exc
+        return io.BytesIO(blob)
+
+    # ------------------------------------------------------------------
+    # FileBackend — write surface (POST)
+    # ------------------------------------------------------------------
+
+    def open_write(self, path: str, append: bool = False) -> IO[bytes]:
+        if append:
+            raise OSError("NNTP POST does not support append")
+        # The write target encodes the destination group via the path:
+        # /<group>/draft.eml  → POST to <group>. We require the writer
+        # to provide a fully-formed RFC 5322 article in the body.
+        norm = self.normalize(path)
+        parts = norm.strip("/").split("/")
+        if len(parts) != 2:
+            raise OSError("NNTP write must target /<group>/<filename>.eml")
+        group = parts[0]
+        return _NntpPoster(self._client, group, io_lock(self))
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        # NNTP has no client-side DELE. Some servers expose CANCEL-style
+        # control messages, but those are policy-bound; refuse cleanly.
+        raise OSError("NNTP does not expose a generic article-delete primitive")
+
+    def mkdir(self, path: str) -> None:
+        raise OSError("NNTP groups are server-managed — mkdir is not supported")
+
+    def rename(self, src: str, dst: str) -> None:
+        raise OSError("NNTP does not support rename")
+
+    def chmod(self, path: str, mode: int) -> None:
+        raise OSError("NNTP carries no POSIX permissions")
+
+    def copy(self, src: str, dst: str) -> None:
+        raise OSError("NNTP has no server-side copy primitive")
+
+    def readlink(self, path: str) -> str:
+        raise OSError("NNTP has no symlinks")
+
+    def list_versions(self, path: str) -> list:
+        return []
+
+    def open_version_read(self, path: str, version_id: str):
+        raise OSError("NNTP has no version history")
+
+    def disk_usage(self, path: str) -> tuple[int, int, int]:
+        return (0, 0, 0)
+
+    def checksum(self, path: str, algorithm: str = "sha256") -> str:
+        return ""
+
+    # ------------------------------------------------------------------
+    # NNTP-specific verbs (API_GAPS round 2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _no_crlf(label: str, value: str) -> None:
+        """F33: refuse CR/LF in any caller-supplied string that lands
+        in an NNTP command line. The wire layer in ``nntp_lib._send_line``
+        also refuses these, but checking at the public API gives a
+        clearer error and rejects BEFORE any session state changes
+        (e.g. before a partial GROUP select)."""
+        if "\r" in value or "\n" in value:
+            raise ValueError(
+                f"NNTP {label} must not contain CR/LF (would smuggle a second NNTP command). F33."
+            )
+
+    @serialized
+    def groups_list(self, prefix: str = "") -> list[dict]:
+        """``LIST ACTIVE [<prefix>*]`` — return every (or every-prefix-
+        matching) newsgroup the server publishes.
+
+        ``prefix=""`` enumerates the full list — careful, public Usenet
+        servers carry 100k+ groups and this materialises the whole
+        thing. Pass a prefix like ``"de.comp."`` to scope.
+
+        Returns one dict per group ``{name, low, high, status, count}``
+        where ``status`` is ``y``/``n``/``m`` and ``count`` is the
+        server-estimated article count (``high-low+1``).
+        """
+        self._no_crlf("group prefix", prefix)
+        out: list[dict] = []
+        for name, high, low, status in self._client.list_groups(prefix):
+            out.append(
+                {
+                    "name": name,
+                    "low": low,
+                    "high": high,
+                    "status": status,
+                    "count": max(0, high - low + 1),
+                }
+            )
+        return out
+
+    @serialized
+    def xover(
+        self,
+        group: str,
+        low: int | None = None,
+        high: int | None = None,
+        *,
+        max_records: int = 5000,
+    ) -> list[dict]:
+        """``OVER`` (RFC 3977 §8.3) — overview header records for
+        ``low..high`` in ``group``. Falls back to legacy ``XOVER``
+        automatically (handled by nntp_lib).
+
+        ``low`` / ``high`` default to the group's current low/high
+        watermarks (returns every article). Capped at ``max_records``
+        — a packed group can return tens of thousands.
+
+        Returns dicts with ``msgno / subject / from / date /
+        message_id / references / bytes / lines``.
+        """
+        self._no_crlf("group", group)
+        count, lo, hi = self._client.select_group(group)
+        if low is None:
+            low = lo
+        if high is None:
+            high = hi
+        out: list[dict] = []
+        for rec in self._client.over(low, high):
+            out.append(rec)
+            if len(out) >= max_records:
+                break
+        return out
+
+    @serialized
+    def article_headers(self, group: str, msg_no: int) -> dict[str, str]:
+        """``HEAD`` — return only the headers of one article, parsed
+        into a dict ``{header_name_lower: value}``. Multi-line headers
+        are unfolded; repeated headers (``Received:``) keep only the
+        last value (use ``raw_head`` for the unparsed bytes)."""
+        self._no_crlf("group", group)
+        # Switch group + fetch HEAD via the wire-lib.
+        self._client.select_group(group)
+        raw = self._client.head(int(msg_no))
+        return _parse_headers(raw)
+
+    @serialized
+    def raw_head(self, group: str, msg_no: int) -> bytes:
+        """Bytes-level escape hatch — the unparsed ``HEAD`` response
+        for callers that need every duplicate header line."""
+        self._no_crlf("group", group)
+        self._client.select_group(group)
+        return self._client.head(int(msg_no))
+
+
+def _parse_headers(raw: bytes) -> dict[str, str]:
+    """Parse RFC 5322 headers out of ``raw`` (bytes ending at the
+    blank-line separator). Multi-line headers are unfolded; the
+    last value wins on a duplicate name (matches Python's
+    ``email.message.Message.__getitem__`` behaviour)."""
+    text = raw.decode("utf-8", errors="replace")
+    out: dict[str, str] = {}
+    cur_name: str | None = None
+    cur_val: list[str] = []
+    for line in text.split("\n"):
+        line = line.rstrip("\r")
+        if not line:
+            break
+        if line[:1] in (" ", "\t") and cur_name is not None:
+            cur_val.append(line.lstrip())
+            continue
+        if cur_name is not None:
+            out[cur_name] = " ".join(cur_val).strip()
+        if ":" in line:
+            name, _, val = line.partition(":")
+            cur_name = name.strip().lower()
+            cur_val = [val.lstrip()]
+        else:
+            cur_name = None
+            cur_val = []
+    if cur_name is not None:
+        out[cur_name] = " ".join(cur_val).strip()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Writer: buffer + POST on close
+# ---------------------------------------------------------------------------
+
+
+class _NntpPoster:
+    def __init__(self, client, group: str, lock=None):
+        self._client = client
+        self._group = group
+        # The session's I/O lock: POST is a command exchange like any other.
+        self._lock = lock if lock is not None else contextlib.nullcontext()
+        self._buf = io.BytesIO()
+        self._closed = False
+
+    def write(self, data: bytes) -> int:
+        if self._closed:
+            raise OSError("writer closed")
+        return self._buf.write(data)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            article = self._buf.getvalue()
+            # Auto-add Newsgroups header if missing — most submission flows
+            # forget it.
+            if b"\nNewsgroups:" not in article and not article.startswith(b"Newsgroups:"):
+                article = f"Newsgroups: {self._group}\r\n".encode("utf-8") + article
+            else:
+                # Header already present — warn loudly when it disagrees with
+                # the path target so a typo doesn't quietly post into the
+                # wrong group.
+                self._warn_on_group_disagreement(article)
+            with self._lock:
+                self._client.post(article)
+        finally:
+            self._buf.close()
+
+    def _warn_on_group_disagreement(self, article: bytes) -> None:
+        """Emit a WARNING when the in-body ``Newsgroups:`` header lists
+        groups that don't include the path-target group. The post
+        proceeds either way (the header is the wire authority), but
+        the operator gets a heads-up."""
+        # Parse only the headers section. Body comes after the first
+        # blank line (CRLF CRLF or LF LF).
+        head_end = article.find(b"\r\n\r\n")
+        if head_end == -1:
+            head_end = article.find(b"\n\n")
+        head_block = article[:head_end] if head_end != -1 else article
+        # PATTERN-001: RFC 3977 article headers are CRLF-framed; never
+        # use bytes.splitlines() which splits on \v/\f/\x1c-\x1e and bare
+        # \r/\n. A server / posting client carrying \v in a header value
+        # could forge a fake `newsgroups:` continuation line.
+        for raw_line in head_block.split(b"\r\n"):
+            if raw_line[:11].lower() == b"newsgroups:":
+                value = raw_line[11:].decode("utf-8", "replace").strip()
+                groups = {g.strip() for g in value.split(",") if g.strip()}
+                if self._group not in groups:
+                    log.warning(
+                        "NNTP POST: path target %r is not in the article's "
+                        "Newsgroups header (%r) — posting will go to the "
+                        "header's groups, not the path",
+                        self._group,
+                        value,
+                    )
+                return
+
+    def discard(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._buf.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.discard()
+        else:
+            self.close()

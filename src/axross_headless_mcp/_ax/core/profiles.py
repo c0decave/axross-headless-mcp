@@ -1,0 +1,1202 @@
+"""Connection profile management — JSON storage under XDG config."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from core.credentials import (
+    delete_password,
+    delete_proxy_password,
+    delete_secret,
+    get_password,
+    get_proxy_password,
+    get_secret,
+    profile_name_problem,
+    proxy_entry,
+    secret_entry,
+    store_password,
+    store_proxy_password,
+    store_secret,
+)
+from core.secure_storage import locked_store_update
+
+log = logging.getLogger(__name__)
+
+MAX_PROFILES_FILE_BYTES = 4 * 1024 * 1024
+
+
+import re as _re  # noqa: E402 — local alias kept near regex constants below
+
+from core.proxy import is_valid_proxy_type  # noqa: E402
+
+# Allowlisted character set for USB serials. Real-world Android
+# vendors use either uppercase alphanumerics (e.g. ``ABCD1234EF``)
+# or 16-byte hex strings. Underscore + dash are tolerated because
+# some emulators use them. ANYTHING outside the set — including
+# CR/LF, ANSI escapes, null bytes — is stripped at load time.
+_USB_SERIAL_SAFE_RE = _re.compile(r"[^A-Za-z0-9_\-]")
+_CONTROL_CHARS_RE = _re.compile(r"[\x00-\x1f\x7f]")
+
+# MTP device_id allowlist (mirrors the stricter one in
+# core.mtp_client — we sanitise at load time as defence-in-depth).
+_MTP_DEVICE_ID_SAFE_RE = _re.compile(r"[^0-9:.\-]")
+
+# Known MTP mounter binaries; anything else collapses to "" so the
+# backend's auto-pick kicks in.
+_MTP_KNOWN_MOUNTERS = frozenset({"jmtpfs", "simple-mtpfs", "go-mtpfs"})
+
+
+def _sanitize_usb_serial(value: str) -> str:
+    return _USB_SERIAL_SAFE_RE.sub("", value or "")
+
+
+def _strip_control_chars(value: str) -> str:
+    return _CONTROL_CHARS_RE.sub("", value or "")
+
+
+def _sanitize_mtp_device_id(value: str) -> str:
+    cleaned = _MTP_DEVICE_ID_SAFE_RE.sub("", value or "")
+    # Never let the sanitiser produce an empty string — the backend
+    # needs SOMETHING to pass to jmtpfs. "1" is the safest default
+    # (first device on every supported mounter).
+    return cleaned or "1"
+
+
+def _sanitize_mtp_mounter(value: str) -> str:
+    return value if value in _MTP_KNOWN_MOUNTERS else ""
+
+
+CONFIG_DIR = Path.home() / ".config" / "axross"
+PROFILES_FILE = CONFIG_DIR / "profiles.json"
+
+
+VALID_PROTOCOLS = {
+    "sftp",
+    "scp",
+    "ftp",
+    "ftps",
+    "smb",
+    "webdav",
+    "s3",
+    "rsync",
+    "nfs",
+    "azure_blob",
+    "azure_files",
+    "onedrive",
+    "sharepoint",
+    "gdrive",
+    "dropbox",
+    "iscsi",
+    "imap",
+    "pop3",
+    "nntp",
+    "tftp",
+    "ramfs",
+    "svn",
+    "telnet",
+    "cisco-telnet",
+    "gopher",
+    "pjl",
+    "winrm",
+    "dfsn",
+    "adb",
+    "mtp",
+    # Databases, version control and directories as file systems, and
+    # Exchange: in the protocol list of Connect to Server, so a saved
+    # profile of theirs must load as itself (it came back as SFTP).
+    "sqlite",
+    "postgres",
+    "redis",
+    "mongodb",
+    "git",
+    "ldap",
+    "slp",
+    "exchange",
+    "rsh",
+    "wmi",
+}
+
+#: Protocols with the one plain secret field - password, S3 secret key or
+#: Azure account key. The connection dialog shows the field for exactly
+#: these, and Quick Connect asks for (or reads the saved) secret of exactly
+#: these; two hand-kept lists had drifted apart before.
+SIMPLE_PASSWORD_PROTOCOLS = frozenset(
+    {
+        "ftp",
+        "ftps",
+        "smb",
+        "webdav",
+        "s3",
+        "dfsn",
+        "rsync",
+        "azure_blob",
+        "azure_files",
+        "iscsi",
+        "imap",
+        "pop3",
+        "nntp",
+        "telnet",
+        "cisco-telnet",
+        "winrm",
+        "svn",
+        "postgres",
+        "redis",
+        "mongodb",
+        "ldap",
+        "exchange",
+        "wmi",
+    }
+)
+
+
+
+def password_needed(profile) -> bool:
+    """Whether connecting *profile* takes a password (or secret key).
+
+    One decision for Quick Connect (asks for it) and the MCP server (needs
+    it from the keyring, it never asks). No password where nothing would
+    use one: SSH key or agent auth, anonymous S3 and NNTP (no user), rsync
+    over SSH, Azure with a connection string or SAS token of its own.
+    """
+    proto = getattr(profile, "protocol", "")
+    if proto in ("sftp", "scp"):
+        return getattr(profile, "auth_type", "password") == "password"
+    if proto not in SIMPLE_PASSWORD_PROTOCOLS:
+        return False
+    if proto in ("s3", "nntp"):
+        return bool(getattr(profile, "username", ""))
+    if proto == "rsync":
+        return not getattr(profile, "rsync_ssh", False)
+    if proto == "iscsi":
+        # CHAP needs a user name: without one no secret is sent.
+        return bool(getattr(profile, "username", ""))
+    if proto in ("azure_blob", "azure_files"):
+        return not (
+            getattr(profile, "azure_connection_string", "")
+            or getattr(profile, "azure_sas_token", "")
+        )
+    if proto in ("svn", "postgres", "mongodb", "ldap"):
+        # An anonymous checkout, a trusted local database or an anonymous
+        # LDAP bind: no login name, no password.
+        return bool(getattr(profile, "username", ""))
+    if proto == "redis":
+        # Redis has no user name to tell; a server with AUTH has the
+        # password kept in the keyring (or typed into the dialog).
+        return bool(getattr(profile, "store_password", False))
+    return True
+
+
+def default_port(protocol: str, *, tls: bool = True) -> int:
+    """The port a profile of *protocol* uses when none is given: the
+    registry's, or the plain variant's for IMAP, POP3, NNTP and LDAP
+    without TLS. 22 (SFTP) when the protocol has no port of its own."""
+    plain = {"imap": 143, "pop3": 110, "nntp": 119}
+    if not tls and protocol in plain:
+        return plain[protocol]
+    if tls and protocol == "ldap":
+        return 636
+    try:
+        from core.backend_registry import get as get_backend
+
+        info = get_backend(protocol)
+    except Exception:  # noqa: BLE001 - a profile loads without the registry too
+        info = None
+    port = getattr(info, "default_port", 0) or 0
+    return port if 1 <= port <= 65535 else 22
+
+
+SENSITIVE_PROFILE_FIELDS = (
+    "azure_connection_string",
+    "azure_sas_token",
+    "gdrive_client_secret",
+    "dropbox_app_secret",
+)
+
+
+#: The largest SFTP time-out a profile may set (seconds).
+SFTP_TIMEOUT_MAX = 3600
+
+
+
+@dataclass
+class ConnectionProfile:
+    """A saved connection profile (multi-protocol)."""
+
+    name: str = ""
+    protocol: str = "sftp"  # "sftp", "ftp", "ftps", "smb", "webdav", "s3"
+    host: str = ""
+    port: int = 22
+    username: str = ""
+    auth_type: str = "password"  # "password", "key", "agent"
+    key_file: str = ""
+    store_password: bool = False
+
+    # Proxy settings
+    # custom: the fields below (proxy_type "none" = direct); default: the
+    # application default (Tools > Network & Proxy); none: always direct.
+    proxy_mode: str = "custom"
+    # "none", "socks4", "socks5", "http", "https", optionally "+ntlm" etc.
+    proxy_type: str = "none"
+    proxy_host: str = ""
+    proxy_port: int = 0
+    proxy_username: str = ""
+    store_proxy_password: bool = False
+
+    # SSH ProxyCommand (alternative to SOCKS/HTTP proxy)
+    proxy_command: str = ""  # e.g. "ssh -W %h:%p jumphost"
+    # False for a ProxyCommand that came in through a profile import: it
+    # is a shell command from someone else and runs only after the user
+    # saw and confirmed it (ConnectionManager refuses it until then).
+    proxy_command_confirmed: bool = True
+    # Set only on the transient copy ConnectionManager resolves for a
+    # connection: the password of the proxy that was chosen for it.
+    _proxy_password_override: str | None = field(default=None, repr=False, compare=False)
+
+    # Address family preference
+    address_family: str = "auto"  # "auto", "ipv4", "ipv6"
+
+    # --- Protocol-specific fields ---
+    # FTP/FTPS
+    ftp_passive: bool = True
+    # FTPS-only: whether to verify the server's TLS certificate chain
+    # and hostname. Default is True (secure); users connecting to
+    # internal / lab servers with self-signed certs can flip this to
+    # False per-profile.
+    ftps_verify_tls: bool = True
+
+    # SMB
+    smb_share: str = ""
+
+    # WebDAV
+    webdav_url: str = ""  # Full URL (e.g. https://cloud.example.com/remote.php/dav)
+
+    # S3-compatible
+    s3_bucket: str = ""
+    s3_region: str = ""
+    s3_endpoint: str = ""  # Custom endpoint for MinIO, Ceph, Wasabi, R2
+
+    # Rsync
+    rsync_module: str = ""  # rsyncd module name
+    rsync_ssh: bool = False  # True = rsync over SSH, False = native rsync protocol
+    rsync_ssh_key: str = ""
+
+    # NFS
+    nfs_export: str = ""  # e.g. /srv/nfs/share
+    nfs_version: int = 3  # NFS version (3 or 4)
+    nfs_minor: int = 0  # with version 4: 0 (NFSv4.0) or 1 (NFSv4.1, sessions)
+    # What the client sends about itself (AUTH_SYS). Any of them set: axross
+    # speaks NFSv3 itself (core.nfs_user_client) instead of mounting through
+    # the kernel, which always sends the host's name and the process's IDs.
+    # Unset (-1 / ""): the host's name, this process's UID and GID, no
+    # extra GIDs.
+    nfs_machine_name: str = ""
+    nfs_uid: int = -1
+    nfs_gid: int = -1
+    nfs_gids: str = ""  # "100, 27"
+    nfs_privileged_port: bool = False  # a source port < 1024 (root only)
+    nfs_client_id: str = ""  # NFSv4: the client id string (SETCLIENTID); "" = axross:<machine name>
+
+    # Azure Blob
+    azure_container: str = ""
+    azure_connection_string: str = ""
+    azure_account_name: str = ""
+    azure_sas_token: str = ""
+
+    # Azure Files
+    azure_share: str = ""
+
+    # OneDrive / SharePoint
+    onedrive_client_id: str = ""
+    onedrive_tenant_id: str = "common"
+    sharepoint_site_url: str = ""
+
+    # Google Drive
+    gdrive_client_id: str = ""
+    gdrive_client_secret: str = ""
+
+    # Dropbox
+    dropbox_app_key: str = ""
+    dropbox_app_secret: str = ""
+
+    # iSCSI
+    iscsi_target_iqn: str = ""
+    iscsi_mount_point: str = ""
+    # What the initiator sends about itself - empty = the system's
+    # /etc/iscsi/initiatorname.iscsi and any interface.
+    iscsi_initiator_name: str = ""
+    iscsi_initiator_interface: str = ""
+
+    # IMAP
+    imap_ssl: bool = True
+
+    # POP3 (read-only)
+    pop3_ssl: bool = True
+
+    # NNTP: implicit TLS (NNTPS, 563) or plain (119)
+    nntp_ssl: bool = True
+
+    # TFTP (UDP — no proxy support; opt-in file-list since TFTP
+    # has no native LIST). ``tftp_filelist`` is a comma-separated
+    # list of filenames in profiles.json, deserialised to a Python
+    # list. ``tftp_max_size_bytes`` caps each transfer.
+    tftp_filelist: str = ""
+    tftp_filelist_enabled: bool = False
+    tftp_max_size_bytes: int = 16 * 1024 * 1024
+
+    # Databases as file systems. SQLite keeps its file in ``host``, as
+    # Git keeps its repository (URL or local path) and SVN its URL there.
+    # ``db_name``: the PostgreSQL / MongoDB database, the Redis database
+    # number. ``db_tls``: Redis over TLS (rediss://).
+    db_name: str = ""
+    db_tls: bool = False
+
+    # LDAP over TLS (LDAPS, port 636)
+    ldap_ssl: bool = False
+
+    # SLP: the scope the directory is asked in
+    slp_scope: str = "DEFAULT"
+
+    # Exchange (EWS): the mailbox; empty = the username. ``host`` is the
+    # EWS server; empty = autodiscover.
+    exchange_email: str = ""
+
+    # ADB (Android Debug Bridge)
+    adb_mode: str = "tcp"  # "tcp" or "usb"
+    adb_usb_serial: str = ""  # USB serial filter (optional)
+
+    # MTP (Android via FUSE mount)
+    mtp_device_id: str = "1"  # jmtpfs 1-based index / simple-mtpfs id
+    mtp_mounter: str = ""  # "" = auto-pick first available
+
+    # --- OpSec / client-identity overrides (see docs/OPSEC.md) ---
+    #
+    # SSH keepalive in seconds. 0 = disabled (default — blends with
+    # OpenSSH's own default). Values > 0 enable per-session keepalive
+    # at that interval. Fingerprinting observers can spot a fixed
+    # 30-s cadence, so this is off unless the user opts in for a
+    # specific NAT-bound profile.
+    ssh_keepalive_interval: int = 0
+
+    # SFTP / SSH: seconds of silence after which a waiting request (or a
+    # server-side command such as the checksum after an upload) asks the
+    # connection whether it is alive; it fails only when the connection
+    # does not answer. 0 = the default (core.ssh_client.SFTP_IO_TIMEOUT,
+    # 60 s). Larger for a server that is slow to start answering (tape,
+    # HSM), smaller to notice a lost network sooner.
+    sftp_timeout: int = 0
+
+    # SMB NTLM WorkstationName override. Empty string → fall back to
+    # the module-level default (``core.client_identity.SMB_CLIENT_NAME``,
+    # currently "WORKSTATION"). Set per-profile to mimic a specific
+    # Windows machine name your environment expects, or leave alone
+    # for the uniform-across-installs default.
+    smb_client_name: str = ""
+
+    # Telnet NAWS geometry override. 0 → module default (80×24). Set
+    # per-profile if the server expects a specific geometry.
+    telnet_naws_width: int = 0
+    telnet_naws_height: int = 0
+
+    # rsync: default is to strip local uid/gid/perms/mtime on upload
+    # so the receiver can't correlate the file back to the client's
+    # UID scheme. Set True on a per-profile basis when doing a true
+    # archive/backup flow where metadata preservation matters.
+    rsync_preserve_metadata: bool = False
+
+    # WinRM: HTTPS (the 5986 listener) or HTTP (5985, Windows' default
+    # listener; NTLM still encrypts the messages), and whether the HTTPS
+    # certificate is checked (quickconfig's listener is self-signed).
+    winrm_https: bool = True
+    winrm_verify_tls: bool = True
+
+    # Shell-history suppression: when True (the safe default), the
+    # SSH/Telnet terminal flow silently disables HISTFILE / HISTSIZE /
+    # zsh-savehist on the remote shell so red-team / forensic engagements
+    # don't leak through ``~/.bash_history``. Users running their own
+    # boxes can flip this off per-profile to keep normal history.
+    suppress_shell_history: bool = True
+
+    # Terminal theme name (matches keys in ``ui.terminal_widget.TERMINAL_THEMES``).
+    # Empty string keeps the dock default. Valid: Dark / Solarized-Dark
+    # / Solarized-Light / Hacker / Amber / Light.
+    terminal_theme: str = ""
+
+    # Production tarpit — see ``core/safety_tarpit.py``. When True,
+    # the first destructive op per pane-session against this profile
+    # gets a 3-second countdown ("hit Esc to bail") to defeat
+    # autopilot-typo damage. Default False; only turn on for hosts
+    # where a stray rm/chmod/move actually costs something. Honoured
+    # by ``axross.remove`` / ``move`` / ``trash`` / ``write_*`` and the
+    # GUI right-click destructive entries.
+    production: bool = False
+
+    def get_password(self) -> str | None:
+        """Retrieve password from keyring."""
+        if self.store_password:
+            return get_password(self.name)
+        return None
+
+    def set_password(self, password: str) -> None:
+        """Store password in keyring."""
+        if self.store_password:
+            store_password(self.name, password)
+
+    def get_proxy_password(self) -> str | None:
+        """Retrieve proxy password from keyring."""
+        if self._proxy_password_override is not None:
+            return self._proxy_password_override
+        if self.store_proxy_password:
+            return get_proxy_password(self.name)
+        return None
+
+    def set_proxy_password(self, password: str) -> None:
+        """Store proxy password in keyring."""
+        if self.store_proxy_password:
+            store_proxy_password(self.name, password)
+
+    def nfs_sender_chosen(self) -> bool:
+        """True when the profile says what the NFS client sends about
+        itself - then axross's own NFSv3 client is used."""
+        return bool(self.nfs_machine_name or self.nfs_uid >= 0 or self.nfs_gid >= 0
+                    or self.nfs_gids.strip() or self.nfs_client_id.strip())
+
+    def to_dict(self) -> dict:
+        """Serialize to dict — only includes relevant fields per protocol."""
+        d: dict = {
+            "name": self.name,
+            "protocol": self.protocol,
+            "host": self.host,
+            "port": self.port,
+            "username": self.username,
+            "auth_type": self.auth_type,
+            "store_password": self.store_password,
+        }
+
+        # Key-based auth
+        if self.key_file:
+            d["key_file"] = self.key_file
+
+        # Proxy (only if configured)
+        if self.proxy_mode != "custom":
+            d["proxy_mode"] = self.proxy_mode
+        if self.proxy_type != "none":
+            d["proxy_type"] = self.proxy_type
+            d["proxy_host"] = self.proxy_host
+            d["proxy_port"] = self.proxy_port
+            if self.proxy_username:
+                d["proxy_username"] = self.proxy_username
+            d["store_proxy_password"] = self.store_proxy_password
+
+        # SSH ProxyCommand (only if set)
+        if self.proxy_command:
+            d["proxy_command"] = self.proxy_command
+            if not self.proxy_command_confirmed:
+                d["proxy_command_confirmed"] = False
+
+        # Address family (only if not default)
+        if self.address_family != "auto":
+            d["address_family"] = self.address_family
+
+        # Protocol-specific fields
+        proto = self.protocol
+
+        if proto in ("ftp", "ftps"):
+            d["ftp_passive"] = self.ftp_passive
+            if proto == "ftps" and not self.ftps_verify_tls:
+                d["ftps_verify_tls"] = False
+
+        elif proto in ("smb", "dfsn"):
+            d["smb_share"] = self.smb_share
+
+        elif proto == "webdav":
+            d["webdav_url"] = self.webdav_url
+
+        elif proto == "s3":
+            d["s3_bucket"] = self.s3_bucket
+            if self.s3_region:
+                d["s3_region"] = self.s3_region
+            if self.s3_endpoint:
+                d["s3_endpoint"] = self.s3_endpoint
+
+        elif proto == "rsync":
+            d["rsync_module"] = self.rsync_module
+            d["rsync_ssh"] = self.rsync_ssh
+            if self.rsync_ssh_key:
+                d["rsync_ssh_key"] = self.rsync_ssh_key
+
+        elif proto == "nfs":
+            d["nfs_export"] = self.nfs_export
+            for key in ("nfs_machine_name", "nfs_gids", "nfs_client_id"):
+                if getattr(self, key):
+                    d[key] = getattr(self, key)
+            for key in ("nfs_uid", "nfs_gid"):
+                if getattr(self, key) >= 0:
+                    d[key] = getattr(self, key)
+            if self.nfs_privileged_port:
+                d["nfs_privileged_port"] = True
+            d["nfs_version"] = self.nfs_version
+            if self.nfs_version == 4 and self.nfs_minor:
+                d["nfs_minor"] = self.nfs_minor
+
+        elif proto == "azure_blob":
+            d["azure_container"] = self.azure_container
+            if self.azure_account_name:
+                d["azure_account_name"] = self.azure_account_name
+            # Secrets not persisted in JSON
+
+        elif proto == "azure_files":
+            d["azure_share"] = self.azure_share
+            if self.azure_account_name:
+                d["azure_account_name"] = self.azure_account_name
+
+        elif proto in ("onedrive", "sharepoint"):
+            if self.onedrive_client_id:
+                d["onedrive_client_id"] = self.onedrive_client_id
+            if self.onedrive_tenant_id != "common":
+                d["onedrive_tenant_id"] = self.onedrive_tenant_id
+            if proto == "sharepoint" and self.sharepoint_site_url:
+                d["sharepoint_site_url"] = self.sharepoint_site_url
+
+        elif proto == "gdrive":
+            if self.gdrive_client_id:
+                d["gdrive_client_id"] = self.gdrive_client_id
+            # client_secret not persisted
+
+        elif proto == "dropbox":
+            if self.dropbox_app_key:
+                d["dropbox_app_key"] = self.dropbox_app_key
+            # app_secret not persisted
+
+        elif proto == "iscsi":
+            d["iscsi_target_iqn"] = self.iscsi_target_iqn
+            if self.iscsi_mount_point:
+                d["iscsi_mount_point"] = self.iscsi_mount_point
+            if self.iscsi_initiator_name:
+                d["iscsi_initiator_name"] = self.iscsi_initiator_name
+            if self.iscsi_initiator_interface:
+                d["iscsi_initiator_interface"] = self.iscsi_initiator_interface
+
+        elif proto == "imap":
+            d["imap_ssl"] = self.imap_ssl
+
+        elif proto == "pop3":
+            d["pop3_ssl"] = self.pop3_ssl
+
+        elif proto == "nntp":
+            d["nntp_ssl"] = self.nntp_ssl
+
+        elif proto in ("postgres", "mongodb", "redis"):
+            if self.db_name:
+                d["db_name"] = self.db_name
+            if proto == "redis" and self.db_tls:
+                d["db_tls"] = True
+
+        elif proto == "ldap":
+            d["ldap_ssl"] = self.ldap_ssl
+
+        elif proto == "slp":
+            if self.slp_scope != "DEFAULT":
+                d["slp_scope"] = self.slp_scope
+
+        elif proto == "exchange":
+            if self.exchange_email:
+                d["exchange_email"] = self.exchange_email
+
+        elif proto == "tftp":
+            if self.tftp_filelist:
+                d["tftp_filelist"] = self.tftp_filelist
+            if self.tftp_filelist_enabled:
+                d["tftp_filelist_enabled"] = True
+            if self.tftp_max_size_bytes != 16 * 1024 * 1024:
+                d["tftp_max_size_bytes"] = self.tftp_max_size_bytes
+
+        elif proto == "winrm":
+            d["winrm_https"] = self.winrm_https
+            if not self.winrm_verify_tls:
+                d["winrm_verify_tls"] = False
+
+        elif proto == "adb":
+            d["adb_mode"] = self.adb_mode
+            if self.adb_usb_serial:
+                d["adb_usb_serial"] = self.adb_usb_serial
+
+        elif proto == "mtp":
+            if self.mtp_device_id:
+                d["mtp_device_id"] = self.mtp_device_id
+            if self.mtp_mounter:
+                d["mtp_mounter"] = self.mtp_mounter
+
+        # OpSec overrides — only persist when the user changed them
+        # away from the safe default so the JSON stays readable.
+        if self.ssh_keepalive_interval > 0:
+            d["ssh_keepalive_interval"] = self.ssh_keepalive_interval
+        if self.sftp_timeout > 0:
+            d["sftp_timeout"] = self.sftp_timeout
+        if self.smb_client_name:
+            d["smb_client_name"] = self.smb_client_name
+        if self.telnet_naws_width > 0:
+            d["telnet_naws_width"] = self.telnet_naws_width
+        if self.telnet_naws_height > 0:
+            d["telnet_naws_height"] = self.telnet_naws_height
+        if self.rsync_preserve_metadata:
+            d["rsync_preserve_metadata"] = True
+        # Persist the suppression flag whenever the user OPTED OUT of
+        # the safe default — keeps profile JSON minimal in the common
+        # case (default True is implicit).
+        if not self.suppress_shell_history:
+            d["suppress_shell_history"] = False
+        if self.terminal_theme:
+            d["terminal_theme"] = self.terminal_theme
+        if self.production:
+            d["production"] = True
+
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ConnectionProfile:
+        if not isinstance(d, dict):
+            raise TypeError("Profile data must be a JSON object")
+
+        def _string(key: str, default: str = "") -> str:
+            value = d.get(key, default)
+            if not isinstance(value, str):
+                return default
+            return _strip_control_chars(value)
+
+        def _boolean(key: str, default: bool = False) -> bool:
+            value = d.get(key, default)
+            return value if isinstance(value, bool) else default
+
+        def _int_in_range(key: str, default: int, minimum: int, maximum: int) -> int:
+            value = d.get(key, default)
+            if not isinstance(value, int):
+                return default
+            if minimum <= value <= maximum:
+                return value
+            return default
+
+        auth_type = _string("auth_type", "password")
+        if auth_type not in {"password", "key", "agent"}:
+            auth_type = "password"
+
+        proxy_type = _string("proxy_type", "none").lower()
+        if not is_valid_proxy_type(proxy_type):
+            proxy_type = "none"
+        proxy_mode = _string("proxy_mode", "custom")
+        if proxy_mode not in {"custom", "default", "none"}:
+            proxy_mode = "custom"
+
+        address_family = _string("address_family", "auto")
+        if address_family not in {"auto", "ipv4", "ipv6"}:
+            address_family = "auto"
+
+        protocol = _string("protocol", "sftp")
+        if protocol not in VALID_PROTOCOLS:
+            protocol = "sftp"
+
+        return cls(
+            name=_string("name"),
+            protocol=protocol,
+            host=_string("host"),
+            # An imported profile without a port: its protocol's (22 is SFTP's).
+            port=_int_in_range(
+                "port",
+                default_port(protocol, tls=_boolean(f"{protocol}_ssl", protocol != "ldap")),
+                1,
+                65535,
+            ),
+            username=_string("username"),
+            auth_type=auth_type,
+            key_file=_string("key_file"),
+            store_password=_boolean("store_password"),
+            proxy_mode=proxy_mode,
+            proxy_type=proxy_type,
+            proxy_host=_string("proxy_host"),
+            proxy_port=_int_in_range("proxy_port", 0, 0, 65535),
+            proxy_username=_string("proxy_username"),
+            store_proxy_password=_boolean("store_proxy_password"),
+            proxy_command=_string("proxy_command"),
+            proxy_command_confirmed=_boolean("proxy_command_confirmed", True),
+            address_family=address_family,
+            # Protocol-specific
+            ftp_passive=_boolean("ftp_passive", True),
+            ftps_verify_tls=_boolean("ftps_verify_tls", True),
+            smb_share=_string("smb_share"),
+            webdav_url=_string("webdav_url"),
+            s3_bucket=_string("s3_bucket"),
+            s3_region=_string("s3_region"),
+            s3_endpoint=_string("s3_endpoint"),
+            # Rsync
+            rsync_module=_string("rsync_module"),
+            rsync_ssh=_boolean("rsync_ssh"),
+            rsync_ssh_key=_string("rsync_ssh_key"),
+            # NFS
+            nfs_export=_string("nfs_export"),
+            nfs_version=_int_in_range("nfs_version", 3, 2, 4),
+            nfs_minor=_int_in_range("nfs_minor", 0, 0, 1),
+            nfs_machine_name=_string("nfs_machine_name"),
+            nfs_uid=_int_in_range("nfs_uid", -1, -1, 0xFFFFFFFF),
+            nfs_gid=_int_in_range("nfs_gid", -1, -1, 0xFFFFFFFF),
+            nfs_gids=_string("nfs_gids"),
+            nfs_privileged_port=_boolean("nfs_privileged_port", False),
+            nfs_client_id=_string("nfs_client_id"),
+            # Azure
+            azure_container=_string("azure_container"),
+            azure_connection_string=_string("azure_connection_string"),
+            azure_account_name=_string("azure_account_name"),
+            azure_sas_token=_string("azure_sas_token"),
+            azure_share=_string("azure_share"),
+            # OneDrive / SharePoint
+            onedrive_client_id=_string("onedrive_client_id"),
+            onedrive_tenant_id=_string("onedrive_tenant_id", "common"),
+            sharepoint_site_url=_string("sharepoint_site_url"),
+            # Google Drive
+            gdrive_client_id=_string("gdrive_client_id"),
+            gdrive_client_secret=_string("gdrive_client_secret"),
+            # Dropbox
+            dropbox_app_key=_string("dropbox_app_key"),
+            dropbox_app_secret=_string("dropbox_app_secret"),
+            # iSCSI
+            iscsi_target_iqn=_string("iscsi_target_iqn"),
+            iscsi_mount_point=_string("iscsi_mount_point"),
+            iscsi_initiator_name=_string("iscsi_initiator_name"),
+            iscsi_initiator_interface=_string("iscsi_initiator_interface"),
+            # IMAP
+            imap_ssl=_boolean("imap_ssl", True),
+            # POP3 (read-only)
+            pop3_ssl=_boolean("pop3_ssl", True),
+            # NNTP
+            nntp_ssl=_boolean("nntp_ssl", True),
+            # Databases, LDAP, SLP, Exchange
+            db_name=_string("db_name"),
+            db_tls=_boolean("db_tls"),
+            ldap_ssl=_boolean("ldap_ssl"),
+            slp_scope=_string("slp_scope", "DEFAULT") or "DEFAULT",
+            exchange_email=_string("exchange_email"),
+            # TFTP
+            tftp_filelist=_string("tftp_filelist"),
+            tftp_filelist_enabled=_boolean("tftp_filelist_enabled"),
+            tftp_max_size_bytes=_int_in_range(
+                "tftp_max_size_bytes",
+                16 * 1024 * 1024,
+                1024,  # at least 1 KiB
+                512 * 1024 * 1024,  # at most 512 MiB
+            ),
+            # ADB — "tcp" or "usb"; fall back to tcp on junk input.
+            adb_mode=_string("adb_mode", "tcp")
+            if _string(
+                "adb_mode",
+                "tcp",
+            )
+            in ("tcp", "usb")
+            else "tcp",
+            # USB serial is user-visible in logs + UI labels. An
+            # adversary with write access to profiles.json (cloud-
+            # sync compromise, shared laptop) could otherwise plant
+            # CR/LF + ANSI escapes in the serial string to forge
+            # log lines or spoof error dialogs. Filter to the
+            # character set real USB serials actually use.
+            adb_usb_serial=_sanitize_usb_serial(
+                _string("adb_usb_serial"),
+            ),
+            # MTP device_id: the mtp_client wrapper re-validates
+            # against a strict allowlist before use, but we also
+            # canonicalise here so an invalid value doesn't survive
+            # a save/load round-trip.
+            mtp_device_id=_sanitize_mtp_device_id(
+                _string("mtp_device_id", "1"),
+            ),
+            # mtp_mounter is an allowlist of known binary names.
+            mtp_mounter=_sanitize_mtp_mounter(
+                _string("mtp_mounter"),
+            ),
+            # --- OpSec overrides ---
+            ssh_keepalive_interval=_int_in_range(
+                "ssh_keepalive_interval",
+                0,
+                0,
+                3600,
+            ),
+            sftp_timeout=_int_in_range("sftp_timeout", 0, 0, SFTP_TIMEOUT_MAX),
+            smb_client_name=_string("smb_client_name"),
+            telnet_naws_width=_int_in_range(
+                "telnet_naws_width",
+                0,
+                0,
+                500,
+            ),
+            telnet_naws_height=_int_in_range(
+                "telnet_naws_height",
+                0,
+                0,
+                500,
+            ),
+            rsync_preserve_metadata=_boolean("rsync_preserve_metadata"),
+            # Saved before the field existed: port 5985 is the HTTP listener.
+            winrm_https=_boolean("winrm_https", d.get("port") != 5985),
+            winrm_verify_tls=_boolean("winrm_verify_tls", True),
+            # The safe default is True; only honour an explicit False.
+            suppress_shell_history=_boolean(
+                "suppress_shell_history",
+                default=True,
+            ),
+            terminal_theme=_string("terminal_theme"),
+            production=_boolean("production"),
+        )
+
+
+@dataclass(frozen=True)
+class SaveResult:
+    """What :meth:`ProfileManager.save` did. True when the file was written.
+
+    ``error`` is the exception that stopped the write (None for success and
+    for a refusal without one); ``reason`` is the sentence for the user.
+    ``reported`` tells whether the save-failure listeners
+    (core.json_store.on_save_failure: the main window's "Not saved") were
+    already told - a caller that shows its own message passes
+    ``report_failure=False`` instead."""
+
+    ok: bool
+    error: BaseException | None = None
+    reason: str = ""
+    reported: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+#: The result of a save that wrote the file.
+SAVED = SaveResult(True)
+
+
+class ProfileManager:
+    """Manages saved connection profiles."""
+
+    def __init__(self):
+        self._profiles: dict[str, ConnectionProfile] = {}
+        # True while PROFILES_FILE holds data load() could not take in
+        # completely. The next save() would replace that file with only
+        # what is in memory, so it first keeps a copy of the original.
+        self._file_not_fully_loaded = False
+        # The profiles as this manager last read or wrote the file
+        # (``name -> to_dict()``). save() compares the file against it to
+        # tell what another writer (a script, the MCP server) changed.
+        self._base: dict[str, dict] = {}
+        # Profiles whose sensitive fields have not been read from the keyring
+        # yet: get() and all_profiles() read them at a profile's first use
+        # (four keyring lookups per profile - a manager that only lists
+        # names, or looks up one profile, needs none or four, not 4 x all).
+        self._secrets_unread: set[str] = set()
+        self._secrets_lock = threading.Lock()
+        self.load()
+
+    @staticmethod
+    def _read_file() -> tuple[dict[str, ConnectionProfile], bool]:
+        """Parse PROFILES_FILE: the valid profiles (sensitive fields not
+        yet restored) and whether entries were skipped. Raises on a file
+        that cannot be read at all."""
+        if PROFILES_FILE.stat().st_size > MAX_PROFILES_FILE_BYTES:
+            raise OSError(f"profile file exceeds {MAX_PROFILES_FILE_BYTES} bytes")
+        data = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("profile file root must be a JSON object")
+        loaded: dict[str, ConnectionProfile] = {}
+        skipped = False
+        for name, profile in data.items():
+            if not isinstance(name, str) or not isinstance(profile, dict):
+                log.warning("Skipping invalid profile entry %r", name)
+                skipped = True
+                continue
+            try:
+                loaded[name] = ConnectionProfile.from_dict(profile)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Skipping invalid profile %r: %s", name, exc)
+                skipped = True
+        return loaded, skipped
+
+    def load(self) -> None:
+        if not PROFILES_FILE.exists():
+            return
+        try:
+            loaded, skipped = self._read_file()
+            self._base = {name: p.to_dict() for name, p in loaded.items()}
+            self._profiles = dict(loaded)
+            self._secrets_unread = set(loaded)
+            self._file_not_fully_loaded = skipped
+            log.info("Loaded %d profiles from %s", len(self._profiles), PROFILES_FILE)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            self._file_not_fully_loaded = True
+            log.error("Failed to load profiles: %s", e)
+
+    def _merge_from_disk(self) -> None:
+        """Fold in what another writer changed in the file since this
+        manager last read or wrote it: a profile it added is added here,
+        one it deleted is dropped here unless this manager changed it, and
+        one it edited takes the edit unless this manager edited it too. A
+        profile deleted here stays deleted. The other writer already
+        stored or deleted the keyring entries of what it changed."""
+        if not PROFILES_FILE.exists():
+            disk: dict[str, ConnectionProfile] = {}
+        else:
+            try:
+                disk, skipped = self._read_file()
+            except (json.JSONDecodeError, OSError, ValueError) as e:
+                log.error("Failed to re-read profiles: %s", e)
+                self._file_not_fully_loaded = True
+                return
+            if skipped:
+                self._file_not_fully_loaded = True
+        disk_dicts = {name: p.to_dict() for name, p in disk.items()}
+        if disk_dicts == self._base:
+            return
+        for name in list(self._profiles):
+            base = self._base.get(name)
+            if base is None or self._profiles[name].to_dict() != base:
+                continue  # added or changed here: this manager's version wins
+            if name not in disk:
+                del self._profiles[name]
+                self._secrets_unread.discard(name)
+            elif disk_dicts[name] != base:
+                self._profiles[name] = disk[name]
+                self._secrets_unread.add(name)
+        for name, profile in disk.items():
+            if name not in self._base and name not in self._profiles:
+                self._profiles[name] = profile
+                self._secrets_unread.add(name)
+
+    def _preserve_unloaded_file(self) -> bool:
+        """Copy the profile file load() could not take in completely
+        next to it (``profiles.json.corrupt-<time>``, 0600) before save()
+        replaces it. Returns False when the copy could not be made."""
+        if not self._file_not_fully_loaded:
+            return True
+        if not PROFILES_FILE.exists():
+            self._file_not_fully_loaded = False
+            return True
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for attempt in range(100):
+            suffix = f".corrupt-{stamp}" + (f"-{attempt}" if attempt else "")
+            backup = PROFILES_FILE.with_name(PROFILES_FILE.name + suffix)
+            try:
+                fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            except OSError as e:
+                log.error("Could not back up unreadable profiles file: %s", e)
+                return False
+            try:
+                with os.fdopen(fd, "wb") as dst, open(PROFILES_FILE, "rb") as src:
+                    shutil.copyfileobj(src, dst)
+            except OSError as e:
+                log.error("Could not back up unreadable profiles file: %s", e)
+                try:
+                    os.unlink(backup)
+                except OSError:
+                    pass
+                return False
+            log.warning("Kept the unreadable profiles file as %s", backup)
+            self._file_not_fully_loaded = False
+            return True
+        log.error("Could not back up unreadable profiles file: no free backup name")
+        return False
+
+    def save(self, *, report_failure: bool = True) -> SaveResult:
+        """Write the profiles, first merging what another writer changed in
+        the file meanwhile (see :meth:`_merge_from_disk`), under a file lock.
+
+        Returns a :class:`SaveResult` - a failed write used to be visible
+        only to the save-failure listeners, so the connection dialog said
+        "Saved" over a full disk or an unreadable profiles.json. With
+        *report_failure* False the listeners are not told: the caller shows
+        the failure itself."""
+        from core.user_errors import describe
+
+        target_dir = PROFILES_FILE.parent
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(target_dir, 0o700)
+            except OSError:
+                log.debug("Could not set permissions on %s", target_dir, exc_info=True)
+            with locked_store_update(PROFILES_FILE):
+                self._merge_from_disk()
+                result = self._write()
+        except OSError as e:
+            result = SaveResult(False, e, describe(e))
+        if not result.ok and result.error is not None and report_failure \
+                and not result.reported:
+            from core.json_store import report_save_failure
+
+            report_save_failure("connection profiles", result.error)
+            result = SaveResult(False, result.error, result.reason, reported=True)
+        elif not result.ok:
+            log.error("Profiles not saved: %s", result.reason)
+        return result
+
+    def _write(self) -> SaveResult:
+        from core.i18n import tr
+        from core.user_errors import describe
+
+        target_dir = PROFILES_FILE.parent
+        if not self._preserve_unloaded_file():
+            log.error("Not saving profiles: %s would be overwritten", PROFILES_FILE)
+            return SaveResult(False, None, tr(
+                "{path} could not be read, and no copy of it could be kept; it is left "
+                "as it is, so nothing in it is lost. Repair or move the file, then save "
+                "again.").format(path=PROFILES_FILE))
+        data = {name: profile.to_dict() for name, profile in self._profiles.items()}
+        payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        try:
+            # Use mkstemp so the file is 0o600 from birth — NamedTemporary-
+            # File inherits the umask and could leave the JSON world-
+            # readable for the millisecond between write and the follow-
+            # up os.chmod. Profiles contain host + username; not secrets
+            # but not broadcast-worthy either.
+            fd, temp_name = tempfile.mkstemp(
+                dir=target_dir,
+                prefix=".profiles.",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as tmp:
+                    fd = -1  # ownership transferred
+                    tmp.write(payload)
+                os.replace(temp_name, PROFILES_FILE)
+                os.chmod(PROFILES_FILE, 0o600)
+                self._base = data
+                log.info(
+                    "Saved %d profiles to %s",
+                    len(self._profiles),
+                    PROFILES_FILE,
+                )
+            except BaseException:
+                if fd != -1:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            return SaveResult(False, e, describe(e))
+        return SAVED
+
+    def get(self, name: str) -> ConnectionProfile | None:
+        profile = self._profiles.get(name)
+        if profile is not None and name in self._secrets_unread:
+            self._read_secrets(name, profile)
+        return profile
+
+    def peek(self, name: str) -> ConnectionProfile | None:
+        """The profile *name* without reading its secrets from the keyring -
+        for showing it (a bookmark's security badge), never for connecting:
+        its sensitive fields may still be empty."""
+        return self._profiles.get(name)
+
+    def _read_secrets(self, name: str, profile: ConnectionProfile) -> None:
+        """Fill *profile*'s sensitive fields from the keyring, once. The name
+        leaves the unread set only after the fields are filled, so another
+        thread never gets the profile half-filled."""
+        with self._secrets_lock:
+            if self._profiles.get(name) is not profile:
+                # Replaced meanwhile (a save merged another writer's edit):
+                # the caller still holds this object, so it gets its secrets
+                # too; the new one is read at its own first use.
+                self._restore_sensitive_fields(profile)
+            elif name in self._secrets_unread:
+                self._restore_sensitive_fields(profile)
+                self._secrets_unread.discard(name)
+
+    def list_names(self) -> list[str]:
+        return sorted(self._profiles.keys())
+
+    def add(self, profile: ConnectionProfile, *, report_failure: bool = True) -> SaveResult:
+        """Store *profile* (its secrets in the keyring) and save the file.
+        Raises ValueError for a name that cannot be used and RuntimeError
+        when the keyring refused a secret; returns the save's result."""
+        problem = profile_name_problem(profile.name)
+        if problem:
+            from core.i18n import tr
+
+            # Shown to the user as it is (connection dialog, import report).
+            raise ValueError(tr("The profile name {name} cannot be used: it {problem}. "
+                                "Choose another name.").format(name=repr(profile.name),
+                                                               problem=tr(problem)))
+        failed_secret_fields = self._sync_sensitive_fields(
+            profile, self._foreign_entries(profile.name)
+        )
+        if failed_secret_fields:
+            failed = ", ".join(sorted(failed_secret_fields))
+            raise RuntimeError(f"Could not store secret fields in keyring: {failed}")
+        self._profiles[profile.name] = profile
+        self._secrets_unread.discard(profile.name)  # the caller's object is complete
+        if not profile.store_password:
+            delete_password(profile.name)
+        if not profile.store_proxy_password and proxy_entry(profile.name) not in self._profiles:
+            delete_proxy_password(profile.name)
+        return self.save(report_failure=report_failure)
+
+    def remove(self, name: str, *, report_failure: bool = True) -> SaveResult:
+        if name in self._profiles:
+            if profile_name_problem(name):
+                # A profile file from before the name check: this name's
+                # entries are another secret's entries, so none is deleted.
+                log.warning("Profile %r shares keyring entries; leaving them in place", name)
+            else:
+                delete_password(name)
+                if proxy_entry(name) not in self._profiles:
+                    delete_proxy_password(name)
+                self._delete_sensitive_fields(name, self._foreign_entries(name))
+            del self._profiles[name]
+            self._secrets_unread.discard(name)
+            return self.save(report_failure=report_failure)
+        return SAVED
+
+    def _foreign_entries(self, name: str) -> set[str]:
+        """Entries derived from *name* that are another loaded profile's
+        password entry (only possible with a pre-check profile file)."""
+        return {secret_entry(name, field) for field in SENSITIVE_PROFILE_FIELDS} & (
+            set(self._profiles) - {name}
+        )
+
+    def all_profiles(self) -> list[ConnectionProfile]:
+        return [p for p in (self.get(name) for name in list(self._profiles)) if p is not None]
+
+    @staticmethod
+    def _restore_sensitive_fields(profile: ConnectionProfile) -> ConnectionProfile:
+        for field_name in SENSITIVE_PROFILE_FIELDS:
+            value = get_secret(profile.name, field_name)
+            if value is not None:
+                setattr(profile, field_name, value)
+        return profile
+
+    @staticmethod
+    def _sync_sensitive_fields(
+        profile: ConnectionProfile, foreign: set[str] = frozenset()
+    ) -> list[str]:
+        failed_fields: list[str] = []
+        for field_name in SENSITIVE_PROFILE_FIELDS:
+            value = getattr(profile, field_name, "")
+            if value:
+                if not store_secret(profile.name, field_name, value):
+                    failed_fields.append(field_name)
+            elif secret_entry(profile.name, field_name) not in foreign:
+                delete_secret(profile.name, field_name)
+        return failed_fields
+
+    @staticmethod
+    def _delete_sensitive_fields(profile_name: str, foreign: set[str] = frozenset()) -> None:
+        for field_name in SENSITIVE_PROFILE_FIELDS:
+            if secret_entry(profile_name, field_name) not in foreign:
+                delete_secret(profile_name, field_name)

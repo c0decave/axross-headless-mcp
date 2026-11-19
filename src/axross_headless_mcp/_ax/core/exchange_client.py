@@ -1,0 +1,1352 @@
+"""Exchange / EWS backend implementing FileBackend.
+
+Exposes an Exchange (or Office 365) mailbox as a filesystem, the
+same way :mod:`core.imap_client` does for IMAP. Folder = directory;
+message = ``<id>_<subject>.eml`` raw RFC 822 file; attachments live
+in a ``<id>/`` sub-directory.
+
+Path layout
+-----------
+    /                          — list of top-level mailbox folders
+    /Inbox/                    — messages in Inbox
+    /Inbox/123_subject.eml     — raw RFC 822 of message id 123
+    /Inbox/123/                — attachments of message 123
+    /Inbox/123/report.pdf      — attachment bytes
+
+Why a separate backend (vs. just IMAP)
+--------------------------------------
+* On-prem Exchange and Office 365 expose richer metadata via EWS
+  (calendar, contacts, search, free/busy) that IMAP doesn't.
+* Modern AzureAD-only mailboxes don't always allow IMAP at all.
+* exchangelib handles autodiscover + auth (NTLM / Basic / OAuth)
+  centrally so we don't have to thread three transport modes.
+
+Scope
+-----
+Email-as-file only. Calendar / Contacts / Tasks intentionally
+deferred — they don't fit the FileBackend protocol cleanly.
+
+* V1: read + message delete (into Deleted Items, as Outlook does).
+* V2 (this module): mkdir (create folder), rename (same-parent
+  folder rename), copy (message move between folders) and
+  open_write (upload a new RFC 822 message into a folder). V2
+  writes are header-level — Subject / To / Cc / text body are
+  pulled from the supplied MIME stream; attachments + HTML parts
+  are preserved best-effort but not guaranteed round-trip. The
+  transport-layer quirk we rely on: exchangelib's ``Message.save()``
+  handles folder routing through the ``folder=`` kwarg so we don't
+  have to walk the store to place the new item.
+"""
+
+from __future__ import annotations
+
+import email
+import email.message
+import email.utils
+import errno
+import io
+import logging
+import re
+from datetime import datetime
+from typing import IO
+
+from core.backend import SessionLifecycle
+from core.mail_names import cap_component, message_file_name
+from models.file_item import FileItem
+
+log = logging.getLogger(__name__)
+
+
+def _private_autodiscover_cache() -> None:
+    """Move exchangelib's autodiscover cache out of the shared temp folder.
+
+    It is a ``shelve`` (pickle) file at a predictable name in /tmp: another
+    local user who created it first decided what was unpickled - code run
+    as this user - and which endpoint got the credentials. It lives in a
+    0700 folder of this user's cache directory now."""
+    try:
+        from pathlib import Path
+
+        from exchangelib.autodiscover import cache as _cache  # type: ignore[import-not-found]
+
+        base = Path.home() / ".cache" / "axross" / "exchangelib"
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        base.chmod(0o700)
+        _cache.AUTODISCOVER_PERSISTENT_STORAGE = base / _cache.shelve_filename()
+    except Exception as exc:  # noqa: BLE001 - autodiscover then refuses below
+        log.warning("Exchange: no private autodiscover cache (%s)", exc)
+        _AUTODISCOVER_CACHE_PROBLEM.append(str(exc) or type(exc).__name__)
+
+
+#: Why the autodiscover cache could not be made private (autodiscover is
+#: refused then).
+_AUTODISCOVER_CACHE_PROBLEM: list[str] = []
+
+
+try:  # pragma: no cover — optional dep
+    import exchangelib  # type: ignore[import-not-found]
+    from exchangelib import (  # type: ignore[import-not-found]
+        DELEGATE,
+        Account,
+        Configuration,
+        Credentials,
+        Folder,
+        Mailbox,
+        Message,
+    )
+
+    # Override exchangelib's module-level default User-Agent before
+    # any Account is constructed. exchangelib's session pool reads
+    # this constant when it creates the underlying requests.Sessions,
+    # so patching the module attribute covers all subsequent SOAP
+    # calls. See docs/OPSEC.md #4.
+    from core.client_identity import HTTP_USER_AGENT as _AXROSS_UA
+
+    try:
+        exchangelib.USER_AGENT = _AXROSS_UA  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    EXCHANGELIB_AVAILABLE = True
+    _private_autodiscover_cache()
+except ImportError:  # pragma: no cover — optional dep
+    exchangelib = None  # type: ignore[assignment]
+    Account = None  # type: ignore[assignment]
+    Configuration = None  # type: ignore[assignment]
+    Credentials = None  # type: ignore[assignment]
+    DELEGATE = None  # type: ignore[assignment]
+    Folder = None  # type: ignore[assignment]
+    Mailbox = None  # type: ignore[assignment]
+    Message = None  # type: ignore[assignment]
+    EXCHANGELIB_AVAILABLE = False
+
+
+# What a folder listing shows (id and changekey always come along). All
+# simple fields, so exchangelib answers with FindItem alone; without
+# .only() it fetched every field - MIME content, body and attachments of
+# every message - through GetItem.
+LISTING_FIELDS = (
+    "subject",
+    "size",
+    "datetime_received",
+    "datetime_sent",
+    "last_modified_time",
+    "has_attachments",
+)
+# Attachment listing / stat: the attachments plus the times _msg_mtime reads.
+ATTACHMENT_FIELDS = ("attachments", "datetime_received", "datetime_sent", "last_modified_time")
+
+# Cap on a single message read — mailbox attachments can hit hundreds
+# of MiB and we'd rather refuse than OOM on a one-line "show me that
+# file" click.
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------
+# Path helpers
+# --------------------------------------------------------------------------
+
+_FILENAME_BAD_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
+
+
+# Substrings (case-insensitive) that mark a "not found" failure as
+# distinct from a transient transport error. Conservative: anything
+# we don't recognise is treated as transient and re-raised so the
+# caller sees the real problem.
+_NOT_FOUND_MARKERS = (
+    "not found",
+    "does not exist",
+    "no folder",
+    "no such",
+    "errornonexistentmailbox",
+)
+
+
+# exchangelib's not-found errors, by class name so the check works with
+# exchangelib absent. Their messages need not say "not found": a folder
+# lookup raises ErrorFolderNotFound("No subfolder with name 'x'"). An id
+# the server rejects as malformed names no item either - "notes.eml" in an
+# upload is parsed as the id "notes".
+_NOT_FOUND_ERRORS = frozenset(
+    {
+        "ErrorFolderNotFound",
+        "ErrorItemNotFound",
+        "ErrorInvalidIdMalformed",
+        "ErrorNonExistentMailbox",
+    }
+)
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    """True when *exc*, or an error it was raised ``from``, says the
+    folder, message or attachment is not there. Only ``__cause__`` is
+    followed: an error raised while handling a not-found one (a reset
+    connection during _child_folder's fallback scan) has it as its
+    ``__context__`` and is not a not-found itself."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, FileNotFoundError) or type(cur).__name__ in _NOT_FOUND_ERRORS:
+            return True
+        msg = str(cur).lower()
+        if any(marker in msg for marker in _NOT_FOUND_MARKERS):
+            return True
+        cur = cur.__cause__
+    return False
+
+
+def _sanitize(name: str, max_len: int = 120) -> str:
+    """*name* as one path component: at most *max_len* characters, as
+    before - unless that is over MAX_NAME_BYTES UTF-8 bytes (CJK): then
+    cut in bytes, an extension kept (core.mail_names)."""
+    cleaned = _FILENAME_BAD_CHARS.sub("_", name or "")
+    cleaned = cleaned.strip(". ")
+    if not cleaned:
+        cleaned = "untitled"
+    return cap_component(cleaned, max_len)
+
+
+def _split_path(path: str) -> list[str]:
+    """Normalise to forward-slash, drop empties, drop leading/trailing
+    slashes. Returns the path component list. Empty for root.
+
+    Doubled separators (``"a//b"``) collapse — the empty segment is
+    dropped — so callers don't need to pre-clean their inputs."""
+    norm = (path or "/").replace("\\", "/").strip("/")
+    if not norm:
+        return []
+    return [seg for seg in norm.split("/") if seg]
+
+
+def _id_segment(item_id: str) -> str:
+    """An EWS ItemId as path text. ItemIds are standard base64, which
+    uses "/" - the path separator - but never "-" or "_"."""
+    return item_id.replace("/", "-")
+
+
+def _parse_msg_segment(segment: str) -> tuple[str, str]:
+    """Pull (id, subject) out of a message-file or message-dir name.
+
+    The on-disk shape is ``<id>_<subject>.eml`` for the raw message
+    file and ``<id>`` for the attachments directory, the id written by
+    :func:`_id_segment`. Returns (id, "") when no subject is present.
+    """
+    name = segment
+    if name.endswith(".eml"):
+        name = name[:-4]
+    head, _, tail = name.partition("_")
+    head = head.replace("-", "/")
+    if not _ and not tail:
+        return head, ""
+    return head, tail
+
+
+def _extract_text_body(parsed: email.message.Message) -> str:
+    """Pull a text/plain body out of the parsed RFC 822 message.
+
+    Falls back to the first non-multipart part when text/plain is
+    absent. The charset defaults to utf-8; decode errors become
+    replacement characters so the write always succeeds — we're
+    round-tripping what the user sent, not policing it.
+    """
+    if parsed.is_multipart():
+        for part in parsed.walk():
+            if part.get_content_type() == "text/plain":
+                return _decode_part(part)
+        for part in parsed.walk():
+            if part.is_multipart():
+                continue
+            return _decode_part(part)
+        return ""
+    return _decode_part(parsed)
+
+
+def _decode_part(part: email.message.Message) -> str:
+    """A part's payload in its declared charset, UTF-8 when that
+    charset is unknown (LookupError) or not a codec name at all
+    (ValueError, e.g. an embedded NUL) - as the IMAP and POP3 backends
+    decode headers."""
+    raw = part.get_payload(decode=True) or b""
+    if not isinstance(raw, bytes):
+        raw = str(raw).encode("utf-8", "replace")
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return raw.decode(charset, errors="replace")
+    except (LookupError, ValueError):
+        return raw.decode("utf-8", errors="replace")
+
+
+def _split_addresses(headers: list[str] | None) -> list[str]:
+    """Split one or more ``To`` / ``Cc`` header values into a flat
+    list of bare email addresses.
+
+    Delegates to :func:`email.utils.getaddresses` so quoted display
+    names with embedded commas — ``"Last, First" <a@example.com>``
+    — don't fracture into ``"Last``, ``First" <a@example.com>``
+    (three malformed entries). Entries with no address part are
+    dropped silently; we surface only what exchangelib can use.
+    """
+    if not headers:
+        return []
+    parsed = email.utils.getaddresses(headers)
+    out: list[str] = []
+    for _display, addr in parsed:
+        cleaned = (addr or "").strip()
+        if cleaned:
+            out.append(cleaned)
+    return out
+
+
+class _ExchangeMessageWriter:
+    """Buffer-then-commit writer for Exchange message uploads.
+
+    The bytes land in a BytesIO until ``close()``; at that point they
+    are parsed as RFC 822 and a new ``Message`` is created in the
+    target folder with subject / recipients / body lifted from the
+    supplied MIME.
+
+    Not seekable — the transfer worker doesn't need to read back, and
+    seekable=False lets us cleanly reject half-written reuse.
+    """
+
+    def __init__(self, session: "ExchangeSession", folder, filename: str):
+        self._session = session
+        self._folder = folder
+        self._filename = filename
+        self._buf = io.BytesIO()
+        self._closed = False
+
+    def write(self, data: bytes) -> int:
+        if self._closed:
+            raise ValueError("Exchange writer already closed")
+        return self._buf.write(data)
+
+    def tell(self) -> int:
+        return self._buf.tell()
+
+    def flush(self) -> None:
+        return None
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        payload = self._buf.getvalue()
+        self._buf.close()
+        self._session._commit_message(self._folder, self._filename, payload)
+
+    def discard(self) -> None:
+        """Drop buffered bytes without committing a new message
+        (transfer cancel path)."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._buf.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __enter__(self) -> "_ExchangeMessageWriter":
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        if exc_info and exc_info[0] is not None:
+            self.discard()
+        else:
+            self.close()
+        return False
+
+
+# --------------------------------------------------------------------------
+# Session
+# --------------------------------------------------------------------------
+
+
+#: Seconds exchangelib may spend waiting and retrying one request that the
+#: server turned away as busy (ErrorServerBusy, HTTP 503 / 429 - EWS
+#: throttling) or that lost its connection. exchangelib's default policy
+#: (FailFast) retries nothing, so one throttled request failed a whole
+#: folder copy; its FaultTolerance default (3600 s) would leave a pane
+#: waiting for an hour. A server that asks for a longer back-off than
+#: this fails at once.
+EXCHANGE_RETRY_MAX_WAIT = 60
+
+
+def _retry_policy():
+    """exchangelib's FaultTolerance bounded by EXCHANGE_RETRY_MAX_WAIT in
+    TOTAL, a 401 a refused login - or None when this exchangelib has none
+    (its default then applies).
+
+    FaultTolerance's max_wait bounds each single back-off: a server that
+    kept answering ErrorServerBusy with a back-off under a minute was
+    retried for ever. And it reads every 401 as throttling: a wrong
+    password was sent four times (an account lock-out after five) over
+    70 s and then reported as "Max timeout reached"."""
+    try:
+        from exchangelib import FaultTolerance  # type: ignore[import-not-found]
+        from exchangelib.errors import RateLimitError, UnauthorizedError
+    except ImportError:
+        return None
+    import time as _time
+
+    class _BoundedFaultTolerance(FaultTolerance):
+        def __init__(self, max_wait):
+            super().__init__(max_wait=max_wait)
+            self._episode_start = None
+            self._episode_last = None
+
+        def __setstate__(self, state):
+            super().__setstate__(state)
+            self._episode_start = self._episode_last = None
+
+        def back_off(self, seconds):
+            now = _time.monotonic()
+            if self._episode_last is None or now - self._episode_last > self.max_wait:
+                self._episode_start = now  # a new busy spell
+            self._episode_last = now
+            waited = now - self._episode_start
+            if waited + float(seconds or 0) > self.max_wait:
+                raise RateLimitError(
+                    f"the server stayed busy for {waited:.0f} s", wait=seconds)
+            super().back_off(seconds)
+
+        def raise_response_errors(self, response):
+            if getattr(response, "status_code", None) == 401:
+                raise UnauthorizedError(f"Invalid credentials for {response.url}")
+            return super().raise_response_errors(response)
+
+    return _BoundedFaultTolerance(EXCHANGE_RETRY_MAX_WAIT)
+
+
+class ExchangeSession(SessionLifecycle):
+    """EWS-backed FileBackend.
+
+    Construct one per (smtp address, credentials). Folder / message
+    fetches go through exchangelib. Each method translates the
+    library's exceptions into ``OSError`` so transfer_worker etc.
+    don't have to care about EWS specifics.
+    """
+
+    def __init__(
+        self,
+        smtp_address: str,
+        username: str = "",
+        password: str = "",
+        *,
+        server: str = "",  # "outlook.office365.com" etc.
+        autodiscover: bool = True,
+        proxy_type: str = "none",
+        proxy_host: str = "",
+        proxy_port: int = 0,
+        proxy_username: str = "",
+        proxy_password: str = "",
+    ):
+        self._smtp = smtp_address
+        self._username = username or smtp_address
+        self._password = password
+        # Bind early so the cleanup branch below can introspect even
+        # if the failure happened before assignment.
+        self._account = None
+
+        from core.proxy import build_requests_proxies
+
+        proxies = build_requests_proxies(
+            proxy_type,
+            proxy_host,
+            int(proxy_port or 0),
+            proxy_username,
+            proxy_password,
+        )
+        # Autodiscover sends Pre-Account HTTP requests directly via
+        # exchangelib's static fetcher — those bypass the per-Account
+        # session pool, so a proxy set after the fact misses them.
+        # Refuse the combination loudly rather than leak unproxied.
+        # See docs/PROXY_SUPPORT.md.
+        if proxies and autodiscover:
+            raise OSError(
+                "Exchange: proxy + autodiscover=True is not supported — "
+                "the autodiscover step bypasses the session pool. "
+                "Set autodiscover=False and pass an explicit server=… "
+                "to route every byte through the proxy."
+            )
+        if not EXCHANGELIB_AVAILABLE:
+            raise ImportError(
+                "Exchange support requires exchangelib. Install with: pip install axross[exchange]"
+            )
+        if autodiscover and _AUTODISCOVER_CACHE_PROBLEM:
+            raise OSError(
+                errno.EACCES,
+                "Exchange: autodiscover needs a private cache folder "
+                f"({_AUTODISCOVER_CACHE_PROBLEM[0]}); give the server instead",
+            )
+
+        try:
+            creds = Credentials(self._username, password)  # type: ignore[misc]
+            policy = _retry_policy()
+            retry = {"retry_policy": policy} if policy is not None else {}
+            if autodiscover:
+                # The retry policy reaches an autodiscovered Account only
+                # through a Configuration (exchangelib takes it from there).
+                self._account = Account(  # type: ignore[misc]
+                    primary_smtp_address=smtp_address,
+                    credentials=creds,
+                    autodiscover=True,
+                    access_type=DELEGATE,
+                    **(
+                        {"config": Configuration(credentials=creds, **retry)}  # type: ignore[misc]
+                        if retry
+                        else {}
+                    ),
+                )
+            else:
+                if not server:
+                    raise ValueError("ExchangeSession: server is required when autodiscover=False")
+                config = Configuration(  # type: ignore[misc]
+                    server=server,
+                    credentials=creds,
+                    **retry,
+                )
+                self._account = Account(  # type: ignore[misc]
+                    primary_smtp_address=smtp_address,
+                    config=config,
+                    autodiscover=False,
+                    access_type=DELEGATE,
+                )
+                # Wire the proxy into the protocol's session pool BEFORE
+                # any payload request runs. We patch existing pooled
+                # sessions plus override ``create_session`` so future
+                # sessions added on demand inherit the proxy.
+                if proxies:
+                    self._apply_protocol_proxy(self._account.protocol, proxies)
+        except Exception as exc:  # noqa: BLE001 — surface to user
+            # If autodiscover or the second Account ctor raised AFTER
+            # we'd already established the protocol object, drop it
+            # cleanly so the underlying TLS/HTTP connection isn't held
+            # for the GC. ``Account`` may not have a ``close()`` on
+            # every exchangelib version; use getattr + best-effort.
+            self._safely_close_account()
+            self._account = None
+            raise OSError(
+                f"Exchange connect to {smtp_address}: {exc}",
+            ) from exc
+        log.info("ExchangeSession opened for %s", smtp_address)
+
+    @staticmethod
+    def _apply_protocol_proxy(protocol, proxies: dict) -> None:
+        """Inject ``proxies`` into every requests.Session that
+        exchangelib's protocol session pool produces.
+
+        Two halves: (1) patch any session already in the pool — the
+        Account ctor populates it with one or two — and (2) wrap the
+        protocol's ``create_session`` so future on-demand expansions
+        inherit the proxy.
+
+        This must be fail-closed. If exchangelib's internals change
+        and we cannot prove the session pool is proxy-wired, raising is
+        safer than letting an operator believe EWS traffic is tunnelled
+        while it goes direct.
+        """
+        from core.proxy import lock_requests_session_to_profile_proxy
+
+        patched_existing = 0
+        existing_sessions = 0
+        try:
+            pool = getattr(protocol, "_session_pool", None)
+            if pool is not None:
+                # exchangelib uses a Queue; iterate non-destructively.
+                inner = list(getattr(pool, "queue", []))
+                for sess in inner:
+                    existing_sessions += 1
+                    if not hasattr(sess, "proxies"):
+                        raise OSError("Exchange proxy: pooled session has no 'proxies' attribute")
+                    lock_requests_session_to_profile_proxy(sess, proxies)
+                    patched_existing += 1
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange proxy: could not patch existing session pool: {exc}") from exc
+
+        original = getattr(protocol, "create_session", None)
+        if original is None:
+            if existing_sessions and patched_existing == existing_sessions:
+                return
+            raise OSError(
+                "Exchange proxy: protocol does not expose create_session(); "
+                "refusing to continue without a verified proxy hook."
+            )
+
+        def _patched_create_session(*args, **kwargs):
+            sess = original(*args, **kwargs)
+            if not hasattr(sess, "proxies"):
+                raise OSError("Exchange proxy: newly-created session has no 'proxies' attribute")
+            lock_requests_session_to_profile_proxy(sess, proxies)
+            return sess
+
+        try:
+            protocol.create_session = _patched_create_session  # type: ignore[assignment]
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange proxy: could not wrap create_session: {exc}") from exc
+
+    def _safely_close_account(self) -> None:
+        """Best-effort close of the underlying exchangelib Account /
+        protocol so a partially-constructed session doesn't strand
+        TLS connections in the protocol pool."""
+        if self._account is None:
+            return
+        for closer in (
+            getattr(self._account, "close", None),
+            getattr(getattr(self._account, "protocol", None), "close_pools", None),
+            getattr(getattr(self._account, "protocol", None), "close", None),
+        ):
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("ExchangeSession close: %s raised %s", closer, exc)
+
+    def close(self) -> None:
+        """Public teardown: drop the underlying exchangelib resources.
+        Idempotent."""
+        self._safely_close_account()
+        self._account = None
+
+    @property
+    def connected(self) -> bool:
+        """False after close(). There was no such property: the connection
+        manager counted a closed session as alive, and the health check
+        reported "no connected state" for ever."""
+        return getattr(self, "_account", None) is not None
+
+    # ------------------------------------------------------------------
+    # FileBackend protocol — surface
+    # ------------------------------------------------------------------
+    @property
+    def name(self) -> str:
+        return f"{self._smtp} (Exchange)"
+
+    def separator(self) -> str:
+        return "/"
+
+    def join(self, *parts: str) -> str:
+        cleaned = [str(p).strip("/") for p in parts if p is not None]
+        cleaned = [p for p in cleaned if p]
+        if not cleaned:
+            return "/"
+        return "/" + "/".join(cleaned)
+
+    def normalize(self, path: str) -> str:
+        return self.join(*_split_path(path))
+
+    def parent(self, path: str) -> str:
+        parts = _split_path(path)
+        if not parts:
+            return "/"
+        return self.join(*parts[:-1])
+
+    def home(self) -> str:
+        return "/"
+
+    # ------------------------------------------------------------------
+    # Listing / stat
+    # ------------------------------------------------------------------
+    def list_dir(self, path: str) -> list[FileItem]:
+        parts = _split_path(path)
+        if not parts:
+            return self._list_root_folders()
+        # Last segment may be a message id (= attachments dir) or a
+        # folder name. Try folder first; if it fails, treat as message.
+        try:
+            folder = self._resolve_folder(parts)
+        except OSError:
+            # Attachments listing: parts == [<folder>..., <msg_id>]
+            *folder_parts, msg_seg = parts
+            folder = self._resolve_folder(folder_parts)
+            return self._list_attachments(folder, msg_seg)
+        # The folder's own subfolders first: they were left out, so a
+        # recursive copy or delete of a folder never saw them.
+        return self._folder_items(folder, f"Exchange list {path}") + self._list_messages(folder)
+
+    def stat(self, path: str) -> FileItem:
+        parts = _split_path(path)
+        if not parts:
+            return FileItem(name="", is_dir=True)
+        # The last segment can be either a folder, a message file
+        # (.eml), or an attachment basename. Check in that order —
+        # but only fall through to the next interpretation when the
+        # error was a clean "not found", NOT a transient network
+        # blip (otherwise a TLS reset during folder traversal looks
+        # like "attachment not found" to the user).
+        head, *_ = _parse_msg_segment(parts[-1])
+        try:
+            folder = self._resolve_folder(parts)
+            return FileItem(name=parts[-1], is_dir=True)
+        except OSError as exc:
+            if not _is_not_found(exc):
+                raise
+        # Attachments dir lookup: last segment is a bare msg id.
+        if not parts[-1].endswith(".eml"):
+            try:
+                folder = self._resolve_folder(parts[:-1])
+                self._fetch_message(folder, parts[-1], only=LISTING_FIELDS)
+                return FileItem(name=parts[-1], is_dir=True)
+            except OSError as exc:
+                if not _is_not_found(exc):
+                    raise
+        try:
+            # Message file (.eml) lookup.
+            if parts[-1].endswith(".eml"):
+                folder = self._resolve_folder(parts[:-1])
+                msg = self._fetch_message(folder, head, only=LISTING_FIELDS)
+                return FileItem(
+                    name=parts[-1],
+                    size=self._estimate_size(msg),
+                    modified=self._msg_mtime(msg),
+                    is_dir=False,
+                )
+            # Attachment within a message.
+            if len(parts) >= 3:
+                folder = self._resolve_folder(parts[:-2])
+                msg = self._fetch_message(folder, parts[-2], only=ATTACHMENT_FIELDS)
+                atts = getattr(msg, "attachments", None) or []
+                for att in atts:
+                    # The name the listing shows (duplicates numbered), not
+                    # the raw one: "report.1.pdf" was "not found" (review B24).
+                    if self._unique_attachment_name(atts, att) == parts[-1]:
+                        return FileItem(
+                            name=parts[-1],
+                            size=int(getattr(att, "size", 0) or 0),
+                            modified=self._msg_mtime(msg),
+                            is_dir=False,
+                        )
+        except OSError as exc:
+            if not _is_not_found(exc):
+                raise
+            raise FileNotFoundError(
+                errno.ENOENT, f"Exchange stat({path}): not found: {exc}", path
+            ) from exc
+        raise FileNotFoundError(errno.ENOENT, f"Exchange stat({path}): not found", path)
+
+    def is_dir(self, path: str) -> bool:
+        """False only for a path that is not there; a failed EWS call is
+        an OSError (transfer_manager recurses on True)."""
+        try:
+            return self.stat(path).is_dir
+        except FileNotFoundError:
+            return False
+
+    def exists(self, path: str) -> bool:
+        """False only when EWS answers "not found" for every reading of
+        the path. A reset connection, a timeout, ErrorAccessDenied or a
+        busy server is an OSError: server_side_copy(overwrite=False)
+        takes False as its go-ahead."""
+        try:
+            self.stat(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    # ------------------------------------------------------------------
+    # IO
+    # ------------------------------------------------------------------
+    def open_read(self, path: str) -> IO[bytes]:
+        parts = _split_path(path)
+        if not parts:
+            raise OSError("Exchange open_read: cannot read root")
+        # Message .eml: <folder>/<id>_<subject>.eml
+        if parts[-1].endswith(".eml") and len(parts) >= 2:
+            folder = self._resolve_folder(parts[:-1])
+            msg_id, _ = _parse_msg_segment(parts[-1])
+            msg = self._fetch_message(folder, msg_id)
+            payload = bytes(getattr(msg, "mime_content", b"") or b"")
+            self._enforce_size_cap(payload, path)
+            return io.BytesIO(payload)
+        # Attachment: <folder>/<id>/<filename>
+        if len(parts) >= 3:
+            folder = self._resolve_folder(parts[:-2])
+            msg = self._fetch_message(folder, parts[-2])
+            atts = list(getattr(msg, "attachments", None) or [])
+            wanted = parts[-1]
+            matches = [att for att in atts if self._unique_attachment_name(atts, att) == wanted]
+            if not matches:
+                raise OSError(f"Exchange open_read({path}): attachment not found")
+            if len(matches) > 1:
+                # _unique_attachment_name disambiguates by appending
+                # ``.1``, ``.2``, … so a true collision after that is
+                # an exchangelib invariant violation we'd rather surface
+                # than silently pick one and corrupt the user's data.
+                raise OSError(
+                    f"Exchange open_read({path}): multiple attachments "
+                    f"resolve to the same on-disk name "
+                    f"({len(matches)} matches) — refusing to guess"
+                )
+            payload = self._attachment_bytes(matches[0], path)
+            self._enforce_size_cap(payload, path)
+            return io.BytesIO(payload)
+        raise OSError(f"Exchange open_read({path}): not a message or attachment")
+
+    @staticmethod
+    def _attachment_bytes(att, path: str) -> bytes:
+        """The bytes of a file attachment, or the attached mail (an
+        ItemAttachment: a forwarded message) as its MIME source. An
+        ItemAttachment has no ``content``: it was read as 0 bytes while
+        the listing showed its real size."""
+        if hasattr(att, "content"):
+            return bytes(getattr(att, "content", b"") or b"")
+        item = getattr(att, "item", None)
+        mime = getattr(item, "mime_content", None) if item is not None else None
+        if mime:
+            return mime if isinstance(mime, bytes) else str(mime).encode("utf-8")
+        raise OSError(
+            errno.EOPNOTSUPP,
+            f"Exchange open_read({path}): the attached item has no content to download",
+        )
+
+    @staticmethod
+    def _enforce_size_cap(payload: bytes, path: str) -> None:
+        if len(payload) > MAX_MESSAGE_BYTES:
+            raise OSError(
+                f"Exchange open_read({path}): {len(payload)} bytes exceeds {MAX_MESSAGE_BYTES} cap"
+            )
+
+    def open_write(self, path: str, append: bool = False) -> IO[bytes]:
+        """Upload a new RFC 822 message into the folder named by
+        ``path``'s parent. Only ``<folder>/<name>.eml`` paths are
+        accepted — writing to the attachments sub-dir would require
+        mutating an existing message, which EWS doesn't expose."""
+        if append:
+            raise OSError("Exchange open_write: append unsupported (EWS messages are immutable)")
+        parts = _split_path(path)
+        if len(parts) < 2:
+            raise OSError(
+                f"Exchange open_write({path}): expected /<folder>/<name>.eml",
+            )
+        leaf = parts[-1]
+        if not leaf.endswith(".eml"):
+            raise OSError(
+                f"Exchange open_write({path}): only .eml uploads are supported — "
+                "attachments cannot be added to an existing message",
+            )
+        folder = self._resolve_folder(parts[:-1])
+        return _ExchangeMessageWriter(self, folder, leaf)
+
+    def _commit_message(self, folder, filename: str, raw: bytes) -> None:
+        """Parse ``raw`` as RFC 822 and save a new Message into
+        ``folder``. Size capped like ``open_read`` — a 200 MiB write
+        is a mistake, not a workflow."""
+        self._enforce_size_cap(raw, filename)
+        try:
+            parsed = email.message_from_bytes(raw)
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(
+                f"Exchange commit({filename}): RFC 822 parse failed: {exc}",
+            ) from exc
+        # ``filename`` includes the trailing ``.eml``; strip it so the
+        # fallback subject is readable.
+        fallback_subject = filename[:-4] if filename.endswith(".eml") else filename
+        subject = (parsed.get("Subject") or "").strip() or fallback_subject
+        mime = raw
+        if not (parsed.get("Subject") or "").strip():
+            clean = "".join(c for c in fallback_subject if c >= " " and c != "\x7f")
+            mime = f"Subject: {clean}\r\n".encode("utf-8") + raw
+        try:
+            # The message as it is - attachments, HTML part, From, Date and
+            # every other header. It used to be rebuilt from Subject,
+            # To/Cc/Bcc and the first text part, dropping the rest
+            # silently (review B2, 2026-10-17).
+            msg = Message(  # type: ignore[misc]
+                account=self._account,
+                folder=folder,
+                mime_content=mime,
+            )
+            msg.save()
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(
+                f"Exchange commit({filename}): save failed: {exc}",
+            ) from exc
+        log.info(
+            "Exchange committed %d bytes as %r in %s",
+            len(raw),
+            subject,
+            getattr(folder, "name", "?"),
+        )
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
+    def remove(self, path: str, recursive: bool = False) -> None:
+        """Delete a message the way Outlook and OWA do: into Deleted Items.
+
+        exchangelib's ``Item.delete()`` is EWS ``DeleteType=HardDelete``:
+        the message skips Deleted Items and "Recover deleted items", gone
+        for the user at once - while the same Delete in Outlook, OWA or
+        the phone app only moves it. ``move_to_trash()``
+        (``MoveToDeletedItems``) is used instead; a message that is in
+        Deleted Items already is ``soft_delete()``d (``SoftDelete``: into
+        Recoverable Items, what Outlook does there). Either way the
+        message is gone from the folder, as remove() promises, and stays
+        recoverable for the mailbox's retention time."""
+        parts = _split_path(path)
+        if not parts:
+            raise OSError("Exchange remove: cannot remove root")
+        if parts[-1].endswith(".eml") and len(parts) >= 2:
+            folder = self._resolve_folder(parts[:-1])
+            msg_id, _ = _parse_msg_segment(parts[-1])
+            msg = self._fetch_message(folder, msg_id)
+            try:
+                if self._is_deleted_items(folder):
+                    msg.soft_delete()
+                else:
+                    msg.move_to_trash()
+            except Exception as exc:  # noqa: BLE001
+                raise OSError(f"Exchange delete: {exc}") from exc
+            return
+        raise OSError("Exchange remove: only message files can be deleted")
+
+    def mkdir(self, path: str) -> None:
+        """Create a mail folder at ``path``. Parent must exist; leaf
+        must be unique within the parent — EWS allows duplicates by
+        display name but our flat-name path scheme cannot distinguish
+        them, so we refuse upfront rather than create a shadow."""
+        parts = _split_path(path)
+        if not parts:
+            raise OSError("Exchange mkdir: cannot create root")
+        leaf = parts[-1]
+        parent_parts = parts[:-1]
+        try:
+            parent = self._resolve_folder(parent_parts) if parent_parts else self._account.root
+        except OSError as exc:
+            raise OSError(
+                f"Exchange mkdir({path}): parent missing: {exc}",
+            ) from exc
+        # Probe for duplicate — a failed lookup means clear to create.
+        # A broad ``except Exception`` here would swallow genuine
+        # network / TLS / auth errors and mis-report them as
+        # "folder doesn't exist"; narrow to the canonical "not found"
+        # shape and let anything else propagate as OSError so the
+        # user sees the real problem (cf. ``_is_not_found`` — same
+        # substring heuristic EWS uses elsewhere in this module).
+        exists = False
+        try:
+            probe = parent / leaf
+            _ = probe.name
+            exists = True
+        except Exception as probe_exc:  # noqa: BLE001
+            if not _is_not_found(probe_exc):
+                raise OSError(
+                    f"Exchange mkdir({path}): duplicate probe failed "
+                    f"with a non-not-found error (likely network or "
+                    f"auth): {probe_exc}",
+                ) from probe_exc
+        if exists:
+            raise OSError(f"Exchange mkdir({path}): already exists")
+        try:
+            Folder(parent=parent, name=leaf).save()  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange mkdir({path}): {exc}") from exc
+        log.info("Exchange mkdir %s", path)
+
+    def rename(self, src: str, dst: str) -> None:
+        """Same-parent rename of a folder. Cross-parent moves and
+        message renames are rejected — the former needs ``move()``
+        support we haven't validated against Outlook's archive
+        policies, the latter would break the ``<id>_<subject>.eml``
+        scheme (id is server-assigned and immutable)."""
+        src_parts = _split_path(src)
+        dst_parts = _split_path(dst)
+        if not src_parts or not dst_parts:
+            raise OSError("Exchange rename: cannot rename root")
+        if src_parts[-1].endswith(".eml") or dst_parts[-1].endswith(".eml"):
+            raise OSError(
+                "Exchange rename: messages cannot be renamed "
+                "(the server-assigned id is part of the filename)",
+            )
+        if src_parts[:-1] != dst_parts[:-1]:
+            raise OSError(
+                "Exchange rename: cross-folder moves are unsupported — "
+                "use copy + delete if you really need to relocate",
+            )
+        try:
+            folder = self._resolve_folder(src_parts)
+            folder.name = dst_parts[-1]
+            folder.save()
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange rename({src}→{dst}): {exc}") from exc
+        log.info("Exchange rename %s → %s", src, dst)
+
+    def chmod(self, path: str, mode: int) -> None:
+        raise OSError("Exchange has no POSIX permissions")
+
+    def readlink(self, path: str) -> str:
+        raise OSError("Exchange has no symlinks")
+
+    def copy(self, src: str, dst: str) -> None:
+        """Copy a message between folders. Only message-level copy is
+        supported — duplicating a folder would require recursively
+        fanning out messages and loses server-side storage savings."""
+        src_parts = _split_path(src)
+        dst_parts = _split_path(dst)
+        if len(src_parts) < 2 or not src_parts[-1].endswith(".eml"):
+            raise OSError(
+                "Exchange copy: source must be a message path (/<folder>/<id>_<subject>.eml)",
+            )
+        if len(dst_parts) < 1:
+            raise OSError("Exchange copy: destination must name a folder")
+        # Dst may be a folder path or a folder/newname.eml path; in
+        # either case the target folder is the leading components (we
+        # cannot rename on copy — the copy keeps the original subject).
+        dst_folder_parts = dst_parts[:-1] if dst_parts[-1].endswith(".eml") else dst_parts
+        try:
+            src_folder = self._resolve_folder(src_parts[:-1])
+            dst_folder = (
+                self._resolve_folder(dst_folder_parts) if dst_folder_parts else self._account.root
+            )
+            msg_id, _ = _parse_msg_segment(src_parts[-1])
+            msg = self._fetch_message(src_folder, msg_id)
+            msg.copy(to_folder=dst_folder)
+        except OSError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange copy({src}→{dst}): {exc}") from exc
+        log.info("Exchange copy %s → %s", src, dst)
+
+    def disk_usage(self, path: str) -> tuple[int, int, int]:
+        # Mailbox quota would be the right answer; exchangelib exposes
+        # it but support varies per-tenant. Returning zeros keeps the
+        # contract instead of probing every time.
+        return (0, 0, 0)
+
+    def checksum(self, path: str, algorithm: str = "sha256") -> str:
+        return ""
+
+    # ------------------------------------------------------------------
+    # Exchange-specific verbs (slice 4 of API_GAPS)
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, *, folder: str | None = None, limit: int = 100) -> list[dict]:
+        """Find messages matching a free-text query (subject + body
+        + sender). Returns up to ``limit`` lightweight dicts with
+        ``{id, subject, sender, datetime_received, has_attachments}``.
+
+        ``folder`` is a virtual path inside the mailbox
+        (``"/inbox"`` / ``"/sent items"`` / ``"/junk email"``).
+        ``None`` searches the inbox by default.
+
+        Power users wanting full QueryString DSL can hit
+        ``self.account.<folder>.filter(...)`` directly — this helper
+        just wraps the common ``contains-text`` case.
+        """
+        acct = self._account_or_raise()
+        target = acct.inbox
+        if folder:
+            parts = [p for p in folder.strip("/").split("/") if p]
+            target = self._resolve_folder(parts) if parts else acct.inbox
+        from exchangelib import Q  # type: ignore[import-not-found]
+
+        # One filter with an OR: two QuerySets joined with "|" raised
+        # TypeError - search() never worked.
+        items = target.filter(Q(subject__icontains=query) | Q(body__icontains=query))
+        out: list[dict] = []
+        for msg in items.order_by("-datetime_received")[: int(limit)]:
+            try:
+                sender = msg.sender.email_address if msg.sender else ""
+            except Exception:  # noqa: BLE001
+                sender = ""
+            out.append(
+                {
+                    "id": self._msg_id(msg),
+                    "subject": getattr(msg, "subject", "") or "",
+                    "sender": sender,
+                    "datetime_received": getattr(msg, "datetime_received", None),
+                    "has_attachments": bool(getattr(msg, "has_attachments", False)),
+                }
+            )
+        return out
+
+    def move_message(self, src_path: str, dst_folder: str) -> None:
+        """Move a single message from ``src_path`` (virtual file path
+        inside a folder) to ``dst_folder`` (virtual folder path).
+        Wraps exchangelib's ``Item.move``."""
+        # Side-effect call: raises if not connected. The returned
+        # account isn't needed here (msg.move(dst) is the operation).
+        self._account_or_raise()
+        src_parts = [p for p in src_path.strip("/").split("/") if p]
+        if len(src_parts) < 2:
+            raise OSError(f"move_message: bad source path {src_path!r}")
+        msg_seg = src_parts[-1]
+        folder_parts = src_parts[:-1]
+        src_folder = self._resolve_folder(folder_parts)
+        msg = self._fetch_message(src_folder, msg_seg)
+        dst_parts = [p for p in dst_folder.strip("/").split("/") if p]
+        if not dst_parts:
+            raise OSError(f"move_message: bad destination {dst_folder!r}")
+        dst = self._resolve_folder(dst_parts)
+        msg.move(dst)
+
+    def send_mail(
+        self,
+        to: list[str] | str,
+        subject: str,
+        body: str,
+        *,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        attachments: list[tuple[str, bytes]] | None = None,
+    ) -> None:
+        """Send an email through the connected Exchange account.
+        ``to`` may be a single address or a list. ``attachments`` is
+        a list of ``(filename, bytes)``.
+
+        F34: every address (to/cc/bcc), the subject, AND every
+        attachment filename are validated for CR/LF before the
+        Mailbox/FileAttachment objects are constructed.
+        exchangelib serialises these into MIME headers; a tainted
+        value would otherwise smuggle additional headers (Bcc,
+        Reply-To, X-Mailer-Override, …). Body is sent as plain
+        text; HTML bodies are out of scope for this helper.
+        """
+        if "\r" in subject or "\n" in subject:
+            raise ValueError("send_mail subject must not contain CR/LF (F34)")
+        if isinstance(to, str):
+            to_list = [to]
+        else:
+            to_list = list(to)
+        for label, addrs in (("to", to_list), ("cc", cc or []), ("bcc", bcc or [])):
+            for a in addrs:
+                if "\r" in a or "\n" in a:
+                    raise ValueError(
+                        f"send_mail {label} address {a!r} must not "
+                        f"contain CR/LF (F34 — header-injection guard)"
+                    )
+        for fname, _blob in attachments or []:
+            if "\r" in fname or "\n" in fname:
+                raise ValueError(
+                    f"send_mail attachment filename {fname!r} must not contain CR/LF (F34)"
+                )
+        from exchangelib import FileAttachment as _Att
+        from exchangelib import Mailbox as _Mb
+        from exchangelib import Message as _Msg
+
+        acct = self._account_or_raise()
+        msg = _Msg(
+            account=acct,
+            subject=subject,
+            body=body,
+            to_recipients=[_Mb(email_address=a) for a in to_list],
+            cc_recipients=[_Mb(email_address=a) for a in (cc or [])],
+            bcc_recipients=[_Mb(email_address=a) for a in (bcc or [])],
+        )
+        for fname, blob in attachments or []:
+            msg.attach(_Att(name=fname, content=blob))
+        msg.send()
+
+    def _account_or_raise(self):
+        """Resolve self.account or raise a structured OSError. Older
+        exchange code paths defer the connect, so guard."""
+        acct = getattr(self, "account", None) or getattr(self, "_account", None)
+        if acct is None:
+            raise OSError("Exchange backend not connected — call connect() first")
+        return acct
+
+    def list_versions(self, path: str) -> list:
+        return []
+
+    def open_version_read(self, path: str, version_id: str):
+        raise OSError("Exchange backend has no version history")
+
+    # ------------------------------------------------------------------
+    # exchangelib helpers — kept narrow so tests can patch them
+    # ------------------------------------------------------------------
+    def _list_root_folders(self) -> list[FileItem]:
+        return self._folder_items(self._account.root, "Exchange list root folders")
+
+    @staticmethod
+    def _folder_items(parent, where: str) -> list[FileItem]:
+        """A folder item for each child folder of *parent*."""
+        try:
+            children = list(parent.children)
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"{where}: {exc}") from exc
+        out: list[FileItem] = []
+        for folder in children:
+            name = _sanitize(getattr(folder, "name", "") or "")
+            if not name:
+                continue
+            out.append(FileItem(name=name, is_dir=True))
+        return out
+
+    def _is_deleted_items(self, folder) -> bool:
+        """Whether *folder* is the mailbox's Deleted Items (``account.trash``,
+        found by its well-known name whatever the display language). A
+        lookup that fails answers False: the message is then moved there."""
+        try:
+            trash = self._account.trash
+        except Exception as exc:  # noqa: BLE001 - exchangelib raises various
+            log.debug("Exchange: Deleted Items lookup failed: %s", exc)
+            return False
+        if trash is None:
+            return False
+        if trash is folder:
+            return True
+        trash_id = getattr(trash, "id", None)
+        return trash_id is not None and trash_id == getattr(folder, "id", None)
+
+    def _resolve_folder(self, parts: list[str]):
+        try:
+            cursor = self._account.root
+            for segment in parts:
+                cursor = self._child_folder(cursor, segment)
+                # Touch the folder to force an EWS round-trip — if it
+                # doesn't exist we get a clear exception instead of a
+                # lazy failure later.
+                _ = cursor.name  # noqa: F841
+            return cursor
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(
+                f"Exchange folder lookup {'/'.join(parts)}: {exc}",
+            ) from exc
+
+    @staticmethod
+    def _child_folder(cursor, segment: str):
+        """Child of ``cursor`` named ``segment``. The listing shows
+        ``_sanitize(name)``, so a folder such as "Projects: 2025" comes
+        back as "Projects_ 2025" and has to be matched that way when
+        exchangelib's exact (case-insensitive) lookup finds nothing."""
+        try:
+            # exchangelib supports folder lookup by name with /
+            return cursor / segment
+        except Exception as exact_miss:  # noqa: BLE001 — ErrorFolderNotFound
+            wanted = segment.lower()
+            for child in cursor.children:
+                if _sanitize(getattr(child, "name", "") or "").lower() == wanted:
+                    return child
+            raise exact_miss
+
+    def _list_messages(self, folder) -> list[FileItem]:
+        try:
+            messages = list(folder.all().only(*LISTING_FIELDS))
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange list messages: {exc}") from exc
+        out: list[FileItem] = []
+        for msg in messages:
+            mid = _id_segment(self._msg_id(msg))
+            subj = _sanitize(getattr(msg, "subject", "") or "no_subject")
+            # The ItemId (~150 characters) whole, the subject cut so the
+            # name stays a valid local file name; found by the id alone.
+            file_name = message_file_name(mid, subj)
+            out.append(
+                FileItem(
+                    name=file_name,
+                    size=self._estimate_size(msg),
+                    modified=self._msg_mtime(msg),
+                    is_dir=False,
+                )
+            )
+            # Add the attachments-directory entry only when the message
+            # actually has attachments — otherwise we'd lie.
+            if getattr(msg, "has_attachments", False):
+                out.append(FileItem(name=mid, is_dir=True))
+        return out
+
+    def _list_attachments(self, folder, msg_seg: str) -> list[FileItem]:
+        msg = self._fetch_message(folder, msg_seg, only=ATTACHMENT_FIELDS)
+        atts = list(getattr(msg, "attachments", None) or [])
+        out: list[FileItem] = []
+        for att in atts:
+            out.append(
+                FileItem(
+                    name=self._unique_attachment_name(atts, att),
+                    size=int(getattr(att, "size", 0) or 0),
+                    modified=self._msg_mtime(msg),
+                    is_dir=False,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _unique_attachment_name(all_atts, target) -> str:
+        """Translate an attachment to its on-disk name, disambiguating
+        when two attachments sanitise to the same string. Appends
+        ``.1``, ``.2``, … to later occurrences in iteration order.
+
+        Without this, a message with two attachments both named
+        ``report (1).pdf`` would surface as a single visible file in
+        list_dir + open_read would silently return the first one's
+        content even when the user clicked the second — a textbook
+        silent-data-corruption bug for anyone saving multiple
+        attachments with similar names.
+        """
+        seen: dict[str, int] = {}
+        for att in all_atts:
+            base = _sanitize(getattr(att, "name", "")) or "attachment"
+            if base not in seen:
+                seen[base] = 0
+                resolved = base
+            else:
+                seen[base] += 1
+                root, _, ext = base.rpartition(".")
+                if root:
+                    resolved = f"{root}.{seen[base]}.{ext}"
+                else:
+                    resolved = f"{base}.{seen[base]}"
+            if att is target:
+                return resolved
+        # target wasn't in all_atts — fall back to the sanitised name.
+        return _sanitize(getattr(target, "name", "")) or "attachment"
+
+    def _fetch_message(self, folder, msg_seg: str, only: tuple[str, ...] | None = None):
+        """The message *msg_seg* names. ``only`` limits the fetched fields
+        (id/changekey always come along); None fetches every field, which
+        callers reading MIME content or moving the item need."""
+        msg_id, _ = _parse_msg_segment(msg_seg)
+        try:
+            query = folder.filter(id=msg_id)
+            if only is not None:
+                query = query.only(*only)
+            for msg in query:
+                return msg
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange fetch_message({msg_id}): {exc}") from exc
+        raise OSError(f"Exchange message {msg_id} not found")
+
+    @staticmethod
+    def _msg_id(msg) -> str:
+        return str(getattr(msg, "id", "") or getattr(msg, "item_id", ""))
+
+    @staticmethod
+    def _msg_mtime(msg) -> datetime:
+        for attr in ("datetime_received", "datetime_sent", "last_modified_time"):
+            value = getattr(msg, attr, None)
+            if isinstance(value, datetime):
+                return value
+        return datetime.fromtimestamp(0)
+
+    @staticmethod
+    def _estimate_size(msg) -> int:
+        # exchangelib exposes ``size`` on Message objects; fall back to
+        # 0 when the property isn't populated (Outlook draft messages
+        # sometimes ship without it).
+        try:
+            return int(getattr(msg, "size", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
+__all__ = [
+    "EXCHANGELIB_AVAILABLE",
+    "ExchangeSession",
+    "MAX_MESSAGE_BYTES",
+    "_ExchangeMessageWriter",
+    "_extract_text_body",
+    "_parse_msg_segment",
+    "_sanitize",
+    "_split_addresses",
+    "_split_path",
+]

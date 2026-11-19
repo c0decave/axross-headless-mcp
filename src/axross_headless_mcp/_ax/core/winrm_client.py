@@ -1,0 +1,1128 @@
+"""WinRM (PowerShell-Remoting) backend implementing FileBackend.
+
+Uses ``pywinrm`` to talk to a Windows host's WSMan endpoint
+(default HTTPS:5986, HTTP:5985). Every file operation is a small
+PowerShell snippet executed via Invoke-Command/Run; binary IO is
+base64-framed inside the script so the SOAP envelope stays text-clean.
+
+Why this matters: many production Windows hosts disable SMB inbound
+but keep WinRM open for management, especially in cloud / hardened
+environments. Without a backend here the user has to drop into a
+real PowerShell session.
+
+Security
+--------
+PowerShell is a code-execution channel. Every path / argument that
+crosses into a script is passed via base64-encoded UTF-8 so a
+filename like ``C:\\foo'; rm -rf C:\\``  cannot break out of its
+quoting context — the script decodes the base64 INSIDE the runner
+and only the decoded bytes ever land in a PowerShell variable.
+
+Not implemented in V1
+---------------------
+* checksums via Get-FileHash work but the implementation favours
+  the cheap-native path; we expose it as ``sha256:<hex>``.
+* ``readlink`` returns the path itself (Windows symlinks are rare
+  in user-land and need elevated PowerShell to follow reliably).
+* ``chmod`` is a no-op — Windows ACLs don't map to POSIX bits and
+  applying SetAcl from here would be a footgun.
+"""
+
+from __future__ import annotations
+
+import base64
+import errno
+import io
+import logging
+import re
+import secrets
+import ssl
+import threading
+from datetime import datetime, timezone
+from typing import IO, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from models.exec_result import ExecResult
+
+from core.answer_fields import as_size, as_str
+from core.backend import SessionLifecycle
+from core.i18n import tr
+from models.file_item import FileItem
+
+log = logging.getLogger(__name__)
+
+
+try:
+    import winrm  # type: ignore[import-not-found]
+    from winrm.exceptions import (  # type: ignore[import-not-found]
+        InvalidCredentialsError,
+        WinRMError,
+        WinRMTransportError,
+    )
+except ImportError:  # pragma: no cover — optional dep
+    winrm = None  # type: ignore[assignment]
+    InvalidCredentialsError = OSError  # type: ignore[assignment,misc]
+    WinRMError = OSError  # type: ignore[assignment,misc]
+    WinRMTransportError = OSError  # type: ignore[assignment,misc]
+
+# pywinrm's run_ps sends "powershell -encodedcommand <base64 of the
+# UTF-16LE script>" as the command line (winrm/__init__.py run_ps), which
+# the WinRM cmd shell caps at 8,190 characters.
+_PS_COMMAND_PREFIX = "powershell -encodedcommand "
+_COMMAND_LINE_LIMIT = 8190
+
+#: Put in front of every script of the file operations. pywinrm opens the
+#: shell with code page 437 (WINRS_CODEPAGE), so powershell.exe wrote its
+#: redirected stdout in the OEM code page, which was read as UTF-8:
+#: "Präsentation.pptx" came back as "Pr\ufffdsentation.pptx" and could not
+#: be opened, stat'ed or deleted. The setter can fail where there is no
+#: console; names travel base64-encoded as well (``Name64``) and output
+#: that is no UTF-8 is read as code page 437 (:func:`_decode_output`).
+_UTF8_OUTPUT = (
+    "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }; "
+    "$OutputEncoding = New-Object System.Text.UTF8Encoding $false\n"
+)
+
+#: The code page pywinrm opens its shell with (winrm.Protocol.open_shell).
+_SHELL_CODEPAGE = "cp437"
+
+
+def _decode_output(raw: bytes | None) -> str:
+    """powershell.exe's output as text: UTF-8 (what :data:`_UTF8_OUTPUT`
+    asks for), else the shell's code page 437 - never U+FFFD in a name."""
+    raw = raw or b""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode(_SHELL_CODEPAGE, errors="replace")
+    return text.lstrip("\ufeff")
+
+
+def _ps_command_length(script: str) -> int:
+    """Length of the command line ``_run_ps(script)`` sends (through
+    ``Session.run_ps``, with :data:`_UTF8_OUTPUT` in front)."""
+    utf16_len = len((_UTF8_OUTPUT + script).encode("utf_16_le"))
+    return len(_PS_COMMAND_PREFIX) + 4 * -(-utf16_len // 3)
+
+
+def _write_script(path_expr: str, data_b64: str, *, append: bool) -> str:
+    if append:
+        return f"""
+            $p = {path_expr}
+            $bytes = [Convert]::FromBase64String('{data_b64}')
+            $s = [IO.File]::Open($p, [IO.FileMode]::Append)
+            try {{ $s.Write($bytes, 0, $bytes.Length) }} finally {{ $s.Close() }}
+        """
+    return f"""
+            $p = {path_expr}
+            $bytes = [Convert]::FromBase64String('{data_b64}')
+            [IO.File]::WriteAllBytes($p, $bytes)
+        """
+
+
+def _max_chunk_bytes(path_expr: str) -> int:
+    """Largest payload whose append script still fits the command line.
+
+    Derived from the real template: every base64 character adds two
+    UTF-16LE bytes, i.e. 8/3 characters of the outer base64."""
+    room = (_COMMAND_LINE_LIMIT - len(_PS_COMMAND_PREFIX)) // 4 * 3 // 2
+    b64_chars = room - len(_UTF8_OUTPUT) - len(_write_script(path_expr, "", append=True))
+    return max(0, b64_chars // 4 * 3)
+
+
+# pywinrm refuses a read timeout that does not exceed the operation
+# timeout (its own default read timeout is 30 s): the server may hold a
+# request for the whole operation timeout before it answers.
+_READ_TIMEOUT_MARGIN_SEC = 10
+
+
+# Cap on a single read_file call. Larger files transit fine through
+# WinRM but the base64 round-trip eats RAM on both ends; 32 MiB is
+# generous for config / log files and small enough to not OOM the
+# remote PS host.
+MAX_READ_BYTES = 32 * 1024 * 1024
+MAX_WRITE_BYTES = 32 * 1024 * 1024
+
+#: A file larger than this is read in ranges of this size, one script
+#: each: no file is held whole in the remote PowerShell's memory (the read
+#: used to load all of it and then refuse anything above MAX_READ_BYTES),
+#: and a transfer moves (and can be cancelled) range by range.
+_READ_CHUNK = 2 * 1024 * 1024
+_LARGE = "AXROSS-LARGE"
+
+#: Every character that opens or closes a PowerShell single-quoted string:
+#: ' and the typographic quotes U+2018-U+201B (PowerShell's tokenizer
+#: treats them alike, so a doubled ' alone let ’ end the string).
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+_PS_QUOTE_RE = re.compile(f"([{_PS_SINGLE_QUOTES}])")
+
+
+def _ps_single_quoted(value: str) -> str:
+    """*value* as the inside of a PowerShell single-quoted string."""
+    return _PS_QUOTE_RE.sub(r"\1\1", value)
+
+
+class _ScriptFailed(OSError):
+    """The script ran and ended with an error (not the transport)."""
+
+
+def _causes(exc: BaseException):
+    """*exc* and what it wraps: ``__cause__``, ``__context__``, urllib3's
+    ``reason`` and exception arguments (requests wraps a MaxRetryError
+    that way), breadth first."""
+    seen: set[int] = set()
+    todo = [exc]
+    while todo and len(seen) < 32:
+        cur = todo.pop(0)
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        yield cur
+        nxt = [cur.__cause__, cur.__context__, getattr(cur, "reason", None)]
+        nxt += [a for a in getattr(cur, "args", ()) if isinstance(a, BaseException)]
+        todo += [n for n in nxt if isinstance(n, BaseException)]
+
+
+def _transport_error(exc: BaseException, host: str, endpoint: str) -> OSError:
+    """An OSError for a failed WinRM request that core.user_errors can
+    explain: pywinrm / requests texts ("HTTPSConnectionPool(...): Max
+    retries exceeded ... NewConnectionError(<urllib3...>)") said nothing a
+    user could act on, and the cause was cut off."""
+    chain = list(_causes(exc))
+    for link in chain:
+        if isinstance(link, ssl.SSLCertVerificationError):
+            return _own_words(
+                tr("The certificate of {host} could not be verified ({reason}). A WinRM "
+                   "HTTPS listener often has a self-signed certificate: turn off the "
+                   "certificate check in the profile only if you trust this network."
+                   ).format(host=host, reason=link.verify_message or link.reason or link)
+            )
+    for link in chain:
+        if isinstance(link, ssl.SSLError) and endpoint.startswith("https:") and any(
+            t in str(link).upper()
+            for t in ("WRONG_VERSION_NUMBER", "RECORD_LAYER_FAILURE", "UNKNOWN_PROTOCOL",
+                      "PACKET_LENGTH_TOO_LONG", "HTTP_REQUEST")
+        ):
+            return _own_words(
+                tr("{host} does not answer HTTPS on this port. WinRM listens with HTTP on "
+                   "port 5985 and with HTTPS on 5986: check the port and the HTTPS "
+                   "setting of the profile.").format(host=host)
+            )
+    names = {cls.__name__ for link in chain for cls in type(link).__mro__}
+    if "AuthenticationError" in names:
+        err = OSError(f"WinRM login to {host} refused: {exc}")
+        err.__cause__ = next(
+            link for link in chain if "AuthenticationError" in
+            {cls.__name__ for cls in type(link).__mro__}
+        )
+        return err
+    root = next(
+        (link for link in chain
+         if isinstance(link, OSError) and getattr(link, "errno", None) is not None),
+        None,
+    ) or next(
+        (link for link in chain
+         if {cls.__name__ for cls in type(link).__mro__} & {"Timeout", "TimeoutError"}),
+        None,
+    )
+    err = OSError(f"WinRM transport error talking to {host}: {exc}")
+    err.__cause__ = root if root is not None else exc
+    return err
+
+
+def _own_words(text: str) -> OSError:
+    """An OSError whose text is the whole message (no cause to explain)."""
+    err = OSError(text)
+    err.__suppress_context__ = True
+    return err
+
+
+def _endpoint_host(host: str) -> str:
+    """*host* for a URL: an IPv6 literal in brackets."""
+    bare = host.strip("[]")
+    return f"[{bare}]" if ":" in bare else bare
+
+
+# --------------------------------------------------------------------------
+# PowerShell quoting helper — base64 safety
+# --------------------------------------------------------------------------
+
+
+def _ps_decode(b64: str) -> str:
+    """Inline PS expression that decodes a base64 string to UTF-8 text.
+
+    Used inside script bodies so an attacker-controlled path can never
+    inject quoting / command-separator characters into the running
+    PowerShell — the bytes only ever exist as a variable assignment
+    once the snippet is on the remote side.
+    """
+    return f"[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))"
+
+
+# What the stat script answers for Get-Item's ItemNotFoundException; JSON
+# never reads like this.
+_NOT_FOUND = "AXROSS-NOT-FOUND"
+_DESTINATION_TAKEN = "AXROSS-DESTINATION-EXISTS"
+_NOT_A_DIRECTORY = "AXROSS-NOT-A-DIRECTORY"
+
+#: The base64 of an entry's name in UTF-8, for the listing and stat rows:
+#: ASCII, whatever code page the output is written in.
+_NAME64 = "[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes({}.Name))"
+
+#: PowerShell's English message for a missing path (ItemNotFoundException),
+#: for the scripts that cannot tell it apart themselves.
+_PATH_NOT_FOUND_TEXT = ("Cannot find path", "because it does not exist")
+
+
+def _b64(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+# --------------------------------------------------------------------------
+# WinRM session
+# --------------------------------------------------------------------------
+
+
+class WinRMSession(SessionLifecycle):
+    """PowerShell-Remoting backend (FileBackend protocol).
+
+    Construct one per (host, credentials) tuple. The pywinrm
+    Session object is reused across all operations.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        username: str = "",
+        password: str = "",
+        *,
+        port: int = 5986,
+        use_https: bool | None = None,
+        transport: str = "ntlm",
+        verify_ssl: bool = True,
+        operation_timeout_sec: int = 60,
+        proxy_type: str = "none",
+        proxy_host: str = "",
+        proxy_port: int = 0,
+        proxy_username: str = "",
+        proxy_password: str = "",
+    ):
+        if winrm is None:
+            raise ImportError(
+                "WinRM support requires pywinrm. Install with: pip install axross[winrm]"
+            )
+        if use_https is None:
+            # Windows' WinRM listeners: HTTP on 5985, HTTPS on 5986. A TLS
+            # handshake against the HTTP listener only failed.
+            use_https = int(port) != 5985
+        scheme = "https" if use_https else "http"
+        self._host = host
+        self._username = username
+        self._endpoint = f"{scheme}://{_endpoint_host(host)}:{port}/wsman"
+        # pywinrm's Protocol closes its requests session after every
+        # command and keeps one message-encryption context: two threads on
+        # one session broke each other's calls. One call at a time.
+        self._lock = threading.RLock()
+        from core.proxy import build_requests_proxies
+
+        proxies = build_requests_proxies(
+            proxy_type,
+            proxy_host,
+            int(proxy_port or 0),
+            proxy_username,
+            proxy_password,
+        )
+        try:
+            self._session = winrm.Session(  # type: ignore[union-attr]
+                self._endpoint,
+                auth=(username, password),
+                transport=transport,
+                server_cert_validation=("validate" if verify_ssl else "ignore"),
+                operation_timeout_sec=operation_timeout_sec,
+                read_timeout_sec=int(operation_timeout_sec) + _READ_TIMEOUT_MARGIN_SEC,
+                # pywinrm's own proxy setting covers the requests it sends
+                # while building its session (the encryption setup);
+                # None: no proxy from the environment either.
+                proxy=proxies.get(scheme) or None,
+            )
+        except (
+            InvalidCredentialsError,
+            WinRMTransportError,
+            WinRMError,
+            ValueError,
+            OSError,
+        ) as exc:
+            raise OSError(f"WinRM connect to {host}: {exc}") from exc
+        self._pin_endpoint(self._session, self._endpoint)
+        self._apply_session_overrides(self._session, proxies)
+        # Endpoint goes to INFO (operational); the username is PII —
+        # keep it at DEBUG so it doesn't ship to centralised logs by
+        # default. Anyone debugging an auth issue can flip the level.
+        log.info("WinRM session opened to %s", self._endpoint)
+        log.debug("WinRM session user: %s", username)
+
+    @staticmethod
+    def _pin_endpoint(session, endpoint: str) -> None:
+        """The URL every request goes to, as built here. pywinrm's own
+        URL parser (Session._build_url) turned an IPv6 literal into the
+        host "https": its result is replaced before the first request."""
+        try:
+            session.url = endpoint
+            session.protocol.endpoint = endpoint
+            session.protocol.transport.endpoint = endpoint
+        except AttributeError:
+            log.debug("WinRM: pywinrm layout without a transport endpoint")
+
+    @staticmethod
+    def _apply_session_overrides(session, proxies: dict | None = None) -> None:
+        """Override the :class:`requests.Session` pywinrm sends with:
+        uniform ``User-Agent`` (per docs/OPSEC.md #4), no environment
+        proxies, and the per-profile proxy dict if any.
+
+        pywinrm builds that session lazily, on its first message - right
+        after construction there is none yet. So the overrides wrap
+        ``Session → Protocol → Transport.build_session`` and run every
+        time it hands out its session.
+
+        If a proxy was configured, this is fail-closed: an unexpected
+        pywinrm layout must not continue with direct WinRM traffic.
+        """
+        try:
+            transport = session.protocol.transport
+            build = transport.build_session
+        except AttributeError as exc:
+            if proxies:
+                raise OSError(
+                    "WinRM proxy configured but pywinrm's requests "
+                    "session hook is unavailable; refusing direct traffic."
+                ) from exc
+            return
+
+        def build_with_overrides():
+            req_session = build()
+            WinRMSession._override_requests_session(req_session, proxies)
+            return req_session
+
+        transport.build_session = build_with_overrides
+
+    @staticmethod
+    def _override_requests_session(req_session, proxies: dict | None) -> None:
+        from core.client_identity import HTTP_USER_AGENT
+        from core.proxy import lock_requests_session_to_profile_proxy
+
+        if req_session is None or not hasattr(req_session, "headers"):
+            if proxies:
+                raise OSError(
+                    "WinRM proxy configured but pywinrm did not expose a "
+                    "requests-like session; refusing direct traffic."
+                )
+            return
+        req_session.headers["User-Agent"] = HTTP_USER_AGENT
+        try:
+            lock_requests_session_to_profile_proxy(req_session, proxies)
+        except Exception as exc:  # noqa: BLE001
+            if proxies:
+                raise OSError(
+                    "WinRM proxy configured but could not attach it to "
+                    "pywinrm's requests session; refusing direct traffic."
+                ) from exc
+            raise
+
+    # ------------------------------------------------------------------
+    # FileBackend protocol — required surface
+    # ------------------------------------------------------------------
+    @property
+    def name(self) -> str:
+        return f"{self._username}@{self._host} (WinRM)"
+
+    def separator(self) -> str:
+        return "\\"
+
+    def join(self, *parts: str) -> str:
+        if not parts:
+            return ""
+        # Normalise: forward-slashes → backslashes; drop empty
+        # segments so join("C:\\", "", "x") == "C:\\x".
+        cleaned: list[str] = []
+        for p in parts:
+            s = p.replace("/", "\\")
+            if s.endswith("\\") and len(s) > 1:
+                s = s.rstrip("\\")
+            if s:
+                cleaned.append(s)
+        if not cleaned:
+            return ""
+        first = cleaned[0]
+        rest = "\\".join(cleaned[1:])
+        if not rest:
+            return first
+        return f"{first}\\{rest}" if not first.endswith("\\") else first + rest
+
+    def normalize(self, path: str) -> str:
+        return path.replace("/", "\\") if path else path
+
+    def parent(self, path: str) -> str:
+        norm = self.normalize(path)
+        # ``C:\\`` and ``\\\\server\\share`` are roots — parent of root is itself.
+        if len(norm) <= 3 and norm.endswith(":\\"):
+            return norm
+        norm = norm.rstrip("\\")
+        if "\\" not in norm:
+            return norm
+        return norm.rsplit("\\", 1)[0] or "\\"
+
+    def home(self) -> str:
+        """$HOME, asked from PowerShell; C:\\Users\\<user> when the answer
+        cannot be read. A request that failed (refused, login, TLS) raises:
+        pywinrm connects on the first request, and this is it - the
+        fallback made Test Connection succeed against any host."""
+        try:
+            out = self._run_ps(
+                "[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$HOME))"
+            )
+            home = base64.b64decode(out.strip(), validate=True).decode("utf-8")
+            if home:
+                return home
+        except (_ScriptFailed, ValueError) as exc:  # binascii.Error, UnicodeDecodeError
+            log.debug("WinRM home(): falling back (%s)", exc)
+        user = self._username.split("\\")[-1].split("@")[0] if self._username else ""
+        return f"C:\\Users\\{user}" if user else "C:\\"
+
+    # ------------------------------------------------------------------
+    # Listing / stat
+    # ------------------------------------------------------------------
+    def list_dir(self, path: str) -> list[FileItem]:
+        path_b64 = _b64(self.normalize(path))
+        script = f"""
+            $p = {_ps_decode(path_b64)}
+            $dir = $null
+            try {{ $dir = Get-Item -Force -LiteralPath $p -ErrorAction Stop }}
+            catch [System.Management.Automation.ItemNotFoundException] {{ }}
+            if ($null -eq $dir) {{ Write-Output '{_NOT_FOUND}'; return }}
+            if (-not $dir.PSIsContainer) {{ Write-Output '{_NOT_A_DIRECTORY}'; return }}
+            $items = Get-ChildItem -Force -LiteralPath $p -ErrorAction Stop
+            $items | ForEach-Object {{
+              [PSCustomObject]@{{
+                Name = $_.Name
+                Name64 = {_NAME64.format("$_")}
+                IsDir = $_.PSIsContainer
+                Size = if ($_.PSIsContainer) {{ 0 }} else {{ $_.Length }}
+                Mtime = $_.LastWriteTimeUtc.ToString('o')
+                IsLink = ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+                IsHidden = ($_.Attributes -band [IO.FileAttributes]::Hidden) -ne 0
+              }}
+            }} | ConvertTo-Json -Compress -Depth 2
+        """
+        out = self._run_ps_at(path, script)
+        if out.strip() == _NOT_FOUND:
+            raise FileNotFoundError(errno.ENOENT, "WinRM list_dir: not found", path)
+        if out.strip() == _NOT_A_DIRECTORY:
+            # Get-ChildItem of a file answers the file itself: it was
+            # listed as a folder holding itself.
+            raise NotADirectoryError(errno.ENOTDIR, "WinRM list_dir: not a folder", path)
+        items = [self._parse_listing_row(row) for row in self._parse_json_array(out)]
+        return [item for item in items if item.name]  # a row without a name names nothing
+
+    def stat(self, path: str) -> FileItem:
+        """The entry at *path*. FileNotFoundError only for Get-Item's
+        ItemNotFoundException; any other failure ends the script with an
+        error, which _run_ps raises as OSError."""
+        path_b64 = _b64(self.normalize(path))
+        script = f"""
+            $p = {_ps_decode(path_b64)}
+            $item = $null
+            try {{ $item = Get-Item -Force -LiteralPath $p -ErrorAction Stop }}
+            catch [System.Management.Automation.ItemNotFoundException] {{ }}
+            if ($null -eq $item) {{ Write-Output '{_NOT_FOUND}' }} else {{
+            [PSCustomObject]@{{
+              Name = $item.Name
+              Name64 = {_NAME64.format("$item")}
+              IsDir = $item.PSIsContainer
+              Size = if ($item.PSIsContainer) {{ 0 }} else {{ $item.Length }}
+              Mtime = $item.LastWriteTimeUtc.ToString('o')
+              IsLink = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+              IsHidden = ($item.Attributes -band [IO.FileAttributes]::Hidden) -ne 0
+            }} | ConvertTo-Json -Compress -Depth 2
+            }}
+        """
+        out = self._run_ps(script)
+        if out.strip() == _NOT_FOUND:
+            raise FileNotFoundError(errno.ENOENT, f"WinRM stat({path}): not found", path)
+        rows = self._parse_json_array(out)
+        if not rows:
+            raise OSError(f"WinRM stat({path}) returned no data")
+        return self._parse_listing_row(rows[0])
+
+    def is_dir(self, path: str) -> bool:
+        """False only for a missing path; a failed call is an OSError
+        (transfer_manager recurses on True)."""
+        try:
+            return self.stat(path).is_dir
+        except FileNotFoundError:
+            return False
+
+    def exists(self, path: str) -> bool:
+        """False only for Get-Item's ItemNotFoundException. A transport
+        error, a refused permission (Test-Path said $false to that too)
+        or an answer that is neither YES nor NO is an OSError:
+        server_side_copy(overwrite=False) takes False as its go-ahead."""
+        path_b64 = _b64(self.normalize(path))
+        script = (
+            f"try {{ $null = Get-Item -Force -LiteralPath {_ps_decode(path_b64)} "
+            f"-ErrorAction Stop; Write-Output 'YES' }} "
+            f"catch [System.Management.Automation.ItemNotFoundException] {{ Write-Output 'NO' }}"
+        )
+        out = self._run_ps(script).strip()
+        if out not in ("YES", "NO"):
+            raise OSError(f"WinRM exists({path}): unexpected answer {out[:200]!r}")
+        return out == "YES"
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
+    def mkdir(self, path: str) -> None:
+        path_b64 = _b64(self.normalize(path))
+        script = f"New-Item -ItemType Directory -Force -Path {_ps_decode(path_b64)} | Out-Null"
+        self._run_ps(script)
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        path_b64 = _b64(self.normalize(path))
+        flag = "-Recurse" if recursive else ""
+        script = (
+            f"try {{ Remove-Item -Force {flag} -LiteralPath {_ps_decode(path_b64)} "
+            f"-ErrorAction Stop }} "
+            f"catch [System.Management.Automation.ItemNotFoundException] "
+            f"{{ Write-Output '{_NOT_FOUND}' }}"
+        )
+        if self._run_ps_at(path, script).strip() == _NOT_FOUND:
+            raise FileNotFoundError(errno.ENOENT, "WinRM remove: not found", path)
+
+    def rename(self, src: str, dst: str) -> None:
+        """Move-Item, refused when *dst* exists (FileExistsError).
+
+        The caps say ``rename_overwrites=False``, but ``Move-Item -Force``
+        replaced an existing file - and onto a folder Move-Item moves the
+        source INTO it. The script looks first (Get-Item, so a hidden
+        entry or a dangling link counts). Only *dst* that is the source
+        itself under another case (Windows names are case-insensitive)
+        goes on. -Force stays: without it a hidden or read-only source
+        cannot be moved at all."""
+        src_b64 = _b64(self.normalize(src))
+        dst_b64 = _b64(self.normalize(dst))
+        script = f"""
+            $s = {_ps_decode(src_b64)}
+            $d = {_ps_decode(dst_b64)}
+            $taken = $null
+            try {{ $taken = Get-Item -Force -LiteralPath $d -ErrorAction Stop }}
+            catch [System.Management.Automation.ItemNotFoundException] {{ }}
+            $item = Get-Item -Force -LiteralPath $s -ErrorAction Stop
+            if ($null -ne $taken -and $taken.FullName -ne $item.FullName) {{
+              Write-Output '{_DESTINATION_TAKEN}'
+            }} else {{
+              Move-Item -Force -LiteralPath $s -Destination $d -ErrorAction Stop
+            }}
+        """
+        out = self._run_ps(script)
+        if out.strip() == _DESTINATION_TAKEN:
+            raise FileExistsError(
+                errno.EEXIST, f"WinRM rename {src} -> {dst}: the destination exists", dst
+            )
+
+    def chmod(self, path: str, mode: int) -> None:
+        # Windows ACLs don't map to POSIX bits cleanly; refuse rather
+        # than silently no-op so callers know.
+        raise OSError("chmod not supported on WinRM backend")
+
+    def readlink(self, path: str) -> str:
+        # Reading a NTFS reparse point requires SeBackupPrivilege in
+        # the runner; rather than half-implement it, we degrade to
+        # "the path itself" when stat says it isn't a link, and
+        # OSError when it is. Saves callers from following bogus data.
+        item = self.stat(path)
+        if not item.is_link:
+            raise OSError(f"{path}: not a symlink")
+        raise OSError("readlink not implemented for WinRM")
+
+    # ------------------------------------------------------------------
+    # IO
+    # ------------------------------------------------------------------
+    def open_read(self, path: str) -> IO[bytes]:
+        """A file up to :data:`_READ_CHUNK` in one call; a larger one is
+        read in ranges as the caller reads (progress and Cancel work, and
+        no size limit is left)."""
+        path_b64 = _b64(self.normalize(path))
+        script = f"""
+            $p = {_ps_decode(path_b64)}
+            $item = $null
+            try {{ $item = Get-Item -Force -LiteralPath $p -ErrorAction Stop }}
+            catch [System.Management.Automation.ItemNotFoundException] {{ }}
+            if ($null -eq $item) {{ Write-Output '{_NOT_FOUND}'; return }}
+            if (-not $item.PSIsContainer -and $item.Length -gt {_READ_CHUNK}) {{
+              Write-Output "{_LARGE} $($item.Length)"; return
+            }}
+            $bytes = [IO.File]::ReadAllBytes($p)
+            [Convert]::ToBase64String($bytes)
+        """
+        out = self._run_ps_at(path, script).strip()
+        if out == _NOT_FOUND:
+            raise FileNotFoundError(errno.ENOENT, "WinRM open_read: not found", path)
+        if out.startswith(_LARGE + " "):
+            return io.BufferedReader(_RangeReader(self, path), buffer_size=_READ_CHUNK)
+        try:
+            data = base64.b64decode(out, validate=True)
+        except Exception as exc:
+            raise OSError(f"WinRM open_read({path}): bad base64: {exc}") from exc
+        return io.BytesIO(data)
+
+    def _read_range(self, path: str, offset: int, size: int) -> bytes:
+        """Up to *size* bytes of *path* from *offset*; b"" at the end."""
+        script = f"""
+            $p = {_ps_decode(_b64(self.normalize(path)))}
+            $fs = [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                                  [IO.FileShare]::ReadWrite)
+            try {{
+              $null = $fs.Seek({int(offset)}, [IO.SeekOrigin]::Begin)
+              $buf = New-Object byte[] {int(size)}
+              $got = 0
+              while ($got -lt {int(size)}) {{
+                $n = $fs.Read($buf, $got, {int(size)} - $got)
+                if ($n -le 0) {{ break }}
+                $got += $n
+              }}
+              [Convert]::ToBase64String($buf, 0, $got)
+            }} finally {{ $fs.Close() }}
+        """
+        out = self._run_ps_at(path, script).strip()
+        try:
+            data = base64.b64decode(out, validate=True)
+        except Exception as exc:
+            raise OSError(f"WinRM read {path}: bad base64: {exc}") from exc
+        if len(data) > size:
+            raise OSError(f"WinRM read {path}: {len(data)} bytes for a range of {size}")
+        return data
+
+    def open_write(self, path: str, append: bool = False) -> IO[bytes]:
+        # Buffer in memory; flush on close. Append semantics are rare
+        # in the GUI flow; if the caller asks, we fetch the existing
+        # bytes first so the file ends up as old + new.
+        backend = self
+        buffer = io.BytesIO()
+        if append:
+            try:
+                with self.open_read(path) as fh:
+                    buffer.write(fh.read())
+            except OSError as exc:
+                # A missing file appends from empty; one that exists but
+                # could not be read (too large, locked, denied) would be
+                # overwritten by the new bytes alone.
+                if self.exists(path):
+                    raise OSError(
+                        f"WinRM append: refusing to overwrite {path}; could not "
+                        f"read existing content ({exc})"
+                    ) from exc
+
+        class _WinRMWriteHandle(io.BytesIO):
+            def close(self_inner) -> None:  # noqa: N805
+                if self_inner.closed:
+                    return
+                try:
+                    data = self_inner.getvalue()
+                    if len(data) > MAX_WRITE_BYTES:
+                        raise OSError(
+                            f"WinRM open_write({path}): payload too large "
+                            f"({len(data)} > {MAX_WRITE_BYTES})"
+                        )
+                    backend._write_bytes(path, data)
+                finally:
+                    super().close()
+
+            def discard(self_inner) -> None:  # noqa: N805
+                if not self_inner.closed:
+                    super().close()
+
+            def __exit__(self_inner, exc_type, exc_val, exc_tb):  # noqa: N805
+                if exc_type is not None:
+                    self_inner.discard()
+                else:
+                    self_inner.close()
+                return False
+
+        h = _WinRMWriteHandle(buffer.getvalue())
+        h.seek(0, io.SEEK_END)
+        return h
+
+    def _write_bytes(self, path: str, data: bytes) -> None:
+        target = self.normalize(path)
+        target_expr = _ps_decode(_b64(target))
+        # Two-stage: decode the base64 inside PS, then ReadAllBytes-style
+        # write. Path goes through _ps_decode for the same anti-injection
+        # reason as the other ops.
+        script = _write_script(target_expr, base64.b64encode(data).decode("ascii"), append=False)
+        if _ps_command_length(script) <= _COMMAND_LINE_LIMIT:
+            self._run_ps(script)
+            return
+        # Too large for one command line: append chunks to a part file
+        # next to the target, then move it over the target - a failed
+        # chunk never leaves a truncated file under the real name.
+        part = f"{target}.axross-part-{secrets.token_hex(4)}"
+        part_expr = _ps_decode(_b64(part))
+        chunk = _max_chunk_bytes(part_expr)
+        if chunk <= 0:
+            raise OSError(f"WinRM write {path}: path too long for a command line")
+        try:
+            for offset in range(0, len(data), chunk):
+                piece = base64.b64encode(data[offset : offset + chunk]).decode("ascii")
+                self._run_ps(_write_script(part_expr, piece, append=offset > 0))
+            self._run_ps(
+                f"Move-Item -Force -LiteralPath {part_expr} "
+                f"-Destination {target_expr} -ErrorAction Stop"
+            )
+        except OSError:
+            try:
+                self._run_ps(
+                    f"Remove-Item -Force -LiteralPath {part_expr} -ErrorAction SilentlyContinue"
+                )
+            except OSError:
+                log.warning("WinRM write %s: could not remove part file %s", path, part)
+            raise
+
+    # ------------------------------------------------------------------
+    # Server-side helpers
+    # ------------------------------------------------------------------
+    def copy(self, src: str, dst: str) -> None:
+        """Copy-Item; a folder with all it holds (-Recurse).
+
+        Without -Recurse, Copy-Item copied a folder as an empty folder and
+        succeeded - an MCP copy, a script or a WebDAV COPY lost the whole
+        content. A file replaces a file at *dst* (as the other backends'
+        copy does); a folder at *dst*, or any *dst* for a folder, is
+        FileExistsError: Copy-Item would put the copy INTO the folder or
+        merge the two. server_side_copy(overwrite=True) goes on with its
+        guarded stream copy then. -Force: hidden and read-only entries."""
+        src_b64 = _b64(self.normalize(src))
+        dst_b64 = _b64(self.normalize(dst))
+        script = f"""
+            $s = {_ps_decode(src_b64)}
+            $d = {_ps_decode(dst_b64)}
+            $item = $null
+            try {{ $item = Get-Item -Force -LiteralPath $s -ErrorAction Stop }}
+            catch [System.Management.Automation.ItemNotFoundException] {{ }}
+            if ($null -eq $item) {{ Write-Output '{_NOT_FOUND}'; return }}
+            $taken = $null
+            try {{ $taken = Get-Item -Force -LiteralPath $d -ErrorAction Stop }}
+            catch [System.Management.Automation.ItemNotFoundException] {{ }}
+            if ($null -ne $taken -and ($item.PSIsContainer -or $taken.PSIsContainer)) {{
+              Write-Output '{_DESTINATION_TAKEN}'
+            }} elseif ($item.PSIsContainer) {{
+              Copy-Item -Recurse -Force -LiteralPath $s -Destination $d -ErrorAction Stop
+            }} else {{
+              Copy-Item -Force -LiteralPath $s -Destination $d -ErrorAction Stop
+            }}
+        """
+        out = self._run_ps_at(src, script).strip()
+        if out == _NOT_FOUND:
+            raise FileNotFoundError(errno.ENOENT, "WinRM copy: the source is not there", src)
+        if out == _DESTINATION_TAKEN:
+            raise FileExistsError(
+                errno.EEXIST, f"WinRM copy {src} -> {dst}: the destination exists", dst
+            )
+
+    def checksum(self, path: str, algorithm: str = "sha256") -> str:
+        algo = (algorithm or "sha256").upper()
+        if algo not in ("SHA1", "SHA256", "SHA384", "SHA512", "MD5"):
+            return ""
+        path_b64 = _b64(self.normalize(path))
+        script = f"(Get-FileHash -Algorithm {algo} -LiteralPath {_ps_decode(path_b64)}).Hash"
+        try:
+            out = self._run_ps(script).strip().lower()
+        except OSError:
+            return ""
+        if not out:
+            return ""
+        return f"{algo.lower()}:{out}"
+
+    def disk_usage(self, path: str) -> tuple[int, int, int]:
+        # Drive-letter lookup via CIM_LogicalDisk. Falls back to
+        # (0,0,0) on UNC paths or odd locations — same contract as
+        # other backends.
+        norm = self.normalize(path)
+        if len(norm) < 2 or norm[1] != ":":
+            return (0, 0, 0)
+        drive = norm[0].upper()
+        if not (len(drive) == 1 and drive.isascii() and drive.isalpha()):
+            return (0, 0, 0)
+        script = (
+            f"$d = Get-PSDrive -Name '{drive}' -ErrorAction Stop;"
+            f' Write-Output ("$($d.Used) $($d.Free)")'
+        )
+        try:
+            out = self._run_ps(script).strip()
+            used_str, free_str = out.split(None, 1)
+            used = int(used_str)
+            free = int(free_str)
+            return (used + free, used, free)
+        except (OSError, ValueError):
+            return (0, 0, 0)
+
+    def list_versions(self, path: str) -> list:
+        # Windows does have Volume Shadow Copy / Previous Versions
+        # but exposing them programmatically requires admin VSS calls
+        # — out of scope for V1.
+        return []
+
+    def open_version_read(self, path: str, version_id: str):
+        raise OSError("WinRM backend has no version history")
+
+    # ------------------------------------------------------------------
+    # WinRM-specific verbs (API_GAPS round 2)
+    # ------------------------------------------------------------------
+
+    def ps(
+        self, script: str, *, stdout_cap: int = 1024 * 1024, stderr_cap: int = 64 * 1024
+    ) -> "ExecResult":
+        """Public PowerShell runner. Returns
+        :class:`models.exec_result.ExecResult` (rc/stdout/stderr/
+        truncated_*) — same shape as ``axross.exec()`` for SSH.
+
+        ``script`` is the PS body (not a one-liner — multi-line is
+        supported and goes through ``run_ps`` directly). Caps clip
+        each stream after the byte count; the corresponding
+        ``truncated_*`` flag is set when a clip happens.
+
+        Raises ``OSError`` on transport failure; non-zero remote
+        rc surfaces as ``ok=False`` on the result (use ``.check()``
+        to raise instead)."""
+        from models.exec_result import ExecResult
+
+        result = self._run_locked(script)
+        out = result.std_out or b""
+        err = result.std_err or b""
+        return ExecResult(
+            returncode=int(result.status_code),
+            stdout=bytes(out[:stdout_cap]),
+            stderr=bytes(err[:stderr_cap]),
+            truncated_stdout=len(out) > stdout_cap,
+            truncated_stderr=len(err) > stderr_cap,
+        )
+
+    def exec(
+        self,
+        cmd: str,
+        *,
+        timeout: float | None = 30.0,
+        stdin: bytes | None = None,
+        stdout_cap: int = 1024 * 1024,
+        stderr_cap: int = 64 * 1024,
+        env: dict[str, str] | None = None,
+    ) -> "ExecResult":
+        """Run *cmd* in PowerShell - same shape as ``SSHSession.exec``.
+
+        WinRM has no stdin channel for a command: *stdin* is refused (put
+        the data into the script). *env* becomes ``$env:`` assignments in
+        front of the command. The time limit is the session's operation
+        timeout.
+        """
+        from core.exec_util import checked_env
+
+        if stdin is not None:
+            raise OSError("WinRM exec: stdin is not supported; put the data into the script")
+        prefix = "".join(
+            f"$env:{k} = '{_ps_single_quoted(str(v))}'; "
+            for k, v in checked_env(env, "WinRM exec").items()
+        )
+        return self.ps(prefix + cmd, stdout_cap=stdout_cap, stderr_cap=stderr_cap)
+
+    def cim_query(self, wql: str, *, namespace: str = "root\\cimv2") -> list[dict]:
+        """Run a WQL (WMI Query Language) query via PowerShell's
+        ``Get-CimInstance -Query`` and return the result rows as
+        dicts (one row per object).
+
+        Refuses single-quote characters in ``wql`` because the query
+        is interpolated into a PowerShell single-quoted string and
+        a tainted ``'`` would close the string + run arbitrary PS
+        cmdlets. Use parameterised values via the WMI metadata
+        catalog if you need user input in the query.
+
+        Default namespace is ``root\\cimv2`` (the standard WMI
+        namespace); override for ``root\\StandardCimv2`` etc.
+        """
+        if any(q in wql for q in _PS_SINGLE_QUOTES):
+            raise ValueError(
+                "WinRM cim_query: single-quote in WQL is refused "
+                "(would break out of the PS interpolated string). "
+                "Filter clauses with %s placeholders are a follow-up."
+            )
+        if "\r" in wql or "\n" in wql:
+            raise ValueError("WinRM cim_query: WQL must not contain CR/LF")
+        if any(c in namespace for c in _PS_SINGLE_QUOTES + "\r\n"):
+            raise ValueError("WinRM cim_query: invalid characters in namespace")
+        # ``ConvertTo-Json -Compress -Depth 4`` so we get parseable
+        # output for any nested object. -Depth 4 is enough for the
+        # vast majority of CIM classes.
+        script = (
+            f"$r = Get-CimInstance -Namespace '{namespace}' -Query '{wql}' "
+            f"-ErrorAction Stop | ConvertTo-Json -Compress -Depth 4; "
+            f'if ($r -is [string]) {{ $r }} else {{ $r -join "" }}'
+        )
+        out = self._run_ps(script)
+        if not out.strip():
+            return []
+        import json as _json
+
+        try:
+            data = _json.loads(out)
+        except (ValueError, RecursionError) as exc:  # see _parse_json_array
+            raise OSError(f"WinRM cim_query: malformed JSON from server: {out[:200]!r}") from exc
+        # ConvertTo-Json returns a single object for 1 row, list for N.
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return data
+        return []
+
+    # ------------------------------------------------------------------
+    # PowerShell runner
+    # ------------------------------------------------------------------
+    def _run_ps_at(self, path: str, script: str) -> str:
+        """:meth:`_run_ps` for a script about *path*: FileNotFoundError when
+        it failed because PowerShell found no such path. Only the English
+        message says so; the scripts catch ItemNotFoundException
+        themselves where they can and answer a marker."""
+        try:
+            return self._run_ps(script)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            if all(part in str(exc) for part in _PATH_NOT_FOUND_TEXT):
+                raise FileNotFoundError(errno.ENOENT, str(exc), path) from exc
+            raise
+
+    def _run_locked(self, script: str):
+        """pywinrm's run_ps under the session's lock; a failed request is
+        an OSError that says why (:func:`_transport_error`)."""
+        lock = self.__dict__.setdefault("_lock", threading.RLock())  # __new__ sessions
+        with lock:
+            try:
+                return self._session.run_ps(script)
+            except Exception as exc:  # noqa: BLE001 — pywinrm raises various
+                # Not "from": _transport_error set the cause it chose.
+                raise _transport_error(
+                    exc, getattr(self, "_host", "?"), getattr(self, "_endpoint", "")
+                )  # noqa: B904
+
+    def _run_ps(self, script: str) -> str:
+        """Run a file-operation script; its stdout as text (UTF-8 asked
+        for, see :data:`_UTF8_OUTPUT`). A failed script is an OSError."""
+        result = self._run_locked(_UTF8_OUTPUT + script)
+        if result.status_code != 0:
+            stderr = _decode_output(result.std_err).strip()
+            stdout = _decode_output(result.std_out).strip()
+            raise _ScriptFailed(
+                f"WinRM ps rc={result.status_code}: {stderr or stdout or '<no output>'}"
+            )
+        return _decode_output(result.std_out)
+
+    # ------------------------------------------------------------------
+    # Parsers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_json_array(raw: str) -> list[dict]:
+        """ConvertTo-Json on a single object yields an object, not an
+        array. Normalise both shapes to a list."""
+        import json
+
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except (ValueError, RecursionError) as exc:
+            # ValueError: JSONDecodeError or an integer above the digit
+            # limit; RecursionError: nesting deeper than the C stack.
+            raise OSError(f"WinRM: malformed JSON: {exc}") from exc
+        if isinstance(data, list):
+            # Rows are objects; anything else in the array names nothing.
+            return [row for row in data if isinstance(row, dict)]
+        if isinstance(data, dict):
+            return [data]
+        raise OSError(f"WinRM: unexpected JSON shape: {type(data).__name__}")
+
+    @staticmethod
+    def _parse_listing_row(row: dict) -> FileItem:
+        mtime_iso = row.get("Mtime") or ""
+        try:
+            # LastWriteTimeUtc.ToString('o'): seven fraction digits and a
+            # "Z" that means UTC. Python 3.10 accepts neither, and a naive
+            # value would be read as local time by FileItem.
+            text = mtime_iso[:-1] if mtime_iso.endswith("Z") else mtime_iso
+            head, dot, frac = text.partition(".")
+            mtime = datetime.fromisoformat(f"{head}.{frac[:6].ljust(6, '0')}" if dot else head)
+            if mtime_iso.endswith("Z"):
+                mtime = mtime.replace(tzinfo=timezone.utc)
+        except (ValueError, AttributeError):
+            mtime = datetime.fromtimestamp(0)
+        name = as_str(row.get("Name"))
+        name64 = row.get("Name64")
+        if isinstance(name64, str) and name64:
+            try:
+                name = base64.b64decode(name64, validate=True).decode("utf-8")
+            except ValueError:  # binascii.Error, UnicodeDecodeError: keep Name
+                pass
+        return FileItem(
+            name=name,
+            size=as_size(row.get("Size")),
+            modified=mtime,
+            is_dir=bool(row.get("IsDir")),
+            is_link=bool(row.get("IsLink")),
+            # ConvertTo-Json writes a JSON boolean; anything else is no flag.
+            attr_hidden=row.get("IsHidden") is True,
+        )
+
+
+class _RangeReader(io.RawIOBase):
+    """A large remote file, read range by range as the caller asks."""
+
+    def __init__(self, session: WinRMSession, path: str) -> None:
+        super().__init__()
+        self._session = session
+        self._path = path
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, pos: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            new = pos
+        elif whence == io.SEEK_CUR:
+            new = self._pos + pos
+        else:
+            new = self._session.stat(self._path).size + pos
+        if new < 0:
+            raise OSError(errno.EINVAL, "negative seek position")
+        self._pos = new
+        return new
+
+    def readinto(self, buffer) -> int:
+        if self.closed:
+            raise ValueError("read of a closed file")
+        want = min(len(buffer), _READ_CHUNK)
+        if want <= 0:
+            return 0
+        data = self._session._read_range(self._path, self._pos, want)
+        buffer[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+
+__all__ = [
+    "MAX_READ_BYTES",
+    "MAX_WRITE_BYTES",
+    "WinRMSession",
+]

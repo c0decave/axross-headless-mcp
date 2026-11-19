@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axross-headless-mcp"
+version = "0.15.179"
+description = "axross's headless MCP server: file tools on the local disk and on SFTP, SMB, WebDAV, S3 and more for any MCP client, over stdio or HTTP - without Qt"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "paramiko>=5.0,<6.0",
+    "cryptography>=50.0.0",
+    "jsonschema>=4.21",
+    "keyring>=25.0",
+    "PySocks>=1.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/c0decave/axross-headless-mcp"
+Source = "https://github.com/c0decave/axross-headless-mcp"
+axross = "https://github.com/c0decave/axross"
+
+[project.optional-dependencies]
+images = ["Pillow>=13.0.0"]
+smb = ["smbprotocol>=1.13"]
+webdav = ["requests>=2.33.0", "defusedxml>=0.7"]
+s3 = ["boto3>=1.28"]
+azure = ["azure-storage-blob>=12.19", "azure-storage-file-share>=12.15"]
+onedrive = ["msal>=1.26", "requests>=2.33.0"]
+gdrive = ["google-api-python-client>=2.100", "google-auth-oauthlib>=1.1", "google-auth-httplib2>=0.2"]
+dropbox = ["dropbox>=12.0"]
+winrm = ["pywinrm>=0.4"]
+wmi = ["impacket>=0.11"]
+exchange = ["exchangelib>=5.0"]
+adb = ["adb-shell[usb]>=0.4"]
+archive = ["py7zr>=1.1.3", "rarfile>=4.0", "backports.zstd>=1.0; python_version < '3.14'"]
+tftp = ["tftpy>=0.8"]
+postgres = ["psycopg[binary]>=3.1"]
+redis = ["redis>=5.0"]
+mongo = ["pymongo>=4.18.3"]
+git = ["dulwich>=1.2.9", "urllib3>=2.8.0"]
+dns = ["dnspython>=2.9.0"]
+magic = ["puremagic>=1.20"]
+encoding = ["chardet>=5.2"]
+snmp = ["pysnmp>=6.2"]
+ldap = ["ldap3>=2.9"]
+metadata = ["pypdf>=6.21.4"]
+all = ["Pillow>=13.0.0", "smbprotocol>=1.13", "requests>=2.33.0", "defusedxml>=0.7", "boto3>=1.28", "azure-storage-blob>=12.19", "azure-storage-file-share>=12.15", "msal>=1.26", "google-api-python-client>=2.100", "google-auth-oauthlib>=1.1", "google-auth-httplib2>=0.2", "dropbox>=12.0", "adb-shell[usb]>=0.4", "py7zr>=1.1.3", "rarfile>=4.0", "tftpy>=0.8", "psycopg[binary]>=3.1", "redis>=5.0", "pymongo>=4.18.3", "dulwich>=1.2.9", "urllib3>=2.8.0", "dnspython>=2.9.0", "puremagic>=1.20", "chardet>=5.2", "pysnmp>=6.2", "ldap3>=2.9", "pypdf>=6.21.4"]
+
+[project.scripts]
+axross-headless-mcp = "axross_headless_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.txt", "*.md", "*.py"]
