@@ -1,6 +1,6 @@
 # axross-headless-mcp: the extended README
 
-Everything on one page; the short version, with the screenshots, is the [README](../README.md).
+Everything on one page; the short version, with the screenshots, is the [README](../README.md) - installing, the tests and the licence are there.
 
 axross's headless MCP server: file tools on the local disk and on SFTP, SMB, WebDAV, S3 and more for any MCP client, over stdio or HTTP - without Qt.
 
@@ -102,23 +102,9 @@ and the tool catalogue [docs/mcp-tools.json](https://github.com/c0decave/axross/
 Setup steps for AI agents (Cline and others):
 [llms-install.md](https://github.com/c0decave/axross-headless-mcp/blob/main/llms-install.md).
 
+## Where it comes from
+
 It is the same code as in [axross](https://github.com/c0decave/axross), written out by
 axross's `scripts/export_standalone.py mcp`; it reads axross's settings
 (`~/.config/axross`) and axross's saved connection profiles.
 
-## Install and run
-
-```sh
-pip install axross-headless-mcp      # or, from this folder: pip install .
-axross-headless-mcp
-```
-
-## Tests
-
-```sh
-python -m pytest tests
-```
-
-## Licence
-
-Apache-2.0, as axross.
