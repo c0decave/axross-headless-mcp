@@ -422,6 +422,38 @@ def _drop_partial(backend, part: str, dst_path: str, mpath: Path) -> None:
         pass
 
 
+def _plain_local(backend) -> bool:
+    """A local backend whose paths are used as they are and that writes as
+    LocalFS does (not the MCP server's confined one, which opens beneath
+    its root itself, nor one with a writer of its own)."""
+    from core.local_fs import LocalFS
+
+    return (isinstance(backend, LocalFS) and not hasattr(backend, "create_new")
+            and type(backend).open_write is LocalFS.open_write)
+
+
+def _open_local_partial(part: str, append: bool, size: int, source_mode):
+    """The local partial file, open to write: a resume appends to it only
+    when it is this user's own regular file of *size* bytes (no symlink
+    followed, core.local_fs.open_own_partial); a fresh start removes the
+    NAME (a symlink planted there, not what it points to) and creates the
+    file anew, O_EXCL, with the source's mode less the umask before a byte
+    is written (a 0600 key was copied through a 0644 partial)."""
+    from core.local_fs import create_private_file, open_own_partial
+    from core.process_umask import process_umask
+
+    if append:
+        return open_own_partial(part, expect_size=size)
+    try:
+        os.unlink(part)
+    except FileNotFoundError:
+        pass
+    mode = None
+    if isinstance(source_mode, int) and source_mode > 0:
+        mode = source_mode & 0o777 & ~process_umask()
+    return create_private_file(part, 0o600 if mode is None else mode)
+
+
 def _open_write_for_resume(backend, path: str, *, append: bool):
     """Open a destination write handle with a clear failure for backends
     that cannot append.
@@ -700,12 +732,18 @@ def resumable_copy(
 
     # Open destination.
     append_mode = bytes_skipped > 0
+    written_file = None
     try:
-        dst_handle = _open_write_for_resume(
-            dst_backend,
-            part,
-            append=append_mode,
-        )
+        if part != dst_path and _plain_local(dst_backend):
+            dst_handle = _open_local_partial(part, append_mode, bytes_skipped,
+                                             getattr(src_stat, "permissions", 0))
+            written_file = os.fstat(dst_handle.fileno())
+        else:
+            dst_handle = _open_write_for_resume(
+                dst_backend,
+                part,
+                append=append_mode,
+            )
     except OSError as exc:
         raise OSError(f"resumable_copy: cannot open destination {dst_path!r}: {exc}") from exc
 
@@ -769,6 +807,14 @@ def resumable_copy(
         ) from exc
 
     completed = all(s.done for s in manifest.segments)
+    if completed and part != dst_path and written_file is not None:
+        try:
+            named = os.lstat(part)
+        except OSError as exc:
+            raise OSError(f"resumable_copy: the partial copy {part!r} is gone: {exc}") from exc
+        if not os.path.samestat(named, written_file):
+            raise OSError(f"resumable_copy: the partial copy {part!r} was replaced while it "
+                          "was written; nothing was put in place")
     if completed and part != dst_path:
         from core.server_ops import _finalize_temp_destination
 

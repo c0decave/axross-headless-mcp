@@ -1,10 +1,12 @@
 <!-- mcp-name: io.github.c0decave/axross-headless-mcp -->
 # axross-headless-mcp
 
-**axross's headless MCP server: file tools on the local disk and on SFTP, SMB, WebDAV, S3 and more for any MCP client, over stdio or HTTP - without Qt.**
+*axross's headless MCP server: file tools on the local disk and on SFTP, SMB, WebDAV, S3 and more for any MCP client, over stdio or HTTP - without Qt.*
+
+![The tools of every group, and a client's tools/call over stdio](https://raw.githubusercontent.com/c0decave/axross-headless-mcp/main/docs/screenshots/terminal.png)
 
 - **Your files for any MCP client** - Claude Desktop, Claude Code, Cursor, VS Code: list, read, search and hash files.
-- **Local disk and remote connections** - SFTP built in; SMB, WebDAV, S3, Azure, cloud drives, Git, databases as extras.
+- **Almost every file system** - the local disk, SFTP built in, and 40 backends from SMB, NFS and S3 to cloud drives, Git and databases as extras.
 - **Read-only by default** - the write tools only with `--mcp-write` and an explicit `--mcp-root`.
 - **Confined to one folder** - every path stays under `--mcp-root`; SSH and GnuPG keys and tokens are refused.
 - **50+ tools in groups** - metadata, duplicates, archives, crypto, file types, transfers, remote profiles and more.
@@ -18,18 +20,39 @@
 
 - **[Everything in detail: the extended README](https://github.com/c0decave/axross-headless-mcp/blob/main/docs/README-extended.md)**
 - [What changed: the CHANGELOG](https://github.com/c0decave/axross-headless-mcp/blob/main/CHANGELOG.md)
-- [Screenshots](#screenshots)
+- [What it supports and does](#what-it-supports-and-does)
 - [Install](#install)
 - [Connect a client](#connect-a-client)
 - [Documentation](#documentation)
 - [Tests](#tests)
 - [Licence](#licence)
 
-## Screenshots
+## What it supports and does
 
-![The tools of every group, and a client's tools/call over stdio](https://raw.githubusercontent.com/c0decave/axross-headless-mcp/main/docs/screenshots/terminal.png)
-
-*The tools of every group, and a client's tools/call over stdio.*
+- **Almost every file system:** the local disk plus 40 backends - protocols, cloud services, devices.
+- **Classic network storage:** SFTP, SCP, SMB / CIFS with DFS namespaces, NFS, WebDAV, FTP / FTPS, rsync, iSCSI.
+- **Object storage and the cloud:** S3 and S3-compatible stores, Azure Blob and Files, OneDrive, SharePoint, Google Drive, Dropbox.
+- **Code and data as folders:** Git and Subversion repositories, PostgreSQL, SQLite, Redis, MongoDB GridFS, LDAP.
+- **Devices and mail:** Android (ADB, MTP), IMAP, POP3, Exchange (EWS), NNTP, TFTP, Gopher, printers (PJL), WinRM, WMI, Cisco IOS.
+- **The same tools everywhere:** list, read, stat, search, grep, walk, hash and preview work alike on every backend.
+- **Your saved connections:** axross's connection profiles, credentials from the system keyring, never shown to the model.
+- **Read-only by default:** writing, moving and deleting need `--mcp-write` and an explicit `--mcp-root`.
+- **Confined to one folder:** every path stays under `--mcp-root`, checked through the folder's own descriptors.
+- **Secrets stay put:** SSH and GnuPG keys, tokens and `.env` files are refused; every stream is scanned for keys.
+- **55 tools in 15 groups, opt in:** only the core tools are on until you name more groups or `all`.
+- **Search and grep across servers:** name, size and date search, content grep, an offline index for repeated searches.
+- **Checksums without downloading:** SHA-256 on the server where the backend offers it, recursive checksums of whole trees.
+- **Duplicate finder:** duplicate groups by wasted space, dedupe to the trash, every copy re-verified first, a dry run by default.
+- **Metadata, read and removed:** EXIF / GPS / XMP / IPTC, Office and PDF properties, media tags; removal writes a cleaned copy.
+- **Archives, safely:** list and extract zip, tar.*, 7z and rar, guarded against zip-slip, bombs, link members and spoofing names.
+- **Packing:** zip, tar.gz / .zst / .xz / .bz2 and 7z, optionally AES-256 with encrypted file names.
+- **Encryption:** encrypt and decrypt files (AES-256-GCM, PBKDF2-SHA256).
+- **File types by content:** magic-byte detection that flags files whose extension lies.
+- **Copy and move between any two backends:** SFTP to S3, SMB to Google Drive - atomic, resumable, never half-written under the final name.
+- **Earlier versions:** list and read previous versions where the storage keeps them.
+- **Remote commands, only if allowed:** SSH, WinRM (PowerShell), ADB and more with `--mcp-allow-exec`, off by default.
+- **Current MCP over stdio or HTTP:** protocol 2025-11-25, 2025-06-18, 2024-11-05; bearer token, mTLS off loopback, an audit trail.
+- **Runs anywhere, no GUI:** `uvx`, `pipx` or the container image; the same code as the axross desktop app and its tests.
 
 ## Install
 

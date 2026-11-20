@@ -27,7 +27,7 @@ import weakref
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import IO, Any
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from core import transfer_hooks
 from core.append_helpers import read_existing_for_append
@@ -127,6 +127,30 @@ def _body_rewinder(data):
     except (OSError, ValueError):
         return None
     return lambda: seek(start)
+
+
+#: Redirect answers; only GET / HEAD let requests follow them.
+_REDIRECTS = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECTS = 5
+
+
+def _same_resource(url: str, target: str) -> bool:
+    """True when *target* (a redirect's Location, absolute) names the same
+    path as *url* on the same host and port - a trailing slash added or
+    taken off, http upgraded to https. Anything else (a login page,
+    another host, https down to http) is not followed by a write."""
+    a, b = urlsplit(url), urlsplit(target)
+    if (a.hostname or "").lower() != (b.hostname or "").lower():
+        return False
+    if a.scheme == "https" and b.scheme != "https":
+        return False
+    if a.scheme not in ("http", "https") or b.scheme not in ("http", "https"):
+        return False
+    if a.scheme == b.scheme and a.port != b.port:
+        return False
+    if a.scheme != b.scheme and b.port not in (None, 443):
+        return False
+    return unquote(a.path).rstrip("/") == unquote(b.path).rstrip("/") and not b.query
 
 
 class WebDavRequestError(OSError):
@@ -319,7 +343,12 @@ class _WebDavClient:
         # decoded: hrefs are unquoted before the comparison, and a base
         # such as .../files/John%20Doe would otherwise never match.
         self._url_path = unquote(parts.path or "")
-        self._auth = (username, password) if username else None
+        # As UTF-8 bytes: requests encodes text credentials as latin-1, so
+        # "€" failed before any request and "café" was not the password
+        # Nextcloud / sabre check (RFC 7617: UTF-8).
+        self._auth = (
+            (username.encode("utf-8"), (password or "").encode("utf-8")) if username else None
+        )
         self._timeout = timeout
         self._proxies = dict(proxies) if proxies else None
         # The constructing thread's Session now: a proxy that cannot be
@@ -398,10 +427,43 @@ class _WebDavClient:
         kwargs.setdefault("timeout", self._timeout)
         kwargs.setdefault("auth", self._auth)
         rewind = _body_rewinder(kwargs.get("data"))
+        # requests turns PUT / DELETE / MOVE / MKCOL / PROPFIND into a GET
+        # on a 302 (an SSO login page, then taken for success) and sends
+        # the body on to another host on a 307: a write follows only a
+        # redirect to the same resource (_same_resource), sent again as
+        # it was.
+        follow_self = method.upper() not in ("GET", "HEAD")
+        if follow_self:
+            kwargs["allow_redirects"] = False
         attempt = 1
+        hops = 0
         while True:
             resp = self.session.request(method, url, **kwargs)
             status = getattr(resp, "status_code", None)
+            if follow_self and status in _REDIRECTS:
+                headers = getattr(resp, "headers", None) or {}
+                location = headers.get("Location") or ""
+                target = urljoin(url, location) if location else ""
+                close = getattr(resp, "close", None)
+                if close is not None:
+                    close()
+                if (
+                    target and hops < _MAX_REDIRECTS and rewind is not None
+                    and status != 303 and _same_resource(url, target)
+                ):
+                    log.info("WebDAV %s %s: HTTP %s to %s, sending it there",
+                             method, redact_url(url), status, redact_url(target))
+                    rewind()
+                    url = target
+                    hops += 1
+                    continue
+                raise WebDavRequestError(
+                    f"WebDAV {method} {redact_url(url)}: the server redirected it "
+                    f"(HTTP {status}) to {redact_url(target) or 'nowhere'}; nothing was done "
+                    "there. A login page or another address: check the profile's URL "
+                    "and sign-in.",
+                    status,
+                )
             if (
                 attempt >= cloud_http.ATTEMPTS
                 or rewind is None
@@ -1191,7 +1253,7 @@ class WebDavSession(SessionLifecycle):
     # ------------------------------------------------------------------
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"

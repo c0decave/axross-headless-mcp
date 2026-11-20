@@ -1270,7 +1270,7 @@ class _Run:
             self.skip("archive_members")
             self.error(f"{ctx.display}: zip directory with {declared[0]} entries not opened")
             return
-        with zipfile.ZipFile(fh) as zf:
+        with AR.open_zip(fh) as zf:
             for info in zf.infolist():
                 if info.is_dir():
                     continue

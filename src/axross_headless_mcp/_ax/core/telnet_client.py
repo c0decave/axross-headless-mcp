@@ -554,6 +554,24 @@ class CommandFailed(OSError):
     """The command ran and exited non-zero: the connection is fine."""
 
 
+def _strip_prompts(output: str) -> str:
+    """*output* of a multi-line command without the prompts the shell
+    printed between its commands (PS1 is the bare marker): at the start of
+    a line, a line of prompts only, and at the very end."""
+    lines = []
+    for line in output.split("\n"):
+        rest = line
+        while rest.startswith(_PROMPT_MARKER):
+            rest = rest[len(_PROMPT_MARKER):]
+        if rest != line and not rest.rstrip("\r"):
+            continue  # nothing but prompts
+        lines.append(rest)
+    text = "\n".join(lines)
+    while text.endswith(_PROMPT_MARKER):
+        text = text[: -len(_PROMPT_MARKER)]
+    return text
+
+
 class _ShellSession:
     """Manages shell interaction over a telnet transport."""
 
@@ -824,7 +842,15 @@ class _ShellSession:
                     exit_re, timeout=timeout, lookback=256, idle=idle
                 )
             except TimeoutError:
-                raise TimeoutError(f"Command timed out: {cmd[:80]!r}")
+                # The shell's state is unknown now: an unbalanced quote or
+                # an open heredoc in the command would have the next
+                # command parsed inside it, its quoted names turned into
+                # shell code. This connection is not used again.
+                try:
+                    self._transport.close()
+                except Exception as exc:  # noqa: BLE001 - gone is gone
+                    log.debug("Telnet: closing after a time-out failed: %s", exc)
+                raise TimeoutError(f"Command timed out: {cmd[:80]!r}") from None
 
         exit_code = int(m.group(1))
 
@@ -838,7 +864,14 @@ class _ShellSession:
         # Clean up: remove prompt markers and the line breaks around the
         # answer. Not blanks: they belong to the answer (the last name of a
         # listing, "report ", came back as "report").
-        output = output.replace(_PROMPT_MARKER, "").strip("\n")
+        # A one-line command prints no prompt between its markers: its
+        # answer stays as it is (a name holding the marker string was
+        # edited). A multi-line one gets the prompt before each further
+        # command's output: taken off the start of lines, and lines that
+        # are prompts only dropped.
+        if "\n" in cmd or start_idx == -1:
+            output = _strip_prompts(output)
+        output = output.strip("\n")
 
         return output, exit_code
 
@@ -1148,6 +1181,32 @@ def ls_unescape(text: str) -> str:
     return out.decode("utf-8", "replace")
 
 
+def split_link_field(field: str, size: int | None) -> tuple[str, str]:
+    """``name -> target`` of an ``ls -l`` (or ``rsync --list-only``) link
+    line as ``(name, target)``.
+
+    A name or target holding `` -> `` leaves several cuts; the first one
+    listed the link ``a -> x`` as ``a``, and a delete of the listed entry
+    removed the OTHER file ``a``. A link's size is the length of its
+    target in bytes, and the possible targets are suffixes of one another,
+    so at most one cut fits it. When none does (no size, a /proc link of
+    size 0) the entry keeps its whole text as its name: one that hits no
+    other file, where a guess could.
+    """
+    parts = field.split(" -> ")
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) < 2:
+        return field, ""
+    if size is not None:
+        for cut in range(1, len(parts)):
+            target = " -> ".join(parts[cut:])
+            if len(target.encode("utf-8", "surrogateescape")) == size:
+                return " -> ".join(parts[:cut]), target
+    log.warning("ls listed a link whose name cannot be told from its target: %r", field[-200:])
+    return field, ""
+
+
 def _parse_ls_la(output: str, *, escaped: bool = False, utc: bool = False) -> list[FileItem]:
     """Parse `ls -la` output into FileItem list.
 
@@ -1179,7 +1238,9 @@ def _parse_ls_la(output: str, *, escaped: bool = False, utc: bool = False) -> li
         name = name_field
 
         if is_link and " -> " in name_field:
-            name, link_target = name_field.split(" -> ", 1)
+            # ls -b escapes the blanks, so only an unescaped listing can
+            # show more than one arrow.
+            name, link_target = split_link_field(name_field, size)
         if escaped:
             name, link_target = ls_unescape(name), ls_unescape(link_target)
 
@@ -1307,14 +1368,23 @@ def _parse_stat_gnu(output: str) -> FileItem:
     try:
         size = int(parts[1])
         mtime = datetime.fromtimestamp(int(parts[2]))
-        mode = int(parts[3], 16) & 0o7777
+        raw_mode = int(parts[3], 16)
     except (ValueError, OverflowError, OSError) as exc:
         raise OSError(f"Cannot parse stat output {output[:200]!r}: {exc}") from exc
+    mode = raw_mode & 0o7777
     owner = parts[4]
     group = parts[5]
-    ftype = parts[6].lower()
-    is_dir = "directory" in ftype
-    is_link = "link" in ftype
+    if raw_mode & 0o170000:
+        # The type from the mode: %F is translated on a server in another
+        # language ("Verzeichnis", "symbolische Verknüpfung").
+        import stat as _stat
+
+        is_dir = _stat.S_ISDIR(raw_mode)
+        is_link = _stat.S_ISLNK(raw_mode)
+    else:
+        ftype = parts[6].lower()
+        is_dir = "directory" in ftype
+        is_link = "link" in ftype
 
     return FileItem(
         name=name,
@@ -1492,12 +1562,18 @@ class _SpooledWriter:
                 "on remote system. Only text files are supported."
             )
         # The telnet stream turns every CR into a line feed and the shell
-        # drops NUL: such a file would arrive altered, so it is refused.
-        if "\r" in text or "\x00" in text:
+        # drops NUL; the terminal acts on the other control characters
+        # before the shell reads the heredoc (^C ends it and the lines
+        # after it ran as commands, ^U / ^W erase, ^D ends the input, ESC
+        # and TAB are line-editing keys): such a file is refused.
+        bad = sorted({c for c in text if (c < " " and c != "\n") or c == "\x7f"})
+        if bad:
+            points = ",".join(f"U+{ord(c):04X}" for c in bad)
             raise OSError(
                 "Cannot upload this file with the raw (cat) transfer: it contains "
-                "carriage returns or NUL bytes, which the terminal would alter; "
-                "no base64/uuencode/xxd available on the remote system."
+                f"control characters ({points}: carriage returns, NUL, tabs or terminal "
+                "keys), which the terminal would act on; no base64/uuencode/xxd "
+                "available on the remote system."
             )
         redirect = ">>" if self._append else ">"
         eof = self._safe_eof(text)
@@ -2089,7 +2165,7 @@ class TelnetSession(SessionLifecycle):
         return _SpooledWriter(self._ensure_connected(), path, self._caps)
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"

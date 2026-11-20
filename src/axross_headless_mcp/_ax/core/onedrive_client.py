@@ -25,6 +25,7 @@ from core.backend import SessionLifecycle
 from core.desktop_open import install_clean_webbrowser
 from core.path_policy import refuse_folder_path
 from core.read_spool import new_spool, spool_response
+from core.redaction import redact_url
 from core.secure_storage import adopt_legacy_secret_file, write_secret_file
 from models.file_item import FileItem
 
@@ -41,6 +42,24 @@ except ImportError:
     requests = None  # type: ignore[assignment]
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+class _CancelledAfterUncertainFinal(InterruptedError):
+    """Cancel after the last fragment of an upload session was sent and
+    its answer lost (a connection error, a 5xx): the item may be
+    committed, so the destination is not reported untouched."""
+
+
+def _on_graph(url: str) -> bool:
+    """True when *url* is https on Graph's own host (GRAPH_BASE)."""
+    from urllib.parse import urlsplit
+
+    try:
+        want, got = urlsplit(GRAPH_BASE), urlsplit(url)
+        return (got.scheme == "https" and got.hostname == want.hostname
+                and got.port in (None, 443))
+    except ValueError:
+        return False
 GRAPH_TIMEOUT = 30
 #: How long the browser sign-in at connect may take (seconds).
 INTERACTIVE_LOGIN_TIMEOUT = 300
@@ -599,6 +618,13 @@ class OneDriveSession(SessionLifecycle):
             url = as_str(data.get("@odata.nextLink"))
             if url in seen:
                 raise OSError(errno.EPROTO, f"Graph API GET: paging link repeats ({url})")
+            if url and not _on_graph(url):
+                # _graph_get adds the bearer token: never to another host,
+                # never over plain http.
+                raise OSError(
+                    errno.EPROTO,
+                    f"Graph API GET: paging link leaves Graph ({redact_url(url)}); not followed",
+                )
 
     # ------------------------------------------------------------------
     # Upload helper (used by _SpooledWriter)
@@ -644,15 +670,30 @@ class OneDriveSession(SessionLifecycle):
             raise OSError(errno.EPROTO, f"OneDrive upload of {path}: the upload URL is not https")
         try:
             self._send_session_chunks(path, fh, size, upload_url, before, hooks)
-        except InterruptedError:
+        except InterruptedError as exc:
             self._cancel_upload_session(upload_url, path)
+            if isinstance(exc, _CancelledAfterUncertainFinal):
+                # The last fragment went out and its answer was lost: Graph
+                # may have committed the item. The engine rolls back.
+                raise InterruptedError(transfer_hooks.CANCELLED) from None
             raise transfer_hooks.UploadCancelled(transfer_hooks.CANCELLED) from None
 
     def _send_session_chunks(self, path: str, fh: IO[bytes], size: int, upload_url: str,
                              before: str | None, hooks) -> None:
+        state = {"uncertain_final": False}
+        try:
+            self._send_session_chunks_in(path, fh, size, upload_url, before, hooks, state)
+        except InterruptedError as exc:
+            if state["uncertain_final"] and not isinstance(exc, _CancelledAfterUncertainFinal):
+                raise _CancelledAfterUncertainFinal(*exc.args) from None
+            raise
+
+    def _send_session_chunks_in(self, path: str, fh: IO[bytes], size: int, upload_url: str,
+                                before: str | None, hooks, state: dict) -> None:
         offset = 0
         failures = 0
         final_sent = False
+        unfinished = 0  # answers to the last fragment that did not commit the item
         while offset < size:
             if hooks is not None:
                 hooks.check()
@@ -665,7 +706,8 @@ class OneDriveSession(SessionLifecycle):
                 "Content-Length": str(len(chunk)),
                 "Content-Range": f"bytes {offset}-{offset + len(chunk) - 1}/{size}",
             }
-            final_sent = final_sent or offset + len(chunk) >= size
+            is_final = offset + len(chunk) >= size
+            final_sent = final_sent or is_final
             retry_after = None
             try:
                 resp = self._http.put(upload_url, headers=headers, data=chunk,
@@ -674,6 +716,18 @@ class OneDriveSession(SessionLifecycle):
                 status, detail = None, str(exc)
             else:
                 status = resp.status_code
+                if is_final and status < 400 and status not in (200, 201):
+                    # Only 200 / 201 with the item commit it; a 202 to the
+                    # last fragment ("nextExpectedRanges") made nothing.
+                    unfinished += 1
+                    if unfinished >= cloud_http.ATTEMPTS:
+                        raise OSError(
+                            errno.EIO,
+                            f"OneDrive upload of {path}: the server did not complete the "
+                            f"file after its last part (HTTP {status})",
+                        )
+                    offset = self._session_offset(upload_url, offset, size)
+                    continue
                 if status < 400:
                     offset += len(chunk)
                     failures = 0
@@ -690,6 +744,9 @@ class OneDriveSession(SessionLifecycle):
                 if hooks is not None:
                     hooks.sent(size, size, check=False)
                 return
+            if is_final and (status is None or status >= 500):
+                # Graph may have committed with this fragment.
+                state["uncertain_final"] = True
             failures += 1
             if (status is not None and status not in cloud_http.RETRYABLE_STATUSES) or \
                     failures >= cloud_http.ATTEMPTS:
@@ -700,7 +757,7 @@ class OneDriveSession(SessionLifecycle):
             log.debug("OneDrive upload of %s: chunk at %d answered %s; resuming", path,
                       offset, status)
             cloud_http.pause(failures, retry_after)
-            offset = self._session_offset(upload_url, offset)
+            offset = self._session_offset(upload_url, offset, size)
 
     #: _content_tag of a path with no item.
     _NO_ITEM = ""
@@ -745,7 +802,7 @@ class OneDriveSession(SessionLifecycle):
                       path, exc)
         log.info("OneDrive upload of %s cancelled; its upload session was deleted", path)
 
-    def _session_offset(self, upload_url: str, fallback: int) -> int:
+    def _session_offset(self, upload_url: str, fallback: int, size: int | None = None) -> int:
         """Where an upload session wants the next byte: the start of its
         first ``nextExpectedRanges`` entry. *fallback* (the chunk that
         failed) when the session cannot tell."""
@@ -763,7 +820,10 @@ class OneDriveSession(SessionLifecycle):
             return fallback
         # Bytes the session has are never sent again; bytes it lacks
         # before the failed chunk would be a hole - start where it says.
-        return start if 0 <= start <= fallback + _UPLOAD_CHUNK else fallback
+        # Never at or past the end: the loop would end there as "done".
+        limit = fallback + _UPLOAD_CHUNK if size is None else min(fallback + _UPLOAD_CHUNK,
+                                                                  size - 1)
+        return start if 0 <= start <= limit else fallback
 
     # ------------------------------------------------------------------
     # FileBackend protocol

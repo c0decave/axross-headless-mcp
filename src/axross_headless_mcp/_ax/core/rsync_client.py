@@ -207,13 +207,18 @@ def _nc_effective_proxy(proxy):
     a password. A password, TLS to the proxy, or NTLM / Negotiate are
     handled by the loopback shim instead; nc then dials the shim without
     credentials and the shim authenticates upstream.
+
+    SOCKS4 too: OpenBSD nc has no SOCKS4a, so ``-X 4`` resolved the
+    rsync host on this computer (a DNS query around the proxy, and an
+    internal name the proxy could reach did not resolve). The shim dials
+    SOCKS4a, as every other backend does: the proxy resolves the name.
     """
     from core.proxy import ProxyConfig
     from core.proxy_http import shim_for
 
     needs_shim = (
         bool(proxy.password)
-        or proxy.transport == "https"
+        or proxy.transport in ("https", "socks4")
         or proxy.auth_scheme not in ("", "basic")
     )
     if not needs_shim:
@@ -405,7 +410,8 @@ _LIST_RE = re.compile(
     r"^(?P<perms>[dlcbps-][rwxstSTlL-]{9})\s+"
     rf"(?P<size>{_GROUPED_NUMBER})\s+"
     r"(?P<date>\d{4}/\d{2}/\d{2})\s+"
-    r"(?P<time>\d{2}:\d{2}:\d{2})\s+"
+    # ONE blank before the name: a name may start with blanks of its own.
+    r"(?P<time>\d{2}:\d{2}:\d{2}) "
     r"(?P<name>.+)$"
 )
 
@@ -539,7 +545,13 @@ def _escape_rsync_pattern(name: str) -> str:
     ``--include '*'`` with ``--exclude '*'`` and ``--delete`` removes every
     sibling the glob matches, so a file called ``*`` or ``[ab]`` used to
     delete its neighbours.
+
+    rsync reads a backslash as an escape only in a pattern that holds a
+    wildcard: a name without one is returned as it is (``back\\slash``
+    escaped named no file, and the delete removed nothing).
     """
+    if not any(c in name for c in "*?["):
+        return name
     return "".join("\\" + c if c in "\\*?[" else c for c in name)
 
 
@@ -615,6 +627,18 @@ class RsyncSession(SessionLifecycle):
             username=proxy_username,
             password=proxy_password,
         )
+        if self._proxy.enabled:
+            # Through a proxy the host goes into a shell command line:
+            # rsync runs RSYNC_CONNECT_PROG with "sh -c" after putting the
+            # host in for %H, ssh its ProxyCommand with %h - unquoted. A
+            # host such as "x;touch /tmp/p" (an imported profile, a URL)
+            # ran a command on this computer.
+            from core.ssh_config import _refuse_shell_syntax
+
+            try:
+                _refuse_shell_syntax(host, "host name")
+            except ValueError as exc:
+                raise OSError(errno.EINVAL, str(exc)) from None
         self._connected = False
 
         self._rsync_bin = shutil.which("rsync")
@@ -800,6 +824,7 @@ class RsyncSession(SessionLifecycle):
         *,
         capture: bool = True,
         timeout: int | None = 60,
+        unescape: bool = True,
     ) -> str:
         """Execute rsync with the given extra arguments (*timeout* None: no
         limit on the whole run - pass rsync's --timeout then).
@@ -833,7 +858,9 @@ class RsyncSession(SessionLifecycle):
                 result.returncode, stderr, self._host, self._module, self._ssh_mode
             )
 
-        return _unescape_rsync_output(result.stdout or "")
+        # unescape=False: the caller undoes the escapes after it has cut the
+        # output into lines - an escaped line feed in a name is no line end.
+        return _unescape_rsync_output(result.stdout or "") if unescape else (result.stdout or "")
 
     # --------------------------------------------------------------------- #
     #  FileBackend — listing / stat                                          #
@@ -856,8 +883,11 @@ class RsyncSession(SessionLifecycle):
         # A stall limit, not a wall clock: a huge folder over a slow link
         # may take longer than a minute and still be arriving.
         output = self._run_rsync(
-            [*motd, f"--timeout={LIST_STALL_TIMEOUT}", "--list-only", url], timeout=None
+            [*motd, f"--timeout={LIST_STALL_TIMEOUT}", "--list-only", url], timeout=None,
+            unescape=False,
         )
+        from core.telnet_client import split_link_field
+
         items: list[FileItem] = []
 
         for line in split_lf_only_stream(output):
@@ -867,12 +897,11 @@ class RsyncSession(SessionLifecycle):
 
             m = _LIST_RE.match(line)
             if m:
-                entry_name = m.group("name")
-                # rsync may include a relative path prefix — take basename
-                entry_name = posixpath.basename(entry_name.rstrip("/"))
-                if entry_name in (".", ".."):
-                    continue
-
+                # rsync's \#ooo escapes undone in the name alone, after the
+                # cut into lines: undone in the whole output first, a name
+                # holding a line feed became a line of its own - an entry
+                # that is not there.
+                field = _unescape_rsync_output(m.group("name"))
                 perm_str = m.group("perms")
                 size_str = m.group("size")
                 date_str = m.group("date")
@@ -880,15 +909,25 @@ class RsyncSession(SessionLifecycle):
 
                 is_dir = perm_str.startswith("d")
                 is_link = perm_str.startswith("l")
-                link_target = ""
-                if is_link and " -> " in m.group("name"):
-                    entry_name, _, link_target = m.group("name").rpartition(" -> ")
-                    entry_name = posixpath.basename(entry_name.rstrip("/"))
-
                 try:
                     size = _size_from_listing(size_str)
                 except ValueError:
                     size = 0
+                link_target = ""
+                entry_name = field
+                if is_link and " -> " in field:
+                    # The link's size (its target's length) tells where a
+                    # name holding " -> " ends.
+                    entry_name, link_target = split_link_field(field, size)
+                if entry_name in (".", ".."):
+                    continue
+                if not entry_name or "/" in entry_name or "\x00" in entry_name:
+                    # A listing of "dir/" names its entries alone: a name
+                    # with a "/" is no entry (a hostile server's, or an
+                    # escaped line feed followed by a forged line).
+                    log.warning("rsync list_dir(%s): dropping impossible name %r",
+                                path, entry_name[-200:])
+                    continue
 
                 try:
                     modified = datetime.strptime(f"{date_str} {time_str}", "%Y/%m/%d %H:%M:%S")
@@ -1032,8 +1071,11 @@ class RsyncSession(SessionLifecycle):
                         f"--timeout={STALL_TIMEOUT}",
                         "-r",
                         "--delete",
+                        # Anchored: --include reads a leading "- " / "+ "
+                        # as a rule prefix, so the folder "- old" became
+                        # "exclude old/" and was not deleted.
                         "--include",
-                        _escape_rsync_pattern(name) + "/",
+                        "/" + _escape_rsync_pattern(name) + "/",
                         "--exclude",
                         "*",
                         tmpdir + "/",
@@ -1261,7 +1303,7 @@ class RsyncSession(SessionLifecycle):
     # --------------------------------------------------------------------- #
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"

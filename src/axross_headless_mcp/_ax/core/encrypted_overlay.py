@@ -182,6 +182,23 @@ def write_encrypted(backend, path: str, data: bytes, passphrase: str) -> str:
     return final
 
 
+def read_capped(handle, limit: int) -> bytes:
+    """Up to *limit* bytes of *handle*, to its end across short reads (a
+    network reader's read(n) may return less than n before the end: one
+    read took the first part only)."""
+    parts: list[bytes] = []
+    size = 0
+    while size < limit:
+        chunk = handle.read(min(4 * 1024 * 1024, limit - size))
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", errors="replace")
+        parts.append(chunk)
+        size += len(chunk)
+    return b"".join(parts)
+
+
 def read_encrypted(backend, path: str, passphrase: str) -> bytes:
     """Read and decrypt *path*. Raises :class:`InvalidCiphertext` on
     bad passphrase / corruption, :class:`OSError` on IO failure."""
@@ -193,7 +210,7 @@ def read_encrypted(backend, path: str, passphrase: str) -> bytes:
         # 50-GiB "encrypted" blob and OOM the client before we've even
         # had a chance to verify the GCM tag. Read one byte past the
         # cap so we can distinguish "exactly MAX" from "too big".
-        raw = handle.read(MAX_ENCRYPTED_SIZE + 1)
+        raw = read_capped(handle, MAX_ENCRYPTED_SIZE + 1)
     finally:
         try:
             handle.close()
@@ -476,6 +493,7 @@ __all__ = [
     "is_encrypted_path",
     "is_streaming_blob",
     "open_encrypted_read",
+    "read_capped",
     "read_encrypted",
     "write_encrypted",
 ]

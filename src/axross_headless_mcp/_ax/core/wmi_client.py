@@ -259,6 +259,10 @@ class WMISession(SessionLifecycle):
     used to stay cached and fail every call until axross restarted.
     """
 
+    #: Windows keeps "README.txt" and "Readme.txt" as one name
+    #: (core.transfer_conflicts.case_insensitive_names).
+    case_insensitive_names = True
+
     _closed = False
     _wbem = None
     _dcom = None

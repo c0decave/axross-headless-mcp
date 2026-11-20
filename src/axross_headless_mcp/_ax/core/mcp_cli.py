@@ -218,7 +218,7 @@ def _audit_to_stderr() -> None:
     if any(getattr(h, "_axross_audit_stderr", False) for h in audit.handlers):
         return
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(asctime)s [AUDIT] %(message)s"))
+    handler.setFormatter(log_config.EscapingFormatter("%(asctime)s [AUDIT] %(message)s"))
     handler.setLevel(logging.INFO)
     handler._axross_audit_stderr = True  # type: ignore[attr-defined]
     audit.addHandler(handler)

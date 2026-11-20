@@ -647,13 +647,16 @@ def _parse_ls_line(raw: str, rest: str = "") -> FileItem | None:
         return None
     name = m.group("name") + rest
     perms_text = m.group("perms")
-    # Strip ``-> target`` for symlinks; we don't model them.
-    if perms_text.startswith("l"):
-        name = name.split(" -> ", 1)[0]
     try:
         size = int(m.group("size"))
     except ValueError:
         size = 0
+    # Strip ``-> target`` for symlinks; we don't model them. The size
+    # tells where a name holding " -> " ends (split_link_field).
+    if perms_text.startswith("l") and " -> " in name:
+        from core.telnet_client import split_link_field
+
+        name = split_link_field(name, size)[0]
     return FileItem(
         name=name,
         is_dir=perms_text.startswith("d"),
@@ -744,22 +747,119 @@ def _end(proc: subprocess.Popen) -> None:
 
 
 class _RshWriter:
-    """File-like writer that streams into ``cat > path`` through a running
-    rsh process: nothing is held in memory, the transfer engine's progress
-    and Cancel act on the real upload, and a time-out comes only when the
-    pipe takes nothing for TRANSFER_IDLE_TIMEOUT. close() reads the status
-    trailer (a failed ``cat`` - no such folder, no permission - raises)."""
+    """File-like writer that streams through a running rsh process: nothing
+    is held in memory, the transfer engine's progress and Cancel act on the
+    real upload, and a time-out comes only when the pipe takes nothing for
+    TRANSFER_IDLE_TIMEOUT.
+
+    The data goes into a temp file beside the target (``.tmp-<hex>.tmp``,
+    created exclusively, given the target's mode before a byte lands), and
+    close() moves it onto the target only once the status trailer said the
+    upload is complete. A cancelled, cut or failed upload removes the temp
+    file and leaves the target as it was - it was ``cat > path``, which
+    emptied the target when the upload began. An append copies the target
+    into the temp file first. A symlink is followed to the file it names.
+    Only where the folder refuses a new file but the file itself is
+    writable does the data go straight into the file, as before."""
 
     def __init__(self, session: RshSession, path: str, append: bool = False):
         self._session = session
         self._path = path
-        op = ">>" if append else ">"
-        self._command = f"cat {op} {shlex.quote(path)}"
-        self._tag, self._proc = session._spawn(self._command, stdin=True)
+        self._closed = False
+        self._target, self._mode = self._destination(session, path)
+        self._tmp: str | None = self._prepare(append)
+        if self._tmp is None:
+            op = ">>" if append else ">"
+            self._command = f"cat {op} {shlex.quote(self._target)}"
+        else:
+            self._command = f"cat >> {shlex.quote(self._tmp)}"
+        try:
+            self._tag, self._proc = session._spawn(self._command, stdin=True)
+        except BaseException:
+            self._drop_temp()
+            raise
         self._watch = _Watchdog(self._proc, TRANSFER_IDLE_TIMEOUT)
         self._out = _Drain(self._proc.stdout)
         self._err = _Drain(self._proc.stderr)
-        self._closed = False
+
+    @staticmethod
+    def _destination(session: RshSession, path: str) -> tuple[str, int | None]:
+        """(the file the upload replaces - a symlink followed -, its mode
+        or None for a new file), as the atomic saves resolve it."""
+        from core.atomic_io import _resolve_destination
+
+        resolved = _resolve_destination(session, path)
+        if resolved is None:  # a link that cannot be read: written through
+            return path, None
+        target, mode = resolved
+        return _validate_path(session.normalize(target)), mode
+
+    def _prepare(self, append: bool) -> str | None:
+        """Create the temp file (None: the data goes straight into the
+        target, whose folder takes no new file). One remote command; a
+        refusal raises before anything was written."""
+        from core.exec_util import ls_error
+
+        target, mode = self._target, self._mode
+        tmp = posixpath.join(posixpath.dirname(target) or "/", f".tmp-{secrets.token_hex(6)}.tmp")
+        fill = []
+        if mode is not None:
+            # Before a byte lands (a 0600 secret never sits in a 0644 file);
+            # the owner may write it until the commit, as atomic_io does.
+            fill.append(f'chmod {oct(mode | 0o200)[2:]} "$t"')
+        if append:
+            fill.append('{ [ ! -e "$p" ] || cat -- "$p" >> "$t"; }')
+        script = (
+            f"( p={shlex.quote(target)}; t={shlex.quote(tmp)}; "
+            f"d={shlex.quote(posixpath.dirname(target) or '/')}; "
+            'if [ -d "$p" ]; then echo "$p: Is a directory" >&2; exit 1; fi; '
+            # The permission ``cat > path`` asked for: a file the login may
+            # not write is not replaced because its folder is writable.
+            'if [ -e "$p" ] && [ ! -w "$p" ]; then echo "$p: Permission denied" >&2; exit 1; fi; '
+            'if [ -e "$p" ] && [ ! -w "$d" ]; then echo direct; exit 0; fi; '
+            + ("umask 077; " if mode is not None else "")
+            # set -C: the temp file is new (O_EXCL), never one already there.
+            + 'set -C; : > "$t" || exit 1; set +C; '
+            + f'{{ {" && ".join(fill) or ":"}; }} || {{ rm -f -- "$t"; exit 1; }}; echo temp )'
+        )
+        try:
+            out = self._session._run_remote(script, timeout=TREE_OP_TIMEOUT)
+        except RshError as exc:
+            raise ls_error(f"rsh upload of {self._path}", str(exc)) from exc
+        if out.strip().endswith(b"direct"):
+            log.info("rsh upload of %s: its folder takes no temp file; written in place", target)
+            return None
+        return tmp
+
+    def _commit(self) -> None:
+        """The complete temp file becomes the target (a rename in one folder)."""
+        if self._tmp is None:
+            return
+        script = (
+            f"( p={shlex.quote(self._target)}; t={shlex.quote(self._tmp)}; "
+            'if [ -d "$p" ]; then echo "$p: Is a directory" >&2; exit 1; fi; '
+            + (f'{{ chmod {oct(self._mode)[2:]} "$t" || :; }}; ' if self._mode is not None else "")
+            + 'mv -f -- "$t" "$p" )'
+        )
+        try:
+            self._session._run_remote(script, timeout=TREE_OP_TIMEOUT)
+        except OSError as exc:
+            self._drop_temp()
+            raise RshError(
+                f"rsh upload of {self._path}: the new content could not replace it: {exc}"
+            ) from exc
+        self._tmp = None
+
+    def _drop_temp(self) -> None:
+        """Best effort: the temp file of an upload that did not complete."""
+        tmp, self._tmp = self._tmp, None
+        if tmp is None:
+            return
+        try:
+            self._session._run_remote(f"rm -f -- {shlex.quote(tmp)}")
+        except Exception as exc:  # noqa: BLE001 - the upload's own error matters
+            log.warning("rsh upload of %s: its temp file %s was not removed: %s",
+                        self._path, tmp, exc)
 
     def write(self, data: bytes) -> int:
         if self._closed:
@@ -773,8 +873,18 @@ class _RshWriter:
         except (OSError, ValueError) as exc:
             # cat (or the connection) ended early: say why.
             self._closed = True
-            self._finish(cause=exc)
+            self._end_upload(cause=exc)
         return len(data)
+
+    def _end_upload(self, cause: BaseException | None = None) -> None:
+        """The process ended and checked; then the temp file becomes the
+        target, or - anything failed - goes."""
+        try:
+            self._finish(cause=cause)
+        except BaseException:
+            self._drop_temp()
+            raise
+        self._commit()
 
     def _finish(self, cause: BaseException | None = None) -> None:
         proc = self._proc
@@ -814,7 +924,7 @@ class _RshWriter:
         if self._closed:
             return
         self._closed = True
-        self._finish()
+        self._end_upload()
 
     def discard(self) -> None:
         if self._closed:
@@ -822,6 +932,7 @@ class _RshWriter:
         self._closed = True
         self._watch.stop()
         _end(self._proc)
+        self._drop_temp()
 
     def __enter__(self):
         return self

@@ -613,6 +613,9 @@ class SmbSession(SessionLifecycle):
     """
 
     _port: int = 445
+    #: A share keeps "README.txt" and "Readme.txt" as one name
+    #: (core.transfer_conflicts.case_insensitive_names).
+    case_insensitive_names = True
 
     @property
     def _kw(self) -> dict:

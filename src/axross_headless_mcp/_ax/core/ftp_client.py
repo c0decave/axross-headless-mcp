@@ -105,6 +105,12 @@ _FTP_REPLY_LINE = re.compile(r"^\d{3}[ -]")
 # (compare, pane, transfers, recursive delete) handles.
 _FTP_PROTOCOL_ERRORS = (_FtpLibError, EOFError)
 
+#: A listing (MLSD, LIST, NLST) stops here: as SFTP's 300 000 entries
+#: (core.ssh_client.MAX_LISTING_ENTRIES), with room for "total" lines; a
+#: hostile server could otherwise stream until memory runs out.
+MAX_LISTING_LINES = 300_016
+MAX_LISTING_BYTES = 256 * 1024 * 1024
+
 # One ``ls -l`` style LIST line: type and mode, link count, owner,
 # optional group, size, date, then one space and the name. The date
 # anchors the name, which may itself contain spaces; a symlink's name is
@@ -840,14 +846,17 @@ class _StreamedDownload(io.RawIOBase):
             return 0
         try:
             data = self._conn.recv(min(len(view), self._BLOCK))
+            if not data:
+                # The server's final reply: a 426 there is a failed
+                # download (an OSError that stays), not ftplib's error_temp
+                # followed by a clean end of file.
+                self._finish()
+                return 0
         except _FTP_PROTOCOL_ERRORS as exc:
             detail = str(exc) or "connection closed by server"
             self._fail(OSError(f"FTP read {self._path}: {detail}"))
         except OSError as exc:
             self._fail(exc)
-        if not data:
-            self._finish()
-            return 0
         n = len(data)
         view[:n] = data
         self._received += n
@@ -1122,6 +1131,7 @@ class _LenientListingMixin:
         if callback is None:
             callback = print
         self.sendcmd("TYPE A")
+        lines = received = 0
         with (
             self.transfercmd(cmd) as conn,
             conn.makefile("r", encoding=self.encoding, errors="surrogateescape") as fp,
@@ -1132,6 +1142,17 @@ class _LenientListingMixin:
                     raise _FtpLibError(f"got more than {self.maxline} bytes")
                 if not line:
                     break
+                lines += 1
+                received += len(line)
+                if lines > MAX_LISTING_LINES or received > MAX_LISTING_BYTES:
+                    # The transfer's reply is left unread: this control
+                    # connection is not used again (the session logs in anew).
+                    _close_quietly(self)
+                    raise OSError(
+                        errno.EFBIG,
+                        f"FTP {cmd.split(' ', 1)[0]}: more than {MAX_LISTING_LINES} entries "
+                        f"or {MAX_LISTING_BYTES // (1024 * 1024)} MiB; not listed",
+                    )
                 if line[-2:] == "\r\n":
                     line = line[:-2]
                 elif line[-1:] == "\n":
@@ -2354,7 +2375,7 @@ class FtpSession(SessionLifecycle):
         return _SpooledWriter(ftp, path, append=append, store=self._store)
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"

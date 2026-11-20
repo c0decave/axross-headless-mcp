@@ -173,7 +173,7 @@ def _connect_error(exc: BaseException, bucket: str) -> OSError:
     if code in ("AccessDenied", "403", "AllAccessDisabled", "AccountProblem"):
         return PermissionError(tr(
             "Access to the S3 bucket {bucket} was denied. Check that the access key may list "
-            "this bucket - or, for a public bucket, connect without a key."
+            "this bucket – or, for a public bucket, connect without a key."
         ).format(bucket=bucket))
     if code in ("NoSuchBucket", "404", "NotFound"):
         return FileNotFoundError(tr(
@@ -629,6 +629,8 @@ class S3Session(SessionLifecycle):
         self.close()
 
     def list_dir(self, path: str) -> list[FileItem]:
+        from core.path_policy import unaddressable_segment_name
+
         prefix = self._to_prefix(path)
         items: list[FileItem] = []
         seen_any = not prefix  # the bucket root is always there
@@ -646,14 +648,15 @@ class S3Session(SessionLifecycle):
                 # Directories (common prefixes)
                 for cp in page.get("CommonPrefixes", []):
                     dir_prefix = cp["Prefix"]
-                    dir_name = dir_prefix[len(prefix) :].rstrip("/")
-                    if dir_name:
-                        items.append(
-                            FileItem(
-                                name=dir_name,
-                                is_dir=True,
-                            )
+                    # One "/" off, not all: the key "a//x" is the folder
+                    # "" under "a", and left out a folder copy missed it.
+                    dir_name = dir_prefix[len(prefix) :].removesuffix("/")
+                    items.append(
+                        FileItem(
+                            name=unaddressable_segment_name(dir_name) or dir_name,
+                            is_dir=True,
                         )
+                    )
 
                 # Files (objects)
                 for obj in page.get("Contents", []):
@@ -661,6 +664,7 @@ class S3Session(SessionLifecycle):
                     name = key[len(prefix) :]
                     if not name or name.endswith("/"):
                         continue  # Skip the prefix itself or directory markers
+                    name = unaddressable_segment_name(name) or name
                     items.append(
                         FileItem(
                             name=name,
@@ -1073,7 +1077,7 @@ class S3Session(SessionLifecycle):
         return _SpooledWriter(self._s3, self._bucket, key)
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"
@@ -1268,7 +1272,9 @@ class S3Session(SessionLifecycle):
 
     def _to_key(self, path: str) -> str:
         """Convert a UI path to an S3 object key (no leading slash)."""
-        return path.lstrip("/")
+        from core.path_policy import refuse_unaddressable
+
+        return refuse_unaddressable(path, "S3").lstrip("/")
 
     def _file_key(self, path: str, action: str) -> str:
         """The object key a FILE at *path* is written to. A key ending in
@@ -1286,7 +1292,9 @@ class S3Session(SessionLifecycle):
 
     def _to_prefix(self, path: str) -> str:
         """Convert a UI path to an S3 prefix for listing."""
-        key = path.lstrip("/")
+        from core.path_policy import refuse_unaddressable
+
+        key = refuse_unaddressable(path, "S3").lstrip("/")
         if key and not key.endswith("/"):
             key += "/"
         return key

@@ -51,6 +51,7 @@ import os
 import posixpath
 import shlex
 import threading
+import time
 from datetime import datetime, timezone
 from typing import IO, TYPE_CHECKING
 
@@ -160,6 +161,26 @@ def _as_text(raw) -> str:
 _COMMAND_TIMEOUT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "axross_adb_command_timeout", default=None
 )
+
+
+class _ShellDeadline(TimeoutError):
+    """A shell answer still coming at its deadline (_shell)."""
+
+
+class _ShellTooLarge(OSError):
+    """A shell answer over SHELL_OUTPUT_CAP (_shell)."""
+
+
+#: The most one shell answer may hold (a listing of ~500 000 entries):
+#: adb_shell joined every packet, so an endless answer filled the memory.
+SHELL_OUTPUT_CAP = 64 * 1024 * 1024
+#: Seconds one ordinary command may take in all (each packet has the
+#: transport time-out); a long one (_command_timeout) has its own.
+SHELL_DEADLINE = 600.0
+#: exec(): how much of the head of an answer is kept (its stdout_cap);
+#: the rest is read and dropped but for the tail with the status trailer.
+_SHELL_KEEP_HEAD: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "adb_shell_keep_head", default=None)
 
 
 @contextlib.contextmanager
@@ -566,8 +587,12 @@ def _parse_ls_entry(line: str, rest: str = "") -> tuple[FileItem, str] | None:
     is_link = mode.startswith("l")
     name = m.group("name") + rest
     link_target = ""
+    size = m.group("size")
     if is_link and " -> " in name:
-        name, _, link_target = name.partition(" -> ")
+        from core.telnet_client import split_link_field
+
+        # toolbox prints no size for a link: an ambiguous name is kept whole.
+        name, link_target = split_link_field(name, int(size) if size is not None else None)
     # Android's ``ls -la`` without --full-time omits seconds. ls runs under
     # TZ=UTC0 (AdbSession._LS): the date is UTC, returned aware (FileItem
     # converts it); the device's wall clock was handed out as local time.
@@ -577,7 +602,6 @@ def _parse_ls_entry(line: str, rest: str = "") -> tuple[FileItem, str] | None:
         )
     except ValueError:
         modified = datetime.fromtimestamp(0)
-    size = m.group("size")
     item = FileItem(
         name=name,
         size=int(size) if size is not None else 0,
@@ -1054,16 +1078,55 @@ class AdbSession(SessionLifecycle):
         every checksum of a big file)."""
         long_timeout = _COMMAND_TIMEOUT.get()
         timeout = long_timeout or self._transport_timeout
+        # The whole command, not only each packet: SHELL_DEADLINE, or the
+        # long command's own time-out.
+        deadline = time.monotonic() + (long_timeout or max(SHELL_DEADLINE, timeout))
+        keep_head = _SHELL_KEEP_HEAD.get()
         # A long command runs beside the listings, as a transfer does.
         channel = self._transfer_channel() if long_timeout else self._command_channel()
         try:
             with channel as device:
-                return _as_text(device.shell(
-                    _RawCommand(cmd),
-                    transport_timeout_s=timeout,
-                    read_timeout_s=timeout,
-                    decode=False,
-                ))
+                # Read as a stream: device.shell() joined every packet, so
+                # an endless answer filled the memory and never returned.
+                # Leaving it early leaves its rest unread: the exception
+                # out of this body drops the connection (_lost).
+                head = bytearray()
+                tail = b""
+                size = 0
+                kwargs = dict(transport_timeout_s=timeout, read_timeout_s=timeout, decode=False)
+                stream = getattr(device, "streaming_shell", None)
+                chunks = (stream(_RawCommand(cmd), **kwargs) if stream is not None
+                          else [device.shell(_RawCommand(cmd), **kwargs)])  # a stand-in
+                for chunk in chunks:
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8", "surrogateescape")
+                    size += len(chunk)
+                    if keep_head is None:
+                        if size > SHELL_OUTPUT_CAP:
+                            raise _ShellTooLarge(
+                                errno.EFBIG,
+                                f"ADB shell({cmd[:60]!r}): the answer holds more than "
+                                f"{SHELL_OUTPUT_CAP // (1024 * 1024)} MiB",
+                            )
+                        head += chunk
+                    else:
+                        room = keep_head + 1 - len(head)
+                        if room > 0:
+                            head += chunk[:room]
+                        tail = (tail + chunk)[-4096:]
+                    if time.monotonic() > deadline:
+                        raise _ShellDeadline(
+                            errno.ETIMEDOUT,
+                            f"ADB shell({cmd[:60]!r}) on {self._label}: still answering after "
+                            f"{(long_timeout or max(SHELL_DEADLINE, timeout)):.0f} s; stopped",
+                        )
+                if keep_head is not None and size > len(head):
+                    # The head (stdout_cap and one byte more) and the tail
+                    # that holds exec's status trailer.
+                    return _as_text(bytes(head)) + "\n" + _as_text(tail)
+                return _as_text(bytes(head))
+        except (_ShellDeadline, _ShellTooLarge):
+            raise
         except Exception as exc:
             raise self._error(f"ADB shell({cmd[:60]!r})", exc, timeout) from exc
 
@@ -1499,8 +1562,12 @@ class AdbSession(SessionLifecycle):
                 fh.write(stdin)
             line = f"{line} < {shlex.quote(tmp)}"
         try:
-            with _command_timeout(timeout or self._long_timeout):
-                raw = self._shell(f"{line}; echo {tag} $?")
+            keep = _SHELL_KEEP_HEAD.set(max(0, int(stdout_cap)))
+            try:
+                with _command_timeout(timeout or self._long_timeout):
+                    raw = self._shell(f"{line}; echo {tag} $?")
+            finally:
+                _SHELL_KEEP_HEAD.reset(keep)
         finally:
             if tmp is not None:
                 try:

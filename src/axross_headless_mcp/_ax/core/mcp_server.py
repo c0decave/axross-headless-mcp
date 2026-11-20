@@ -140,6 +140,7 @@ import errno
 import io
 import json
 import logging
+import sqlite3
 import sys
 import threading
 import time
@@ -688,6 +689,20 @@ def _bulk_copy_complete(entries: list[dict], truncated: bool) -> bool:
 # shouldn't silently stream over a WAN backend" without refusing
 # realistic payloads. Caller overrides per-call.
 BULK_COPY_MAX_FILE_BYTES = 10 * (1 << 30)  # 10 GiB
+
+# Upper caps of the counts a caller may ask for: what a tree tool keeps in
+# memory and sends back is bounded, whatever max_entries / max_files says
+# (10**9 kept a whole disk's listing in the server). The defaults stay far
+# below; a call above a cap is refused, not cut silently.
+MAX_WALK_ENTRIES = 100_000
+MAX_RECURSIVE_CHECKSUM_FILES = 50_000
+MAX_BULK_COPY_FILES = 100_000
+MAX_TREE_DEPTH = 64
+# search: at most this many results (default DEFAULT_SEARCH_LIMIT), and at
+# most MAX_SEARCH_SCAN rows of the index read for them.
+DEFAULT_SEARCH_LIMIT = 1000
+MAX_SEARCH_RESULTS = 10_000
+MAX_SEARCH_SCAN = 200_000
 # Allowed algorithm names for ``checksum``. Deliberately restricted to
 # the four hashlib.new-safe algorithms that a client can reproduce
 # locally — any request for a backend-specific hash (S3 ETag, Dropbox
@@ -2257,7 +2272,7 @@ def _build_tools(
         (protected_places.SECRET_CONTENT_SCAN): look at what it serves -
         and a key's length around it, for a window that starts or ends
         inside a key - before handing it out."""
-        if allow_secret_reads or _is_remote(active_backend):
+        if allow_secret_reads:
             return
         from core import protected_places
 
@@ -2298,7 +2313,7 @@ def _build_tools(
             # .env, credentials files... (the local rules need this
             # machine's home folder and the file's content).
             def refuse_remote(path: str, *, entry: bool = False) -> str:
-                reason = protected_places.remote_secret_refusal(path)
+                reason = protected_places.remote_secret_refusal(path, entry=entry)
                 if reason is not None:
                     raise PermissionError(reason)
                 return path
@@ -2479,7 +2494,8 @@ def _build_tools(
             offset += lead
             data = _text_window(ahead[lead:], cap, more)
             truncated = more or lead + len(data) < len(ahead)
-        if offset + len(data) > _secret_scan_limit():
+        # A remote file is not scanned at open (review B): every window is.
+        if offset + len(data) > _secret_scan_limit() or _is_remote(backend):
             _refuse_served_secret(backend, path, offset, len(data))
         if not allow_secret_reads and _is_remote(backend):
             from core import protected_places
@@ -2553,7 +2569,20 @@ def _build_tools(
         }
         if args.get("max_size"):
             kwargs["max_size"] = int(args["max_size"])
-        entries = MX.search_all(**kwargs)
+        raw_limit = args.get("limit")
+        limit = DEFAULT_SEARCH_LIMIT if raw_limit is None else int(raw_limit)
+        if not 0 < limit <= MAX_SEARCH_RESULTS:
+            raise ValueError(f"search: limit must be 1 … {MAX_SEARCH_RESULTS}")
+        ctx.check_cancel()
+        # The index is read up to MAX_SEARCH_SCAN rows (the root is applied
+        # to them below), and a cancel interrupts the query.
+        try:
+            entries = MX.search_all(**kwargs, limit=MAX_SEARCH_SCAN,
+                                    cancel=lambda: ctx.is_cancelled)
+        except sqlite3.OperationalError:
+            ctx.check_cancel()
+            raise
+        ctx.check_cancel()
         scope = _call_scope(resolved)
 
         def _in_root(entry_path: str) -> bool:
@@ -2565,7 +2594,7 @@ def _build_tools(
                 return False
             return True
 
-        entries = [e for e in entries if _in_root(e.path)]
+        entries = [e for e in entries if _in_root(e.path)][:limit]
         return [
             {
                 "backend_id": e.backend_id,
@@ -2595,6 +2624,9 @@ def _build_tools(
         max_entries = int(args.get("max_entries") or 1000)
         if max_depth < 0 or max_entries <= 0:
             raise ValueError("walk: max_depth must be ≥0 and max_entries > 0")
+        if max_depth > MAX_TREE_DEPTH or max_entries > MAX_WALK_ENTRIES:
+            raise ValueError(f"walk: max_depth must be ≤ {MAX_TREE_DEPTH} and max_entries "
+                             f"≤ {MAX_WALK_ENTRIES}")
         entries: list[dict] = []
         unreadable: list[dict] = []
         queue: list[tuple[str, int]] = [(path, 0)]
@@ -2692,6 +2724,9 @@ def _build_tools(
             raise ValueError("recursive_checksum: max_files must be > 0")
         if max_depth < 0:
             raise ValueError("recursive_checksum: max_depth must be ≥ 0")
+        if max_files > MAX_RECURSIVE_CHECKSUM_FILES or max_depth > MAX_TREE_DEPTH:
+            raise ValueError(f"recursive_checksum: max_files must be ≤ {MAX_RECURSIVE_CHECKSUM_FILES} "
+                             f"and max_depth ≤ {MAX_TREE_DEPTH}")
         if max_file_bytes <= 0:
             raise ValueError(
                 "recursive_checksum: max_file_bytes must be > 0",
@@ -2897,7 +2932,10 @@ def _build_tools(
             name="search",
             description=(
                 "Search the offline metadata index by name substring, "
-                "extension, and size range. Free of network round-trips."
+                "extension, and size range. Free of network round-trips. "
+                f"At most limit results (default {DEFAULT_SEARCH_LIMIT}, at most "
+                f"{MAX_SEARCH_RESULTS}): ask for one more than you need to learn "
+                "whether there are more. A notifications/cancelled stops it."
             ),
             schema={
                 "type": "object",
@@ -2906,6 +2944,7 @@ def _build_tools(
                     "ext": {"type": "string"},
                     "min_size": {"type": "integer", "minimum": 0},
                     "max_size": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_RESULTS},
                 },
             },
             handler=_search,
@@ -2914,7 +2953,8 @@ def _build_tools(
             name="walk",
             description=(
                 "Breadth-first recursive listing under path. Caps at "
-                "max_depth (default 4) and max_entries (default 1000). "
+                f"max_depth (default 4, at most {MAX_TREE_DEPTH}) and max_entries "
+                f"(default 1000, at most {MAX_WALK_ENTRIES}). "
                 "Returns {entries: [{path, name, is_dir, size}], truncated, "
                 "unreadable: [{path, error}], complete}: unreadable names "
                 "every folder below path that could not be listed; complete "
@@ -2927,8 +2967,8 @@ def _build_tools(
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "max_depth": {"type": "integer", "minimum": 0},
-                    "max_entries": {"type": "integer", "minimum": 1},
+                    "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_TREE_DEPTH},
+                    "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_WALK_ENTRIES},
                 },
                 "required": ["path"],
             },
@@ -2950,7 +2990,8 @@ def _build_tools(
                 "notifications/cancelled lands within one chunk of the "
                 "current file. algorithm is one of sha256 / sha1 / md5 "
                 "/ sha512. Defaults: max_files=500, max_depth=10, "
-                "max_file_bytes=1 GiB. If path names a file instead of "
+                f"max_file_bytes=1 GiB (at most max_files={MAX_RECURSIVE_CHECKSUM_FILES}, "
+                f"max_depth={MAX_TREE_DEPTH}). If path names a file instead of "
                 "a directory the result contains exactly one record."
             ),
             schema={
@@ -2961,8 +3002,9 @@ def _build_tools(
                         "type": "string",
                         "enum": sorted(_HASHLIB_ALGOS),
                     },
-                    "max_files": {"type": "integer", "minimum": 1},
-                    "max_depth": {"type": "integer", "minimum": 0},
+                    "max_files": {"type": "integer", "minimum": 1,
+                                  "maximum": MAX_RECURSIVE_CHECKSUM_FILES},
+                    "max_depth": {"type": "integer", "minimum": 0, "maximum": MAX_TREE_DEPTH},
                     "max_file_bytes": {"type": "integer", "minimum": 1},
                 },
                 "required": ["path"],
@@ -3157,11 +3199,12 @@ def _build_tools(
                     safe_full = refuse_secret(scope(full))
                     with backend.open_read(safe_full) as fh:
                         raw = fh.read(MAX_GREP_FILE_BYTES + 1)
-                    if (not allow_secret_reads and not _is_remote(backend)
-                            and isinstance(raw, bytes) and len(raw) > _secret_scan_limit()):
+                    if (not allow_secret_reads and isinstance(raw, bytes)
+                            and (_is_remote(backend) or len(raw) > _secret_scan_limit())):
                         from core import protected_places
 
-                        # read_refusal looked at the first MiB only.
+                        # read_refusal looked at the first MiB only; at a
+                        # remote's file nothing did (review B).
                         if protected_places.secret_in_content(raw):
                             raise PermissionError(f"{full}: holds a private key (refused)")
                 except OSError as exc:
@@ -3550,6 +3593,9 @@ def _build_tools(
                 raise ValueError("bulk_copy: max_files must be > 0")
             if max_depth < 0:
                 raise ValueError("bulk_copy: max_depth must be ≥ 0")
+            if max_files > MAX_BULK_COPY_FILES or max_depth > MAX_TREE_DEPTH:
+                raise ValueError(f"bulk_copy: max_files must be ≤ {MAX_BULK_COPY_FILES} and "
+                                 f"max_depth ≤ {MAX_TREE_DEPTH}")
             if max_file_bytes <= 0:
                 raise ValueError(
                     "bulk_copy: max_file_bytes must be > 0",
@@ -3774,15 +3820,22 @@ def _build_tools(
                 what = "symbolic" if kind == "symlink" else "hard"
                 raise OSError(f"{type(backend).__name__} has no {what} links")
 
-        def _refuse_link_target(target, safe_link: str, active_backend) -> None:
+        def _refuse_link_target(target, safe_link: str, active_backend) -> str:
             """PermissionError unless *target* (relative to the link's
             folder) resolves inside a writable root, outside its read-only
             folders and outside the protected places - nor to a folder that
-            holds one (the home folder, ~/.config)."""
+            holds one (the home folder, ~/.config). Returns the target the
+            link is made with: as typed, or - when it has a ``..`` - the
+            checked place itself (absolute, every link resolved). ``b/..``
+            with ``b`` a link leads wherever ``b``'s parent is once ``b`` is
+            re-pointed, and ``../../x`` wherever its folder is moved to: what
+            was checked would not stay what the link leads to. A target
+            without ``..`` stays in the root whatever is re-pointed in it
+            (every link made here leads into it)."""
             import os.path as op
 
             if _is_remote(active_backend):
-                return
+                return target
             if not isinstance(target, str) or "\x00" in target:
                 raise ValueError("symlink target must be a string without NUL")
             where = target if op.isabs(target) else op.join(op.dirname(safe_link), target)
@@ -3792,6 +3845,9 @@ def _build_tools(
                 _refuse_protected(resolved, entry=True, granted=write_roots)
             except PermissionError as exc:
                 raise PermissionError(f"symlink target {target!r} is refused: {exc}") from exc
+            if ".." in target.replace("\\", "/").split("/"):
+                return resolved
+            return target
 
         def _symlink(args, ctx):
             backend = _resolve_backend(args)
@@ -3811,8 +3867,8 @@ def _build_tools(
                 # later write around ~/.config/autostart.
                 safe_link = _entry_path(link_path, backend)
                 _refuse_root(safe_link, backend, "symlink link_path")
-                _refuse_link_target(target, safe_link, backend)
-                backend.symlink(target, safe_link)
+                made = _refuse_link_target(target, safe_link, backend)
+                backend.symlink(made, safe_link)
             except BaseException as exc:
                 _audit(
                     "symlink",
@@ -3822,8 +3878,8 @@ def _build_tools(
                     error=type(exc).__name__,
                 )
                 raise
-            _audit("symlink", "ok", target=target, link_path=safe_link)
-            return {"ok": True}
+            _audit("symlink", "ok", target=made, link_path=safe_link)
+            return {"ok": True} if made == target else {"ok": True, "target": made}
 
         def _hardlink(args, ctx):
             backend = _resolve_backend(args)
@@ -4027,7 +4083,8 @@ def _build_tools(
                         "one progress notification per copied file; a "
                         "notifications/cancelled stops within one file. "
                         "Defaults: max_files=1000, max_depth=10, "
-                        "max_file_bytes=10 GiB, overwrite=false. Missing "
+                        "max_file_bytes=10 GiB, overwrite=false (at most "
+                        f"max_files={MAX_BULK_COPY_FILES}, max_depth={MAX_TREE_DEPTH}). Missing "
                         "dst parent directories are created automatically. "
                         "Same-backend only in V1 — cross-backend copy is "
                         "handled by the transfer manager, not the MCP "
@@ -4038,8 +4095,10 @@ def _build_tools(
                         "properties": {
                             "src": {"type": "string"},
                             "dst": {"type": "string"},
-                            "max_files": {"type": "integer", "minimum": 1},
-                            "max_depth": {"type": "integer", "minimum": 0},
+                            "max_files": {"type": "integer", "minimum": 1,
+                                          "maximum": MAX_BULK_COPY_FILES},
+                            "max_depth": {"type": "integer", "minimum": 0,
+                                          "maximum": MAX_TREE_DEPTH},
                             "max_file_bytes": {"type": "integer", "minimum": 1},
                             "overwrite": {"type": "boolean"},
                         },

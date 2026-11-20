@@ -35,7 +35,7 @@ from core.proxy import (
     enable_tcp_nodelay,
 )
 from core.redaction import redact_text
-from core.ssh_config import expand_proxy_command
+from core.ssh_config import expand_proxy_command, require_confirmed_proxy_command
 from core.subprocess_env import clean_child_env
 from models.file_item import FileItem
 from security.protocol_line_split import split_lf_only_stream
@@ -1376,6 +1376,7 @@ class SSHSession(SessionLifecycle):
         try:
             # Create socket (ProxyCommand, SOCKS/HTTP proxy, or direct)
             if profile.proxy_command:
+                require_confirmed_proxy_command(profile)
                 cmd = expand_proxy_command(
                     profile.proxy_command,
                     host=profile.host,
@@ -1652,10 +1653,30 @@ class SSHSession(SessionLifecycle):
                         existing.close()
                     except Exception as exc:  # noqa: BLE001 - it is dead already
                         log.debug("Closing the dead SFTP client raised: %s", exc)
+                self._close_channels_of_ended_threads(thread_id)
                 existing = self._open_sftp_client()
                 self._thread_sftp[thread_id] = existing
             self._thread_local.sftp = existing
             return existing
+
+    def _close_channels_of_ended_threads(self, current: int) -> None:
+        """Let go of the channels of threads that have ended (the caller
+        holds _sftp_lock). Transfer workers and MCP calls come and go:
+        their channels stayed open for the life of the session, and after
+        ten OpenSSH (MaxSessions) refused every new pane, terminal and
+        transfer on the host.
+
+        Not closed here: a file the thread opened may still be read by
+        another one (a preview opened off the GUI thread). paramiko closes
+        a channel nothing refers to any more (Channel.__del__; the
+        transport holds its channels weakly)."""
+        alive = {t.ident for t in threading.enumerate()}
+        alive.add(current)
+        ended = [ident for ident in self._thread_sftp if ident not in alive]
+        for ident in ended:
+            del self._thread_sftp[ident]
+        if ended:
+            log.debug("%s: let go of %d SFTP channel(s) of ended threads", self.name, len(ended))
 
     def bound_requests(self, deadline: float, poll: float = 5.0) -> None:
         """Every SFTP request of this session - on every thread's channel,
@@ -2131,11 +2152,56 @@ class SSHSession(SessionLifecycle):
             )
         return PipelinedWriter(self.sftp.open(path, "ab" if append else "wb"), append=append)
 
+    @_sftp_errors_as_oserror
+    def open_write_new(self, path: str, mode: int) -> IO[bytes]:
+        """*path* created (or truncated) for writing with *mode* in the OPEN
+        request's attributes: a server creates the file with it (OpenSSH:
+        less its umask) - private from its first byte, not created in the
+        default mode and chmod-ed after (core.atomic_io._open_new_with_mode).
+        An existing file keeps its mode, as with any open."""
+        from paramiko.sftp import (
+            CMD_HANDLE,
+            CMD_OPEN,
+            SFTP_FLAG_CREATE,
+            SFTP_FLAG_TRUNC,
+            SFTP_FLAG_WRITE,
+        )
+        from paramiko.sftp_attr import SFTPAttributes
+        from paramiko.sftp_file import SFTPFile
+
+        from core.sftp_io import PipelinedWriter
+
+        if path.endswith("/") and path.strip("/"):
+            raise IsADirectoryError(
+                errno.EISDIR, f"Cannot write {path}: a path ending in '/' names a folder", path
+            )
+        sftp = self.sftp
+        attrs = SFTPAttributes()
+        attrs.st_mode = mode & 0o7777
+        kind, msg = sftp._request(
+            CMD_OPEN, sftp._adjust_cwd(path),
+            SFTP_FLAG_WRITE | SFTP_FLAG_CREATE | SFTP_FLAG_TRUNC, attrs,
+        )
+        if kind != CMD_HANDLE:
+            raise OSError(errno.EIO, f"open {path}: the server sent no handle", path)
+        return PipelinedWriter(SFTPFile(sftp, msg.get_binary(), "wb"), append=False)
+
     def normalize(self, path: str) -> str:
         try:
             return self.sftp.normalize(path)
         except (OSError, UnicodeError, paramiko.SFTPError, *_SFTP_CONNECTION_ERRORS):
             return posixpath.normpath(path)
+
+    def realpath(self, path: str) -> str:
+        """The server's canonical form of *path* (REALPATH): OpenSSH's
+        sftp-server answers with realpath(3), every symlink resolved.
+        OSError when the server cannot (a missing path on most)."""
+        try:
+            return self.sftp.normalize(path)
+        except (OSError, UnicodeError, paramiko.SFTPError, *_SFTP_CONNECTION_ERRORS) as exc:
+            if isinstance(exc, OSError):
+                raise
+            raise OSError(f"realpath {path}: {exc}") from exc
 
     def separator(self) -> str:
         return "/"

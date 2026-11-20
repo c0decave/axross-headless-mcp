@@ -220,7 +220,10 @@ class SqliteFsSession(DbFsBackend):
         # the actual schema first to defeat injection.
         if table not in self.tables():
             raise OSError(f"sqlite_fs: unknown table {table!r}")
-        return self.query(f"PRAGMA table_info({table})")
+        # Quoted too: a name with a blank or a quote ("my table") was a
+        # syntax error.
+        quoted = '"' + table.replace('"', '""') + '"'
+        return self.query(f"PRAGMA table_info({quoted})")
 
     # ------------------------------------------------------------------
     # Adapter — translate row dicts ↔ SQLite rows

@@ -35,6 +35,10 @@ MAX_PROFILES_FILE_BYTES = 4 * 1024 * 1024
 
 import re as _re  # noqa: E402 — local alias kept near regex constants below
 
+#: The local shell's name in terminal bookmarks and saved layouts
+#: (core.bookmarks.LOCAL_SHELL): no new profile may take it.
+LOCAL_SHELL_NAME = "local"
+
 from core.proxy import is_valid_proxy_type  # noqa: E402
 
 # Allowlisted character set for USB serials. Real-world Android
@@ -194,6 +198,18 @@ def password_needed(profile) -> bool:
     return True
 
 
+#: IMAP, POP3 and LDAP: implicit TLS, STARTTLS before the login, or plain.
+TLS_MODES = ("tls", "starttls", "plain")
+
+
+def tls_mode_of(implicit_tls, starttls=True) -> str:
+    """The TLS mode of the two profile switches: implicit TLS wins; without
+    it STARTTLS unless *starttls* is explicitly off (then plain)."""
+    if implicit_tls:
+        return "tls"
+    return "starttls" if starttls else "plain"
+
+
 def default_port(protocol: str, *, tls: bool = True) -> int:
     """The port a profile of *protocol* uses when none is given: the
     registry's, or the plain variant's for IMAP, POP3, NNTP and LDAP
@@ -334,11 +350,15 @@ class ConnectionProfile:
     iscsi_initiator_name: str = ""
     iscsi_initiator_interface: str = ""
 
-    # IMAP
+    # IMAP: implicit TLS (IMAPS, 993); without it STARTTLS on 143 unless
+    # ``imap_starttls`` is switched off - then plain text, the password too.
+    # A profile saved before STARTTLS existed reads as STARTTLS.
     imap_ssl: bool = True
+    imap_starttls: bool = True
 
-    # POP3 (read-only)
+    # POP3 (read-only): as IMAP - POP3S (995), STLS (110) or plain.
     pop3_ssl: bool = True
+    pop3_starttls: bool = True
 
     # NNTP: implicit TLS (NNTPS, 563) or plain (119)
     nntp_ssl: bool = True
@@ -358,8 +378,9 @@ class ConnectionProfile:
     db_name: str = ""
     db_tls: bool = False
 
-    # LDAP over TLS (LDAPS, port 636)
+    # LDAP: LDAPS (636), StartTLS on 389 (the default) or plain.
     ldap_ssl: bool = False
+    ldap_starttls: bool = True
 
     # SLP: the scope the directory is asked in
     slp_scope: str = "DEFAULT"
@@ -461,6 +482,17 @@ class ConnectionProfile:
         """Store proxy password in keyring."""
         if self.store_proxy_password:
             store_proxy_password(self.name, password)
+
+    def tls_mode(self) -> str:
+        """IMAP, POP3 and LDAP: ``"tls"`` (implicit TLS), ``"starttls"``
+        (upgraded before the login, refused without it) or ``"plain"``
+        (chosen: no encryption); ``""`` for any other protocol."""
+        flags = {"imap": (self.imap_ssl, self.imap_starttls),
+                 "pop3": (self.pop3_ssl, self.pop3_starttls),
+                 "ldap": (self.ldap_ssl, self.ldap_starttls)}.get(self.protocol)
+        if flags is None:
+            return ""
+        return tls_mode_of(*flags)
 
     def nfs_sender_chosen(self) -> bool:
         """True when the profile says what the NFS client sends about
@@ -586,9 +618,11 @@ class ConnectionProfile:
 
         elif proto == "imap":
             d["imap_ssl"] = self.imap_ssl
+            d["imap_starttls"] = self.imap_starttls
 
         elif proto == "pop3":
             d["pop3_ssl"] = self.pop3_ssl
+            d["pop3_starttls"] = self.pop3_starttls
 
         elif proto == "nntp":
             d["nntp_ssl"] = self.nntp_ssl
@@ -601,6 +635,7 @@ class ConnectionProfile:
 
         elif proto == "ldap":
             d["ldap_ssl"] = self.ldap_ssl
+            d["ldap_starttls"] = self.ldap_starttls
 
         elif proto == "slp":
             if self.slp_scope != "DEFAULT":
@@ -771,14 +806,17 @@ class ConnectionProfile:
             iscsi_initiator_interface=_string("iscsi_initiator_interface"),
             # IMAP
             imap_ssl=_boolean("imap_ssl", True),
+            imap_starttls=_boolean("imap_starttls", True),
             # POP3 (read-only)
             pop3_ssl=_boolean("pop3_ssl", True),
+            pop3_starttls=_boolean("pop3_starttls", True),
             # NNTP
             nntp_ssl=_boolean("nntp_ssl", True),
             # Databases, LDAP, SLP, Exchange
             db_name=_string("db_name"),
             db_tls=_boolean("db_tls"),
             ldap_ssl=_boolean("ldap_ssl"),
+            ldap_starttls=_boolean("ldap_starttls", True),
             slp_scope=_string("slp_scope", "DEFAULT") or "DEFAULT",
             exchange_email=_string("exchange_email"),
             # TFTP
@@ -1126,6 +1164,12 @@ class ProfileManager:
         Raises ValueError for a name that cannot be used and RuntimeError
         when the keyring refused a secret; returns the save's result."""
         problem = profile_name_problem(profile.name)
+        if not problem and profile.name == LOCAL_SHELL_NAME and profile.name not in self._profiles:
+            # "local" is the local shell in terminal bookmarks and saved
+            # layouts: a profile of that name was taken for it (and a
+            # rename to it made remote terminals local shells). One stored
+            # by an older version stays usable.
+            problem = "is the name of the local shell in terminal bookmarks and saved layouts"
         if problem:
             from core.i18n import tr
 

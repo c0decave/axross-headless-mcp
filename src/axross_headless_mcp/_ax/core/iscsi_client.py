@@ -109,6 +109,14 @@ def _make_parent(parent: str, path: str) -> None:
         ) from exc
 
 
+def _names_iqn(tokens: list[str], iqn: str) -> bool:
+    """True when one of *tokens* is *iqn* itself (IQNs compare in lower
+    case, RFC 3720 3.2.6.1). A part of a longer name is not it: ``...:disk1``
+    is no session or discovery entry of ``...:disk10``."""
+    want = iqn.strip().lower()
+    return bool(want) and any(tok.strip().lower() == want for tok in tokens)
+
+
 class IscsiSession(SessionLifecycle):
     """iSCSI block-storage backend implementing the FileBackend protocol.
 
@@ -793,7 +801,8 @@ class IscsiSession(SessionLifecycle):
         )
         log.debug("Discovery output:\n%s", result.stdout)
 
-        if self._target_iqn not in result.stdout:
+        if not any(_names_iqn(line.split()[1:], self._target_iqn)
+                   for line in split_lf_only_stream(result.stdout or "") if line.strip()):
             raise OSError(
                 f"Target {self._target_iqn} not found on portal {portal}. "
                 f"Discovered:\n{result.stdout}"
@@ -814,13 +823,12 @@ class IscsiSession(SessionLifecycle):
            tee`` pair where the secret text traverses stdin/stdout
            only — never appearing in ``/proc/<pid>/cmdline``.
 
-        Fallback: when the node config path cannot be resolved (the
-        record doesn't exist yet, the iqn/ip contain characters we
-        refuse to pass to a shell glob, or sudo is unavailable) we
-        log a warning and fall back to the argv-based
-        ``iscsiadm --op=update -v <password>`` flow. That retains
-        the original behaviour on restricted systems while opting
-        into the safer path everywhere else.
+        When the node config file cannot be written (the record is not
+        there, the iqn/ip hold characters refused in a shell glob, sudo
+        is not allowed) the connect is refused (PermissionError): the
+        argv-based ``iscsiadm --op=update -v <password>`` it fell back to
+        put the secret into /proc/<pid>/cmdline, readable by every local
+        user, and into sudo's log.
         """
         if not self._username:
             return
@@ -854,21 +862,19 @@ class IscsiSession(SessionLifecycle):
                 self._target_iqn,
             )
             return
-        # Step 2 fallback: argv-based update. Secrets brief-appear in
-        # /proc/<pid>/cmdline; same-user exposure only, but a known
-        # downgrade from the file-based path.
-        log.warning(
-            "Falling back to argv-based CHAP update for %s — "
-            "secrets will be briefly visible in /proc/<pid>/cmdline "
-            "during the iscsiadm call. Run this host with sudo access "
-            "to /etc/iscsi/nodes to switch to the file-based path.",
-            self._target_iqn,
+        # No argv fallback: a password on iscsiadm's (and sudo's) command
+        # line is readable in /proc/<pid>/cmdline by every local user, and
+        # sudo logs the whole command (COMMAND=...) to the system journal.
+        from core.i18n import tr
+
+        raise PermissionError(
+            errno.EACCES,
+            tr("The CHAP secret of {target} could not be written to its open-iscsi node "
+               "record (/etc/iscsi/nodes); axross does not pass it on a command line, "
+               "where every local user and the system log would see it. Run axross as "
+               "root or allow 'cat' and 'tee' on the node files through sudo.").format(
+                target=self._target_iqn),
         )
-        for flags in [
-            ("-n", "node.session.auth.username", "-v", self._username),
-            ("-n", "node.session.auth.password", "-v", self._password),
-        ]:
-            self._run_privileged(base + list(flags))
 
     def _node_config_paths(self) -> list[str]:
         """Resolve the open-iscsi node-config files that correspond to
@@ -1076,7 +1082,7 @@ class IscsiSession(SessionLifecycle):
         for line in split_lf_only_stream(result.stdout or ""):
             stripped = line.strip()
             if stripped.startswith("Target:"):
-                in_target = self._target_iqn in stripped
+                in_target = _names_iqn(stripped.split()[1:2], self._target_iqn)
             elif in_target and stripped.startswith(("Current Portal:", "Persistent Portal:")):
                 seen.append(stripped.split(":", 1)[1].strip().split(",")[0])
         if seen and all(addr == portal for addr in seen):
@@ -1170,7 +1176,7 @@ class IscsiSession(SessionLifecycle):
         for line in split_lf_only_stream(output):
             stripped = line.strip()
             if stripped.startswith("Target:"):
-                in_our_target = want in stripped
+                in_our_target = _names_iqn(stripped.split()[1:2], want)
             elif in_our_target and "Attached scsi disk" in stripped:
                 # Example: "Attached scsi disk sdb\t\tState: running"
                 parts = stripped.split()

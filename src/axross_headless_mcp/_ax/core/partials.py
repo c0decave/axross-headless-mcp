@@ -36,12 +36,14 @@ log = logging.getLogger(__name__)
 
 #: axross's temporary names, each with the id of the process that made it:
 #: core.mcp_groups' outputs, core.server_ops' stream copies,
-#: core.confined_fs' temp files, core.packer's staging folders.
+#: core.confined_fs' temp files, core.packer's staging folders,
+#: core.metadata_tools' work folders.
 _TEMP_NAMES = (
     re.compile(r"^\..*\.axross-part-(?P<pid>\d+)-[0-9a-f]+$", re.S),
     re.compile(r"^\..*\.copy-(?P<pid>\d+)-[0-9a-f]+\.tmp$", re.S),
     re.compile(r"^\..*\.(?P<pid>\d+)-[0-9a-f]{12}\.tmp$", re.S),
     re.compile(r"^\.axross-pack-(?P<pid>\d+)-[A-Za-z0-9_]+$", re.S),
+    re.compile(r"^\.axross-clean-(?P<pid>\d+)-[A-Za-z0-9_]+$", re.S),
 )
 
 #: The roots the running server serves (set by core.mcp_cli).

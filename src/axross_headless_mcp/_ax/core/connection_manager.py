@@ -426,6 +426,10 @@ class ConnectionManager:
             profile.iscsi_initiator_interface,
             str(profile.imap_ssl),
             str(profile.pop3_ssl),
+            # STARTTLS or plain text on the same port: two connections.
+            str(profile.imap_starttls),
+            str(profile.pop3_starttls),
+            str(profile.ldap_starttls),
             profile.tftp_filelist,
             str(profile.tftp_filelist_enabled),
             str(profile.tftp_max_size_bytes),
@@ -666,13 +670,10 @@ class ConnectionManager:
         _validate_proxy_request(profile)
         # Flag backends that would silently drop a user-configured proxy.
         _warn_unsupported_proxy(profile)
-        if profile.proxy_command and not profile.proxy_command_confirmed:
-            # An imported profile's shell command: the UI asks first.
-            raise PermissionError(
-                f"profile {profile.name!r} came in through an import and its "
-                f"ProxyCommand ({profile.proxy_command!r}) has not been confirmed; "
-                "confirm it in axross before it can run"
-            )
+        # An imported profile's shell command: the UI asks first.
+        from core.ssh_config import require_confirmed_proxy_command
+
+        require_confirmed_proxy_command(profile)
         proto = profile.protocol
         from core.security_mode import require_protocol_allowed
 
@@ -884,6 +885,7 @@ class ConnectionManager:
                 username=profile.username,
                 password=password,
                 use_ssl=profile.imap_ssl,
+                tls_mode=profile.tls_mode(),
                 **proxy_kw,
             )
 
@@ -895,6 +897,7 @@ class ConnectionManager:
                 username=profile.username,
                 password=password,
                 use_ssl=profile.pop3_ssl,
+                tls_mode=profile.tls_mode(),
                 **proxy_kw,
             )
 
@@ -1145,6 +1148,7 @@ class ConnectionManager:
                 username=profile.username,
                 password=password,
                 use_tls=profile.ldap_ssl,
+                tls_mode=profile.tls_mode(),
                 **proxy_kw,
             )
 
@@ -1231,45 +1235,71 @@ class ConnectionManager:
             return True
 
     def release(self, profile: ConnectionProfile) -> None:
-        """Release a reference to a session. Disconnects when no more references."""
+        """Release a reference to a session. Disconnects when no more references.
+
+        The reference is taken out of ``_held`` and the count decremented
+        in one locked section, and only while the session it holds is
+        still the registered one: in two sections, a connect() in between
+        that replaced a dead session under the same key made this release
+        decrement - and close - the new session another pane holds."""
+        key = None
+        closing = None
         with self._lock:
             entry = self._held_entry_locked(profile, take=True)
-            retired = None
             if entry is not None:
                 key, held_session = entry
                 if self._sessions.get(key) is not held_session:
                     retired = self._release_retired_locked(held_session)
                     if retired is None:
                         return
-            key = entry[0] if entry is not None else None
-        if retired is not None:
-            # The last holder of a replaced session: close it. The key's
-            # health enrolment belongs to the session that replaced it.
-            self._close_unheld(retired)
-            log.info("Disconnected replaced session %s (no more references)", key[:4])
-            return
-        if key is None:
-            # A reference not taken through connect() / acquire().
+                    closing = ("retired", retired)
+                else:
+                    closing = self._decrement_locked(key)
+                    if closing is None:
+                        return
+        if closing is None:
+            # A reference not taken through connect() / acquire(): only its
+            # key tells which session it meant (worked out outside the lock,
+            # a PAC lookup may wait).
             try:
                 key = self._session_key(profile)
             except ConnectionError as exc:  # PAC unreadable: nothing to match
                 log.debug("release: no session key for %s: %s", profile.name, exc)
                 return
+            with self._lock:
+                closing = self._decrement_locked(key)
+            if closing is None:
+                return
+        what, session = closing
+        if what == "retired":
+            # The last holder of a replaced session: close it. The key's
+            # health enrolment belongs to the session that replaced it.
+            self._close_unheld(session)
+            log.info("Disconnected replaced session %s (no more references)", key[:4])
+            return
         with self._lock:
-            if key not in self._ref_counts:
-                return
-
-            self._ref_counts[key] -= 1
-            log.debug("Released session %s (refs: %d)", key[:4], self._ref_counts[key])
-
-            if self._ref_counts[key] > 0:
-                return
-            session = self._sessions.pop(key, None)
-            self._ref_counts.pop(key, None)
-        self._unenroll_health(key)
+            # A connect() since may have registered a new session under the
+            # key: its health enrolment is not this session's to end.
+            replaced = key in self._sessions
+        if not replaced:
+            self._unenroll_health(key)
         if session:
             self._disconnect_session(session)
             log.info("Disconnected session %s (no more references)", key[:4])
+
+    def _decrement_locked(self, key: tuple[str, ...]) -> tuple[str, object] | None:
+        """One reference less on the session registered under *key* (lock
+        held). ``("last", session)`` once the last one is gone - the
+        session is unregistered then, for the caller to close."""
+        if key not in self._ref_counts:
+            return None
+        self._ref_counts[key] -= 1
+        log.debug("Released session %s (refs: %d)", key[:4], self._ref_counts[key])
+        if self._ref_counts[key] > 0:
+            return None
+        session = self._sessions.pop(key, None)
+        self._ref_counts.pop(key, None)
+        return ("last", session)
 
     def _release_retired_locked(self, session: object) -> object | None:
         """Give back one reference on a replaced session (lock held);

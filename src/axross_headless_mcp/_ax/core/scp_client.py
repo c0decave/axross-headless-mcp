@@ -59,7 +59,7 @@ from core.ssh_client import (
     transport_answers,
     transport_suspect,
 )
-from core.ssh_config import expand_proxy_command
+from core.ssh_config import expand_proxy_command, require_confirmed_proxy_command
 from models.file_item import FileItem
 
 if TYPE_CHECKING:
@@ -310,7 +310,11 @@ class _SpooledWriter:
         caps: _Capabilities,
         append: bool = False,
         scp_upload: Callable[[str, bytes], None] | None = None,
+        private: bool = False,
     ):
+        #: A new file made private from its first byte (SCPSession.
+        #: open_write_new): the shell's upload runs under umask 077.
+        self._private = private
         self._exec_fn = exec_fn
         self._scp_upload = scp_upload
         self._remote_path = remote_path
@@ -381,10 +385,13 @@ class _SpooledWriter:
     # string (a heredoc) it became one argument of ``$SHELL -c``, and
     # Linux refuses exec arguments above 128 KiB (E2BIG).
 
+    def _umask(self) -> str:
+        return "umask 077; " if self._private else ""
+
     def _upload_base64(self, data, qpath: str) -> None:
         redirect = ">>" if self._append else ">"
         self._exec_fn(
-            f"base64 -d {redirect} {qpath}",
+            f"{self._umask()}base64 -d {redirect} {qpath}",
             TRANSFER_TIMEOUT,
             stdin_data=base64.b64encode(data) if isinstance(data, bytes) else _Base64Stream(data),
         )
@@ -405,7 +412,8 @@ class _SpooledWriter:
                 "Only text files are supported."
             )
         redirect = ">>" if self._append else ">"
-        self._exec_fn(f"cat {redirect} {qpath}", TRANSFER_TIMEOUT, stdin_data=data)
+        self._exec_fn(f"{self._umask()}cat {redirect} {qpath}", TRANSFER_TIMEOUT,
+                      stdin_data=data)
 
     def __enter__(self):
         return self
@@ -500,6 +508,7 @@ class SCPSession(SessionLifecycle):
             # Create socket (ProxyCommand, SOCKS/HTTP proxy, or direct)
             family = self._socket_family()
             if profile.proxy_command:
+                require_confirmed_proxy_command(profile)
                 cmd = expand_proxy_command(
                     profile.proxy_command,
                     host=profile.host,
@@ -1034,7 +1043,11 @@ class SCPSession(SessionLifecycle):
             # could not tell from "cannot tell".
             from core.exec_util import ls_error
 
-            output, code = self._exec_raw(f"stat --format='%n|%s|%Y|%f|%U|%G|%F' {qpath}")
+            # LC_ALL=C: ls_error types the refusal by its English words
+            # (the connect's "export" reaches no later command - each exec
+            # is a new shell).
+            output, code = self._exec_raw(
+                f"LC_ALL=C stat --format='%n|%s|%Y|%f|%U|%G|%F' {qpath}")
             if code != 0:
                 raise ls_error(f"SCP stat({path})", output.strip()[:500] or f"exit {code}")
             return _parse_stat_gnu(output)
@@ -1084,7 +1097,7 @@ class SCPSession(SessionLifecycle):
         from core.exec_util import refused_as
 
         path = self._path(path)
-        output, code = self._exec_raw(f"mkdir -p {shell_path(path)}")
+        output, code = self._exec_raw(f"LC_ALL=C mkdir -p {shell_path(path)}")
         if code != 0:
             # mkdir -p over a FILE: "File exists" - FileExistsError, so a
             # caller tells it from a refused permission.
@@ -1211,10 +1224,12 @@ class SCPSession(SessionLifecycle):
                         _scp_raise(path, header[1:])
                     if not header.startswith(b"C"):
                         raise OSError(f"Cannot read {path}: not a regular file over SCP")
-                    try:
-                        size = int(header.split(b" ", 2)[1])
-                    except (IndexError, ValueError):
+                    # ASCII digits only: int() took "-5", and the loop then
+                    # read whatever the server sent until the stream ended.
+                    fields = header.split(b" ", 2)
+                    if len(fields) < 3 or not re.fullmatch(rb"[0-9]+", fields[1]):
                         raise OSError(f"Cannot read {path}: bad SCP header {header[:80]!r}")
+                    size = int(fields[1])
                     chan.sendall(b"\0")
                     left = size
                     hooks = transfer_hooks.current()
@@ -1243,9 +1258,10 @@ class SCPSession(SessionLifecycle):
         spool.seek(0)
         return spool
 
-    def _scp_write(self, path: str, data) -> None:
+    def _scp_write(self, path: str, data, mode: int = 0o644) -> None:
         """Write *data* (bytes, or a binary file read from its start) to
-        *path* with ``scp -t`` (sink mode)."""
+        *path* with ``scp -t`` (sink mode); a new file gets *mode* (less the
+        server's umask), an existing one keeps its own."""
         name = posixpath.basename(path)
         if "\n" in name or "\r" in name:
             raise OSError(f"SCP cannot carry a file name with a line break: {path!r}")
@@ -1259,7 +1275,8 @@ class SCPSession(SessionLifecycle):
                 else:
                     size = data.seek(0, os.SEEK_END)
                     data.seek(0)
-                chan.sendall(b"C0644 %d %s\n" % (size, name.encode("utf-8", "surrogateescape")))
+                chan.sendall(b"C%04o %d %s\n" % (mode & 0o777, size,
+                                                  name.encode("utf-8", "surrogateescape")))
                 _scp_status(chan, path)
                 for chunk in _chunks(data):
                     chan.sendall(chunk)
@@ -1299,8 +1316,25 @@ class SCPSession(SessionLifecycle):
             return writer
         return _SpooledWriter(self._exec, path, self._caps, scp_upload=self._scp_write)
 
+    def open_write_new(self, path: str, mode: int) -> IO[bytes]:
+        """A new file *path* made with *mode* from its first byte
+        (core.atomic_io._open_new_with_mode): scp's ``C`` line carries the
+        mode, a shell upload runs under ``umask 077``. Precreated empty and
+        chmod-ed after, it sat in the server's 0644 for a round trip."""
+        if path.endswith("/") and path.strip("/"):
+            raise IsADirectoryError(
+                errno.EISDIR, f"Cannot write {path}: a path ending in '/' names a folder", path
+            )
+        path = self._path(path)
+        perm = mode & 0o777
+
+        def upload(target: str, data) -> None:
+            self._scp_write(target, data, mode=perm)
+
+        return _SpooledWriter(self._exec, path, self._caps, scp_upload=upload, private=True)
+
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"

@@ -1076,7 +1076,7 @@ class DropboxSession(SessionLifecycle):
     # ------------------------------------------------------------------
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"

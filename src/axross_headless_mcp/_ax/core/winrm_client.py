@@ -68,7 +68,7 @@ except ImportError:  # pragma: no cover — optional dep
 # pywinrm's run_ps sends "powershell -encodedcommand <base64 of the
 # UTF-16LE script>" as the command line (winrm/__init__.py run_ps), which
 # the WinRM cmd shell caps at 8,190 characters.
-_PS_COMMAND_PREFIX = "powershell -encodedcommand "
+_PS_COMMAND_PREFIX = "powershell -NonInteractive -encodedcommand "
 _COMMAND_LINE_LIMIT = 8190
 
 #: Put in front of every script of the file operations. pywinrm opens the
@@ -263,6 +263,14 @@ def _ps_decode(b64: str) -> str:
 # never reads like this.
 _NOT_FOUND = "AXROSS-NOT-FOUND"
 _DESTINATION_TAKEN = "AXROSS-DESTINATION-EXISTS"
+_NOT_EMPTY = "AXROSS-NOT-EMPTY"
+
+#: Seconds a file operation's script may run (a copy of a big folder on
+#: the server), and the most output one command may send. pywinrm retries
+#: a receive that timed out without end: a command that never ended held
+#: the session - and its lock, so every pane on it - for good.
+SCRIPT_DEADLINE = 3600.0
+MAX_SCRIPT_OUTPUT = 256 * 1024 * 1024
 _NOT_A_DIRECTORY = "AXROSS-NOT-A-DIRECTORY"
 
 #: The base64 of an entry's name in UTF-8, for the listing and stat rows:
@@ -278,6 +286,70 @@ def _b64(value: str) -> str:
     return base64.b64encode(value.encode("utf-8")).decode("ascii")
 
 
+def _run_ps_bounded(session, script: str, timeout: float | None):
+    """pywinrm's ``Session.run_ps``, with a deadline and an output cap.
+
+    ``powershell -NonInteractive``: a question (Remove-Item's "has
+    children", a Read-Host) fails at once instead of waiting for an answer
+    no one gives. The receive loop is our own: pywinrm's retried a
+    timed-out receive for ever. At the deadline the command is stopped
+    (cleanup_command signals it) and TimeoutError raised."""
+    import time
+
+    from winrm.exceptions import WinRMOperationTimeoutError
+
+    encoded = base64.b64encode(script.encode("utf_16_le")).decode("ascii")
+    protocol = session.protocol
+    limit = SCRIPT_DEADLINE if timeout is None else float(timeout)
+    deadline = time.monotonic() + limit
+    out: list[bytes] = []
+    err: list[bytes] = []
+    size = 0
+    code = None
+    shell_id = protocol.open_shell()
+    try:
+        command_id = protocol.run_command(shell_id, _PS_COMMAND_PREFIX + encoded)
+        try:
+            done = False
+            while not done:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        errno.ETIMEDOUT,
+                        f"WinRM: the command did not end within {limit:.0f} s; it was stopped",
+                    )
+                try:
+                    stdout, stderr, code, done = protocol.get_command_output_raw(
+                        shell_id, command_id)
+                except WinRMOperationTimeoutError:
+                    continue  # nothing yet: ask again, until the deadline
+                size += len(stdout) + len(stderr)
+                if size > MAX_SCRIPT_OUTPUT:
+                    raise OSError(
+                        errno.EFBIG,
+                        f"WinRM: the command sent more than {MAX_SCRIPT_OUTPUT // (1024 * 1024)} "
+                        "MiB of output; it was stopped",
+                    )
+                out.append(stdout)
+                err.append(stderr)
+        finally:
+            try:
+                protocol.cleanup_command(shell_id, command_id)
+            except Exception as exc:  # noqa: BLE001 - the answer is what counts
+                log.debug("WinRM cleanup_command failed: %s", exc)
+    finally:
+        try:
+            protocol.close_shell(shell_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("WinRM close_shell failed: %s", exc)
+    response = winrm.Response((b"".join(out), b"".join(err), code))
+    if response.std_err:
+        try:
+            response.std_err = session._clean_error_msg(response.std_err)
+        except Exception:  # noqa: BLE001 - the raw text is fine too
+            pass
+    return response
+
+
 # --------------------------------------------------------------------------
 # WinRM session
 # --------------------------------------------------------------------------
@@ -289,6 +361,10 @@ class WinRMSession(SessionLifecycle):
     Construct one per (host, credentials) tuple. The pywinrm
     Session object is reused across all operations.
     """
+
+    #: Windows keeps "README.txt" and "Readme.txt" as one name
+    #: (core.transfer_conflicts.case_insensitive_names).
+    case_insensitive_names = True
 
     def __init__(
         self,
@@ -461,6 +537,22 @@ class WinRMSession(SessionLifecycle):
     def normalize(self, path: str) -> str:
         return path.replace("/", "\\") if path else path
 
+    def _target(self, path: str) -> str:
+        """*path* normalized for a script; OSError (EINVAL) when a part of
+        it ends in "." or " ". Windows drops those (outside \\\\?\\): on
+        NTFS ``foo.`` and ``foo`` can both be there, and a delete of the
+        one removed the other."""
+        norm = self.normalize(path)
+        for part in norm.split("\\"):
+            if part not in ("", ".", "..") and part[-1] in ". ":
+                raise OSError(
+                    errno.EINVAL,
+                    f"WinRM: the name {part!r} ends in a dot or a blank, which Windows "
+                    "drops - it would name another file; rename it on the server",
+                    path,
+                )
+        return norm
+
     def parent(self, path: str) -> str:
         norm = self.normalize(path)
         # ``C:\\`` and ``\\\\server\\share`` are roots — parent of root is itself.
@@ -492,7 +584,7 @@ class WinRMSession(SessionLifecycle):
     # Listing / stat
     # ------------------------------------------------------------------
     def list_dir(self, path: str) -> list[FileItem]:
-        path_b64 = _b64(self.normalize(path))
+        path_b64 = _b64(self._target(path))
         script = f"""
             $p = {_ps_decode(path_b64)}
             $dir = $null
@@ -527,7 +619,7 @@ class WinRMSession(SessionLifecycle):
         """The entry at *path*. FileNotFoundError only for Get-Item's
         ItemNotFoundException; any other failure ends the script with an
         error, which _run_ps raises as OSError."""
-        path_b64 = _b64(self.normalize(path))
+        path_b64 = _b64(self._target(path))
         script = f"""
             $p = {_ps_decode(path_b64)}
             $item = $null
@@ -566,7 +658,7 @@ class WinRMSession(SessionLifecycle):
         error, a refused permission (Test-Path said $false to that too)
         or an answer that is neither YES nor NO is an OSError:
         server_side_copy(overwrite=False) takes False as its go-ahead."""
-        path_b64 = _b64(self.normalize(path))
+        path_b64 = _b64(self._target(path))
         script = (
             f"try {{ $null = Get-Item -Force -LiteralPath {_ps_decode(path_b64)} "
             f"-ErrorAction Stop; Write-Output 'YES' }} "
@@ -581,21 +673,58 @@ class WinRMSession(SessionLifecycle):
     # Mutation
     # ------------------------------------------------------------------
     def mkdir(self, path: str) -> None:
-        path_b64 = _b64(self.normalize(path))
+        path_b64 = _b64(self._target(path))
         script = f"New-Item -ItemType Directory -Force -Path {_ps_decode(path_b64)} | Out-Null"
         self._run_ps(script)
 
     def remove(self, path: str, recursive: bool = False) -> None:
-        path_b64 = _b64(self.normalize(path))
-        flag = "-Recurse" if recursive else ""
-        script = (
-            f"try {{ Remove-Item -Force {flag} -LiteralPath {_ps_decode(path_b64)} "
-            f"-ErrorAction Stop }} "
-            f"catch [System.Management.Automation.ItemNotFoundException] "
-            f"{{ Write-Output '{_NOT_FOUND}' }}"
-        )
-        if self._run_ps_at(path, script).strip() == _NOT_FOUND:
+        """Delete *path*; a folder with entries only with *recursive*.
+
+        Not ``Remove-Item -Recurse``: Windows PowerShell 5.1 (what pywinrm
+        starts) goes into a directory junction or symlink and deletes what
+        is in its TARGET. The script walks the folder itself and removes a
+        link as the link. Without *recursive* a folder with entries is
+        ENOTEMPTY - Remove-Item would ask "continue?" and wait."""
+        path_b64 = _b64(self._target(path))
+        script = f"""
+            $p = {_ps_decode(path_b64)}
+            $root = $null
+            try {{ $root = Get-Item -Force -LiteralPath $p -ErrorAction Stop }}
+            catch [System.Management.Automation.ItemNotFoundException] {{ }}
+            if ($null -eq $root) {{ Write-Output '{_NOT_FOUND}'; return }}
+            $link = [IO.FileAttributes]::ReparsePoint
+            $isDir = $root.PSIsContainer -and -not ($root.Attributes -band $link)
+            if ($isDir -and -not ${'true' if recursive else 'false'}) {{
+              if (Get-ChildItem -Force -LiteralPath $p -ErrorAction Stop | Select-Object -First 1) {{
+                Write-Output '{_NOT_EMPTY}'; return
+              }}
+            }}
+            $order = New-Object System.Collections.ArrayList
+            $stack = New-Object System.Collections.Stack
+            $stack.Push($root)
+            while ($stack.Count -gt 0) {{
+              $i = $stack.Pop()
+              [void]$order.Add($i)
+              if ($i.PSIsContainer -and -not ($i.Attributes -band $link)) {{
+                foreach ($c in @(Get-ChildItem -Force -LiteralPath $i.FullName -ErrorAction Stop)) {{
+                  $stack.Push($c)
+                }}
+              }}
+            }}
+            for ($n = $order.Count - 1; $n -ge 0; $n--) {{
+              $i = $order[$n]
+              if ($i.PSIsContainer -and ($i.Attributes -band $link)) {{
+                $i.Delete()  # the junction / symlink itself, never its target
+              }} else {{
+                Remove-Item -Force -LiteralPath $i.FullName -ErrorAction Stop
+              }}
+            }}
+        """
+        out = self._run_ps_at(path, script).strip()
+        if out == _NOT_FOUND:
             raise FileNotFoundError(errno.ENOENT, "WinRM remove: not found", path)
+        if out == _NOT_EMPTY:
+            raise OSError(errno.ENOTEMPTY, f"WinRM remove: the folder is not empty: {path}", path)
 
     def rename(self, src: str, dst: str) -> None:
         """Move-Item, refused when *dst* exists (FileExistsError).
@@ -607,8 +736,8 @@ class WinRMSession(SessionLifecycle):
         itself under another case (Windows names are case-insensitive)
         goes on. -Force stays: without it a hidden or read-only source
         cannot be moved at all."""
-        src_b64 = _b64(self.normalize(src))
-        dst_b64 = _b64(self.normalize(dst))
+        src_b64 = _b64(self._target(src))
+        dst_b64 = _b64(self._target(dst))
         script = f"""
             $s = {_ps_decode(src_b64)}
             $d = {_ps_decode(dst_b64)}
@@ -650,7 +779,7 @@ class WinRMSession(SessionLifecycle):
         """A file up to :data:`_READ_CHUNK` in one call; a larger one is
         read in ranges as the caller reads (progress and Cancel work, and
         no size limit is left)."""
-        path_b64 = _b64(self.normalize(path))
+        path_b64 = _b64(self._target(path))
         script = f"""
             $p = {_ps_decode(path_b64)}
             $item = $null
@@ -677,7 +806,7 @@ class WinRMSession(SessionLifecycle):
     def _read_range(self, path: str, offset: int, size: int) -> bytes:
         """Up to *size* bytes of *path* from *offset*; b"" at the end."""
         script = f"""
-            $p = {_ps_decode(_b64(self.normalize(path)))}
+            $p = {_ps_decode(_b64(self._target(path)))}
             $fs = [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::Read,
                                   [IO.FileShare]::ReadWrite)
             try {{
@@ -790,17 +919,24 @@ class WinRMSession(SessionLifecycle):
     # Server-side helpers
     # ------------------------------------------------------------------
     def copy(self, src: str, dst: str) -> None:
-        """Copy-Item; a folder with all it holds (-Recurse).
+        """Copy a file, or a folder with all it holds.
 
-        Without -Recurse, Copy-Item copied a folder as an empty folder and
-        succeeded - an MCP copy, a script or a WebDAV COPY lost the whole
-        content. A file replaces a file at *dst* (as the other backends'
-        copy does); a folder at *dst*, or any *dst* for a folder, is
-        FileExistsError: Copy-Item would put the copy INTO the folder or
-        merge the two. server_side_copy(overwrite=True) goes on with its
-        guarded stream copy then. -Force: hidden and read-only entries."""
-        src_b64 = _b64(self.normalize(src))
-        dst_b64 = _b64(self.normalize(dst))
+        A file replaces a file at *dst* (as the other backends' copy does);
+        a folder at *dst*, or any *dst* for a folder, is FileExistsError:
+        Copy-Item would put the copy INTO the folder or merge the two.
+        server_side_copy(overwrite=True) goes on with its guarded stream
+        copy then. -Force: hidden and read-only entries.
+
+        Not ``Copy-Item -Recurse``: Windows PowerShell 5.1 (what pywinrm
+        starts) goes into a directory junction or symlink and copies what
+        is in its TARGET - a junction to C:\\ copied the whole disk, one
+        back to the folder copied for ever. The script walks the folder
+        itself and makes a junction or symbolic link of the copy as a link
+        with the same target (CreateSymbolicLink keeps a relative target
+        relative); other reparse points (OneDrive placeholders) are
+        folders and files as Explorer copies them."""
+        src_b64 = _b64(self._target(src))
+        dst_b64 = _b64(self._target(dst))
         script = f"""
             $s = {_ps_decode(src_b64)}
             $d = {_ps_decode(dst_b64)}
@@ -812,11 +948,45 @@ class WinRMSession(SessionLifecycle):
             try {{ $taken = Get-Item -Force -LiteralPath $d -ErrorAction Stop }}
             catch [System.Management.Automation.ItemNotFoundException] {{ }}
             if ($null -ne $taken -and ($item.PSIsContainer -or $taken.PSIsContainer)) {{
-              Write-Output '{_DESTINATION_TAKEN}'
-            }} elseif ($item.PSIsContainer) {{
-              Copy-Item -Recurse -Force -LiteralPath $s -Destination $d -ErrorAction Stop
-            }} else {{
-              Copy-Item -Force -LiteralPath $s -Destination $d -ErrorAction Stop
+              Write-Output '{_DESTINATION_TAKEN}'; return
+            }}
+            $reparse = [IO.FileAttributes]::ReparsePoint
+            $todo = New-Object System.Collections.Stack
+            $todo.Push(@($item, $d))
+            while ($todo.Count -gt 0) {{
+              $pair = $todo.Pop()
+              $i = $pair[0]
+              $to = $pair[1]
+              $kind = [string]$i.LinkType
+              if (($i.Attributes -band $reparse) -and ($kind -eq 'Junction' -or $kind -eq 'SymbolicLink')) {{
+                # A link is copied as the link - never what it points to.
+                $target = [string](@($i.Target)[0])
+                if ($target.StartsWith('\\??\\')) {{ $target = $target.Substring(4) }}
+                if (-not $target) {{ throw "the target of the link $($i.FullName) cannot be read" }}
+                if ($kind -eq 'Junction') {{
+                  New-Item -ItemType Junction -Path $to -Value $target -ErrorAction Stop | Out-Null
+                }} else {{
+                  if (-not ('Axross.WinLink' -as [type])) {{
+                    Add-Type -Namespace Axross -Name WinLink -MemberDefinition '[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern bool CreateSymbolicLink(string link, string target, int flags);'
+                  }}
+                  $flags = 0
+                  if ($i.PSIsContainer) {{ $flags = 1 }}
+                  # 2: without the privilege where Developer Mode allows it.
+                  if (-not [Axross.WinLink]::CreateSymbolicLink($to, $target, $flags + 2)) {{
+                    if (-not [Axross.WinLink]::CreateSymbolicLink($to, $target, $flags)) {{
+                      $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                      throw "the symbolic link $to cannot be made (Windows error $code)"
+                    }}
+                  }}
+                }}
+              }} elseif ($i.PSIsContainer) {{
+                [void][IO.Directory]::CreateDirectory($to)
+                foreach ($c in @(Get-ChildItem -Force -LiteralPath $i.FullName -ErrorAction Stop)) {{
+                  $todo.Push(@($c, [IO.Path]::Combine($to, $c.Name)))
+                }}
+              }} else {{
+                Copy-Item -Force -LiteralPath $i.FullName -Destination $to -ErrorAction Stop
+              }}
             }}
         """
         out = self._run_ps_at(src, script).strip()
@@ -831,7 +1001,7 @@ class WinRMSession(SessionLifecycle):
         algo = (algorithm or "sha256").upper()
         if algo not in ("SHA1", "SHA256", "SHA384", "SHA512", "MD5"):
             return ""
-        path_b64 = _b64(self.normalize(path))
+        path_b64 = _b64(self._target(path))
         script = f"(Get-FileHash -Algorithm {algo} -LiteralPath {_ps_decode(path_b64)}).Hash"
         try:
             out = self._run_ps(script).strip().lower()
@@ -878,7 +1048,12 @@ class WinRMSession(SessionLifecycle):
     # ------------------------------------------------------------------
 
     def ps(
-        self, script: str, *, stdout_cap: int = 1024 * 1024, stderr_cap: int = 64 * 1024
+        self,
+        script: str,
+        *,
+        stdout_cap: int = 1024 * 1024,
+        stderr_cap: int = 64 * 1024,
+        timeout: float | None = None,
     ) -> "ExecResult":
         """Public PowerShell runner. Returns
         :class:`models.exec_result.ExecResult` (rc/stdout/stderr/
@@ -891,10 +1066,11 @@ class WinRMSession(SessionLifecycle):
 
         Raises ``OSError`` on transport failure; non-zero remote
         rc surfaces as ``ok=False`` on the result (use ``.check()``
-        to raise instead)."""
+        to raise instead). *timeout*: seconds until the command is
+        stopped (TimeoutError); SCRIPT_DEADLINE when None."""
         from models.exec_result import ExecResult
 
-        result = self._run_locked(script)
+        result = self._run_locked(script, timeout)
         out = result.std_out or b""
         err = result.std_err or b""
         return ExecResult(
@@ -919,8 +1095,8 @@ class WinRMSession(SessionLifecycle):
 
         WinRM has no stdin channel for a command: *stdin* is refused (put
         the data into the script). *env* becomes ``$env:`` assignments in
-        front of the command. The time limit is the session's operation
-        timeout.
+        front of the command. *timeout*: seconds until the command is
+        stopped (TimeoutError); None is SCRIPT_DEADLINE.
         """
         from core.exec_util import checked_env
 
@@ -930,7 +1106,8 @@ class WinRMSession(SessionLifecycle):
             f"$env:{k} = '{_ps_single_quoted(str(v))}'; "
             for k, v in checked_env(env, "WinRM exec").items()
         )
-        return self.ps(prefix + cmd, stdout_cap=stdout_cap, stderr_cap=stderr_cap)
+        return self.ps(prefix + cmd, stdout_cap=stdout_cap, stderr_cap=stderr_cap,
+                       timeout=timeout)
 
     def cim_query(self, wql: str, *, namespace: str = "root\\cimv2") -> list[dict]:
         """Run a WQL (WMI Query Language) query via PowerShell's
@@ -997,13 +1174,25 @@ class WinRMSession(SessionLifecycle):
                 raise FileNotFoundError(errno.ENOENT, str(exc), path) from exc
             raise
 
-    def _run_locked(self, script: str):
-        """pywinrm's run_ps under the session's lock; a failed request is
-        an OSError that says why (:func:`_transport_error`)."""
+    def _run_locked(self, script: str, timeout: float | None = None):
+        """pywinrm's run_ps under the session's lock, bounded by *timeout*
+        (SCRIPT_DEADLINE by default, :func:`_run_ps_bounded`); a failed
+        request is an OSError that says why (:func:`_transport_error`)."""
         lock = self.__dict__.setdefault("_lock", threading.RLock())  # __new__ sessions
         with lock:
             try:
-                return self._session.run_ps(script)
+                session_class = getattr(winrm, "Session", None)
+                if isinstance(session_class, type) and isinstance(self._session, session_class):
+                    return _run_ps_bounded(self._session, script, timeout)
+                return self._session.run_ps(script)  # a stand-in session
+            except (TimeoutError, _ScriptFailed):
+                raise
+            except OSError as exc:
+                if exc.errno == errno.EFBIG:
+                    raise
+                raise _transport_error(
+                    exc, getattr(self, "_host", "?"), getattr(self, "_endpoint", "")
+                )  # noqa: B904
             except Exception as exc:  # noqa: BLE001 — pywinrm raises various
                 # Not "from": _transport_error set the cause it chose.
                 raise _transport_error(

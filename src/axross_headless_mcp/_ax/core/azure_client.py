@@ -84,6 +84,8 @@ _CODE_ERRNO = {
     "ServerBusy": errno.EAGAIN,
     "OperationTimedOut": errno.ETIMEDOUT,
     "LeaseIdMissing": errno.EBUSY,
+    # Delete Blob without x-ms-delete-snapshots on a blob with snapshots.
+    "SnapshotsPresent": errno.EBUSY,
     "LeaseAlreadyPresent": errno.EBUSY,
     "SharingViolation": errno.EBUSY,
     "InvalidResourceName": errno.EINVAL,
@@ -690,6 +692,8 @@ class AzureBlobSession(SessionLifecycle):
     # -- listing / stat ------------------------------------------------------
 
     def list_dir(self, path: str) -> list[FileItem]:
+        from core.path_policy import unaddressable_segment_name
+
         prefix = self._to_prefix(path)
         items: list[FileItem] = []
         folders: set[str] = set()
@@ -697,8 +701,10 @@ class AzureBlobSession(SessionLifecycle):
 
         def add_folder(name: str) -> None:
             # A hierarchical-namespace folder comes twice: as the prefix
-            # "name/" and as its placeholder blob "name".
-            if name and name not in folders:
+            # "name/" and as its placeholder blob "name". The blob "a//x"
+            # is the folder "" under "a" (core.path_policy).
+            name = unaddressable_segment_name(name) or name
+            if name not in folders:
                 folders.add(name)
                 items.append(FileItem(name=name, is_dir=True))
 
@@ -712,11 +718,12 @@ class AzureBlobSession(SessionLifecycle):
                 seen_any = True  # the folder marker "prefix" itself too
                 # item can be BlobPrefix (virtual dir) or BlobProperties (file)
                 if hasattr(item, "prefix"):
-                    add_folder(item.prefix[len(prefix) :].rstrip("/"))
+                    add_folder(item.prefix[len(prefix) :].removesuffix("/"))
                 else:
                     blob_name = item.name[len(prefix) :]
                     if not blob_name or blob_name.endswith("/"):
                         continue  # directory marker or prefix itself
+                    blob_name = unaddressable_segment_name(blob_name) or blob_name
                     if _is_folder_placeholder(getattr(item, "metadata", None)):
                         add_folder(blob_name)
                         continue
@@ -857,7 +864,7 @@ class AzureBlobSession(SessionLifecycle):
                     target = key.rstrip("/") if kind == "folder" else prefix
                 try:
                     blob_client = self._container.get_blob_client(target)
-                    blob_client.delete_blob()
+                    blob_client.delete_blob(delete_snapshots="include")
                 except Exception as e:
                     raise _azure_error(e, f"Cannot remove {path}: {cloud_http.reason(e)}") from e
             else:
@@ -865,7 +872,8 @@ class AzureBlobSession(SessionLifecycle):
                     self._remove_prefix(prefix)
                     if kind == "folder":
                         # Last: the placeholder is the folder itself.
-                        self._container.get_blob_client(key.rstrip("/")).delete_blob()
+                        self._container.get_blob_client(key.rstrip("/")).delete_blob(
+                            delete_snapshots="include")
                 except OSError:
                     raise
                 except Exception as e:
@@ -873,7 +881,7 @@ class AzureBlobSession(SessionLifecycle):
         else:
             try:
                 blob_client = self._container.get_blob_client(key)
-                blob_client.delete_blob()
+                blob_client.delete_blob(delete_snapshots="include")
             except Exception as e:
                 if _is_not_found(e):
                     # Delete Blob answers 404 BlobNotFound, as unlink(2) ENOENT.
@@ -928,7 +936,7 @@ class AzureBlobSession(SessionLifecycle):
         from azure.storage.blob import PartialBatchErrorException
 
         try:
-            self._container.delete_blobs(*names)
+            self._container.delete_blobs(*names, delete_snapshots="include")
         except PartialBatchErrorException as exc:
             # Some sub-requests failed - or the whole batch was refused in
             # the shape of one: Azurite answers ANY batch with a single
@@ -951,13 +959,13 @@ class AzureBlobSession(SessionLifecycle):
                 exc,
             )
             for name in retry:
-                self._container.delete_blob(name)
+                self._container.delete_blob(name, delete_snapshots="include")
         except Exception as exc:  # noqa: BLE001
             # The batch call itself was refused (no batch support on this
             # account / emulator): delete one by one, as before.
             log.debug("Azure batch delete unavailable (%s); deleting one by one", exc)
             for name in names:
-                self._container.delete_blob(name)
+                self._container.delete_blob(name, delete_snapshots="include")
 
     def rename(self, src: str, dst: str) -> None:
         """Azure Blob doesn't support rename -- copy + delete."""
@@ -1031,12 +1039,13 @@ class AzureBlobSession(SessionLifecycle):
                 try:
                     dst_blob.start_copy_from_url(src_blob.url)
                     self._wait_for_copy(dst_blob)
-                    src_blob.delete_blob()
+                    src_blob.delete_blob(delete_snapshots="include")
                 except Exception as e:
                     raise _azure_error(e, f"Cannot rename {src} -> {dst}: {cloud_http.reason(e)}") from e
             if kind == "folder":
                 try:
-                    self._container.get_blob_client(src_key).delete_blob()
+                    self._container.get_blob_client(src_key).delete_blob(
+                        delete_snapshots="include")
                 except Exception as e:
                     raise _azure_error(e, f"Cannot rename {src} -> {dst}: {cloud_http.reason(e)}") from e
         else:
@@ -1045,7 +1054,7 @@ class AzureBlobSession(SessionLifecycle):
                 dst_blob = self._container.get_blob_client(dst_key)
                 dst_blob.start_copy_from_url(src_blob.url)
                 self._wait_for_copy(dst_blob)
-                src_blob.delete_blob()
+                src_blob.delete_blob(delete_snapshots="include")
             except Exception as e:
                 raise _azure_error(e, f"Cannot rename {src} -> {dst}: {cloud_http.reason(e)}") from e
 
@@ -1095,7 +1104,7 @@ class AzureBlobSession(SessionLifecycle):
     # -- path helpers --------------------------------------------------------
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"
@@ -1295,9 +1304,15 @@ class AzureBlobSession(SessionLifecycle):
             permission=BlobSasPermissions(**kw),
             expiry=datetime.now(timezone.utc) + timedelta(seconds=int(expires_in)),
         )
+        # The name quoted ("#" and "?" cut the
+        # pasted one), at the account's own endpoint (Azurite, a sovereign
+        # cloud, a custom domain), never a guessed blob.core.windows.net.
+        from urllib.parse import quote
+
+        endpoint = self._service.url.split("?", 1)[0].rstrip("/")
         url = (
-            f"https://{self._service.account_name}.blob.core.windows.net/"
-            f"{self._container_name}/{self._to_key(path)}?{sas}"
+            f"{endpoint}/{quote(self._container_name, safe='')}/"
+            f"{quote(self._to_key(path), safe='/')}?{sas}"
         )
         log.info(
             "Azure SAS-URL: container=%s blob=%s perms=%s expires=%ds",
@@ -1395,7 +1410,9 @@ class AzureBlobSession(SessionLifecycle):
 
     def _to_key(self, path: str) -> str:
         """Convert a UI path to a blob key (no leading slash)."""
-        return path.lstrip("/")
+        from core.path_policy import refuse_unaddressable
+
+        return refuse_unaddressable(path, "Azure").lstrip("/")
 
     def _file_key(self, path: str, action: str) -> str:
         """The blob key a FILE at *path* is written to. A key ending in
@@ -1413,7 +1430,9 @@ class AzureBlobSession(SessionLifecycle):
 
     def _to_prefix(self, path: str) -> str:
         """Convert a UI path to a blob prefix for listing."""
-        key = path.lstrip("/")
+        from core.path_policy import refuse_unaddressable
+
+        key = refuse_unaddressable(path, "Azure").lstrip("/")
         if key and not key.endswith("/"):
             key += "/"
         return key
@@ -1786,7 +1805,7 @@ class AzureFilesSession(SessionLifecycle):
     # -- path helpers --------------------------------------------------------
 
     def normalize(self, path: str) -> str:
-        return posixpath.normpath(path) or "/"
+        return posixpath.normpath(path) if path else "/"  # normpath("") is "."
 
     def separator(self) -> str:
         return "/"

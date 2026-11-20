@@ -573,6 +573,27 @@ class ExchangeSession(SessionLifecycle):
         except Exception as exc:  # noqa: BLE001
             raise OSError(f"Exchange proxy: could not patch existing session pool: {exc}") from exc
 
+        # raw_session() makes every requests session of the protocol -
+        # also the auth-type probe of the first one (a POST to
+        # /EWS/Exchange.asmx outside the pool), which went straight to
+        # the server with the environment's proxies.
+        raw = getattr(protocol, "raw_session", None)
+        if raw is None:
+            raise OSError(
+                "Exchange proxy: protocol does not expose raw_session(); "
+                "refusing to continue without a verified proxy hook."
+            )
+
+        def _proxied_raw_session(*args, **kwargs):
+            sess = raw(*args, **kwargs)
+            lock_requests_session_to_profile_proxy(sess, proxies)
+            return sess
+
+        try:
+            protocol.raw_session = _proxied_raw_session  # type: ignore[assignment]
+        except Exception as exc:  # noqa: BLE001
+            raise OSError(f"Exchange proxy: could not wrap raw_session: {exc}") from exc
+
         original = getattr(protocol, "create_session", None)
         if original is None:
             if existing_sessions and patched_existing == existing_sessions:
@@ -1283,19 +1304,32 @@ class ExchangeSession(SessionLifecycle):
         silent-data-corruption bug for anyone saving multiple
         attachments with similar names.
         """
-        seen: dict[str, int] = {}
-        for att in all_atts:
-            base = _sanitize(getattr(att, "name", "")) or "attachment"
-            if base not in seen:
-                seen[base] = 0
-                resolved = base
+        # Every attachment keeps its own name where it is the first of it;
+        # a number is skipped when that name is taken too (review round 2:
+        # [a.pdf, a.pdf, a.1.pdf] gave a.1.pdf twice, and the third could
+        # not be read).
+        names: list[str | None] = []
+        taken: set[str] = set()
+        bases = [_sanitize(getattr(att, "name", "")) or "attachment" for att in all_atts]
+        for base in bases:
+            if base in taken:
+                names.append(None)
             else:
-                seen[base] += 1
-                root, _, ext = base.rpartition(".")
-                if root:
-                    resolved = f"{root}.{seen[base]}.{ext}"
-                else:
-                    resolved = f"{base}.{seen[base]}"
+                names.append(base)
+                taken.add(base)
+        for index, base in enumerate(bases):
+            if names[index] is not None:
+                continue
+            root, _, ext = base.rpartition(".")
+            number = 1
+            while True:
+                resolved = f"{root}.{number}.{ext}" if root else f"{base}.{number}"
+                if resolved not in taken:
+                    break
+                number += 1
+            names[index] = resolved
+            taken.add(resolved)
+        for att, resolved in zip(all_atts, names):
             if att is target:
                 return resolved
         # target wasn't in all_atts — fall back to the sanitised name.
