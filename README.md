@@ -54,6 +54,8 @@
 - **Current MCP over stdio or HTTP:** protocol 2025-11-25, 2025-06-18, 2024-11-05; bearer token, mTLS off loopback, an audit trail.
 - **Runs anywhere, no GUI:** `uvx`, `pipx` or the container image; the same code as the axross desktop app and its tests.
 
+**The 55 tools** (only the file tools are on until `--mcp-tools GROUP,...` or `all` adds groups): **files (always on)** `list_dir`, `stat`, `read_file`, `checksum`, `search`, `walk`, `recursive_checksum`, `preview`, `grep`, `list_versions`, `open_version_read`; **write (`--mcp-write`)** `write_file`, `mkdir`, `remove`, `rename`, `copy`, `bulk_copy`, `symlink`, `hardlink`, `chmod`; **metadata** `metadata_read`, `metadata_export`, `metadata_export_file`, `metadata_remove`; **duplicates** `duplicates_scan`, `duplicates_scans`, `duplicates_groups`, `duplicates_dedupe`; **archives** `archive_list`, `archive_extract`; **packing** `pack_formats`, `pack`; **crypto** `encrypt`, `decrypt`; **file types** `file_type`, `file_type_scan`; **index** `index_build`; **transfers** `transfer_copy`, `transfer_move`; **remote profiles** `remote_profiles`, `remote_open`, `remote_close`, `list_backends`; **remote commands (`--mcp-allow-exec`)** `remote_exec`, `remote_script`, `exec_backends`; **scripts (`--mcp-allow-scripts`)** `script_list`, `script_api_schema`, `script_read`, `script_write`, `script_delete`, `script_run`; **agent** `agent_run`; **extensions** `extensions_list`, `extensions_info`.
+
 ## Install
 
 ```sh
