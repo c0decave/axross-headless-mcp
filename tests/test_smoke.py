@@ -18,10 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 PROBE = ("import atexit, sys; atexit.register(lambda: sys.stderr.write("
          "'QT=%s\\n' % any(m.split('.')[0] == 'PyQt6' for m in sys.modules))); "
          "from axross_headless_mcp.__main__ import main; sys.exit(main())")
-GROUP_TOOLS = {"metadata_read", "duplicates_groups", "pack_formats", "archive_list",
-               "index_build", "file_type", "remote_profiles", "agent_run", "extensions_list"}
+GROUP_TOOLS = {"read_metadata", "list_duplicate_groups", "list_archive_formats",
+               "list_archive_members", "build_index", "identify_file_type",
+               "list_remote_profiles", "run_llm_agent", "list_extensions"}
 #: Served only with --mcp-write.
-WRITE_TOOLS = {"write_file", "transfer_copy", "pack", "archive_extract", "encrypt"}
+WRITE_TOOLS = {"write_file", "copy_path_to_backend", "create_archive", "extract_archive",
+               "encrypt_file"}
 
 
 def _env(home: Path, **extra) -> dict:

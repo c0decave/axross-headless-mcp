@@ -10,13 +10,16 @@ lists, reads, searches and hashes files on this machine and on axross's remote
 connections, and with `--mcp-write` writes them. No GUI and no Qt: it runs on a server,
 in a container or in CI.
 
-- **File tools** (always on, read-only): `list_dir`, `stat`, `read_file`, `checksum`,
-  `search`, `walk`, `recursive_checksum`, `grep`, `list_versions`, `open_version_read`,
-  and `preview` (image thumbnails; with the `images` extra, which brings Pillow).
-- **Write tools** (`--mcp-write --mcp-root DIR`): `write_file`, `mkdir`, `remove`,
-  `rename`, `copy`, `bulk_copy`, `symlink`, `hardlink`, `chmod`.
+- **File tools** (always on, read-only): `list_directory`, `get_path_info`, `read_file`, `compute_file_checksum`,
+  `search_index`, `walk_tree`, `compute_tree_checksums`, `search_content`, `list_file_versions`, `read_file_version`,
+  and `render_preview` (image thumbnails; with the `images` extra, which brings Pillow).
+- **Write tools** (`--mcp-write --mcp-root DIR`): `write_file`, `create_directory`, `delete_path`,
+  `move_path`, `copy_file`, `copy_tree`, `create_symlink`, `create_hardlink`, `set_permissions`.
+- Tool names read verb then resource since 0.15.183; `tools/call` still takes the former
+  names (list_dir, stat, grep, ...), which `tools/list` no longer shows, and the group
+  packer is part of archive (`--mcp-tools packer` still works).
 - **Capability groups** (`--mcp-tools GROUP,...` or `all`): metadata, duplicates,
-  packer, archive, crypto, index, filetype, transfer, remote (axross's saved
+  archive, crypto, index, filetype, transfer, remote (axross's saved
   connection profiles as further backends), exec (`--mcp-allow-exec`), agent,
   extensions.
 - Every path is confined to `--mcp-root` (default: your home folder); secret files
