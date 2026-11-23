@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axross-headless-mcp"
-version = "0.15.183"
+version = "0.15.184"
 description = "axross's headless MCP server: file tools on the local disk and on SFTP, SMB, WebDAV, S3 and more for any MCP client, over stdio or HTTP - without Qt"
 readme = "README.md"
 license = "Apache-2.0"

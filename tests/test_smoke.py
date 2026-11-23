@@ -1,5 +1,5 @@
 """axross-headless-mcp answers an MCP client over stdio and over HTTP - every tool
-group listed, a file read - and PyQt6 is never imported. The installed
+group listed (all,adb: every group), a file read - and PyQt6 is never imported. The installed
 package when there is one, else this checkout's src/."""
 
 import importlib.util
@@ -20,10 +20,10 @@ PROBE = ("import atexit, sys; atexit.register(lambda: sys.stderr.write("
          "from axross_headless_mcp.__main__ import main; sys.exit(main())")
 GROUP_TOOLS = {"read_metadata", "list_duplicate_groups", "list_archive_formats",
                "list_archive_members", "build_index", "identify_file_type",
-               "list_remote_profiles", "run_llm_agent", "list_extensions"}
+               "list_remote_profiles", "run_llm_agent", "list_extensions", "get_device_info"}
 #: Served only with --mcp-write.
 WRITE_TOOLS = {"write_file", "copy_path_to_backend", "create_archive", "extract_archive",
-               "encrypt_file"}
+               "encrypt_file", "install_app"}
 
 
 def _env(home: Path, **extra) -> dict:
@@ -59,7 +59,7 @@ def test_happy_stdio_initialize_lists_every_group_and_reads_a_file(tmp_path):
                     "arguments": {"path": str(data / "hello.txt"), "encoding": "text"}}},
     ]
     proc = subprocess.run(
-        [sys.executable, "-c", PROBE, "--mcp-root", str(data), "--mcp-tools", "all",
+        [sys.executable, "-c", PROBE, "--mcp-root", str(data), "--mcp-tools", "all,adb",
          "--mcp-write"],
         input="".join(json.dumps(r) + "\n" for r in requests), capture_output=True,
         text=True, timeout=120, env=_env(tmp_path), cwd=tmp_path)
@@ -74,7 +74,7 @@ def test_happy_stdio_initialize_lists_every_group_and_reads_a_file(tmp_path):
 
 
 def test_happy_the_manifest_of_every_group(tmp_path):
-    proc = subprocess.run([sys.executable, "-c", PROBE, "--mcp-list-tools", "--mcp-tools", "all"],
+    proc = subprocess.run([sys.executable, "-c", PROBE, "--mcp-list-tools", "--mcp-tools", "all,adb"],
                           capture_output=True, text=True, timeout=120, env=_env(tmp_path),
                           cwd=tmp_path)
     assert proc.returncode == 0, proc.stderr[-2000:]
@@ -110,7 +110,7 @@ def test_happy_http_initialize_lists_every_group_and_reads_a_file(tmp_path):
     port, token = _free_port(), "smoke-token-0123456789"
     proc = subprocess.Popen(
         [sys.executable, "-c", PROBE, "--mcp-http", f"127.0.0.1:{port}", "--mcp-root", str(data),
-         "--mcp-tools", "all"], env=_env(tmp_path, AXROSS_MCP_HTTP_TOKEN=token), cwd=tmp_path,
+         "--mcp-tools", "all,adb"], env=_env(tmp_path, AXROSS_MCP_HTTP_TOKEN=token), cwd=tmp_path,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     url = f"http://127.0.0.1:{port}/messages"
     try:

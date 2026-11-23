@@ -13,15 +13,19 @@ in a container or in CI.
 - **File tools** (always on, read-only): `list_directory`, `get_path_info`, `read_file`, `compute_file_checksum`,
   `search_index`, `walk_tree`, `compute_tree_checksums`, `search_content`, `list_file_versions`, `read_file_version`,
   and `render_preview` (image thumbnails; with the `images` extra, which brings Pillow).
-- **Write tools** (`--mcp-write --mcp-root DIR`): `write_file`, `create_directory`, `delete_path`,
-  `move_path`, `copy_file`, `copy_tree`, `create_symlink`, `create_hardlink`, `set_permissions`.
+- **Write tools** (`--mcp-write --mcp-root DIR`): `write_file` (replace, create, append or
+  at an offset), `restore_file_version`, `create_directory`, `delete_path`, `move_path`,
+  `copy_file`, `copy_tree`, `create_link`, `set_permissions`.
 - Tool names read verb then resource since 0.15.183; `tools/call` still takes the former
   names (list_dir, stat, grep, ...), which `tools/list` no longer shows, and the group
-  packer is part of archive (`--mcp-tools packer` still works).
+  packer is part of archive (`--mcp-tools packer` still works). Since 0.15.184
+  create_symlink and create_hardlink are `create_link` (`kind`), run_backend_script is
+  `run_backend_command` with `script`; the former names still answer.
 - **Capability groups** (`--mcp-tools GROUP,...` or `all`): metadata, duplicates,
   archive, crypto, index, filetype, transfer, remote (axross's saved
   connection profiles as further backends), exec (`--mcp-allow-exec`), agent,
-  extensions.
+  extensions; and adb (Android devices opened as ADB profiles), which `all` leaves out
+  since 0.15.184: `--mcp-tools all,adb` is every group.
 - Every path is confined to `--mcp-root` (default: your home folder); secret files
   (SSH and GnuPG private keys, tokens) are refused unless `--mcp-allow-secret-reads`.
 
@@ -91,6 +95,31 @@ A client sends `Authorization: Bearer <token>`. Anything but loopback needs mTLS
 ```sh
 docker run -i --rm -v "$PWD:/data" ghcr.io/c0decave/axross-headless-mcp:latest     --mcp-server --mcp-root /data --mcp-tools all
 ```
+
+### Android devices (the adb group)
+
+`--mcp-tools remote,adb` (and `--mcp-write` for the tools that change the device or
+write into the root); `all` does not include adb, `all,adb` does. The device is an ADB profile of axross (TCP to the phone's
+`adb tcpip` port, USB, or the adb server of this computer on 127.0.0.1:5037), opened
+with `open_remote_profile`; each tool takes its backend id (`backend='profile:phone'`).
+Commands go to the phone as argument lists, each argument quoted; every input is
+checked against a narrow pattern and every answer is cleaned of control, bidi and
+invisible characters and bounded.
+
+- Reading: `get_device_info` (the IMEI only where the phone service answers the shell
+  or a vendor property holds it), `list_device_properties`, `get_battery_status`,
+  `list_apps`, `get_app_info` (versions, permissions), `list_running_apps`,
+  `get_logcat`, `take_screenshot` (an image; with `out` a PNG in the root), `list_sms`
+  (only where the shell has READ_SMS).
+- Changing: `start_app`, `stop_app`, `install_app` (an `.apk` from the root: no link,
+  no `..`, at most 4 GiB, removed from `/data/local/tmp` again), `uninstall_app`,
+  `export_app` (an app's APKs into the root), `grant_permission`, `revoke_permission`,
+  `reboot_device`, `write_sms` (read back: Android drops the shell's write unless
+  WRITE_SMS is allowed), `compose_sms` (prepares, never sends), `send_at_command` (root
+  and a modem node only).
+
+The tools that change the device are refused on a profile flagged production and in
+the paranoid security mode, and leave audit lines without message texts.
 
 ### Settings
 
